@@ -1,0 +1,10 @@
+{
+  "name": "Асистент трейдера",
+  "short_name": "Асистент",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0E1116",
+  "theme_color": "#0E1116",
+  "lang": "uk",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}
