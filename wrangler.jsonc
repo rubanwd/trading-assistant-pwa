@@ -1,0 +1,27 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "trading-assistant-pwa",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-10-01",
+  "assets": {
+    "directory": "dist/client",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "triggers": { "crons": ["*/30 * * * *"] },
+  "durable_objects": {
+    "bindings": [{ "name": "ENGINE", "class_name": "Engine" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Engine"] }],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "trading-assistant",
+      // Заміни після `wrangler d1 create trading-assistant`
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "observability": { "enabled": true }
+}

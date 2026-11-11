@@ -25,3 +25,24 @@ AI-асистент трейдера: PWA на Cloudflare. Звіт двічі �
 4. Сигнали: 2–3 сетапи, фільтр, аналітик і скептик, супровід сигналів.
 5. Статистика: калібрування, результат по сетапах, витрати, тижневий розбір.
 6. Форвард-тест 8 тижнів без реальних грошей.
+
+## Запуск
+
+```bash
+npm install
+cp .dev.vars.example .dev.vars
+npm run db:migrate:local
+npm run dev            # http://localhost:8787
+```
+
+## Перший деплой
+
+1. `npx wrangler login`
+2. `npx wrangler d1 create trading-assistant`, потім встав `database_id` у `wrangler.jsonc`.
+3. `npm run db:migrate`
+4. `npx wrangler secret put ANTHROPIC_API_KEY`
+5. `npm run deploy`
+6. Увімкни Cloudflare Access для домену застосунку.
+7. Відкрий застосунок і натисни «Перевірити джерела з ЄС». Це перша перевірка плану: Binance і Claude API мають відповісти з рушія.
+
+Потрібен план Workers Paid: скан робить близько 80 зовнішніх запитів, безкоштовний план дає 50.
