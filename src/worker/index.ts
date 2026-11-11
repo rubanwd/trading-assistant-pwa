@@ -28,6 +28,27 @@ app.get("/api/status", async (c) => {
 /** Ручна перевірка доступності джерел з рушія в ЄС. */
 app.post("/api/probe", async (c) => c.json(await engineStub(c.env).probe()));
 
+/** Ручний запуск скану. 409, якщо скан уже триває. */
+app.post("/api/scan", async (c) => {
+  const summary = await engineStub(c.env).scanNow();
+  return summary ? c.json(summary) : c.json({ error: "scan already running" }, 409);
+});
+
+/** Знімки ознак останнього скану. */
+app.get("/api/snapshots/latest", async (c) => {
+  const run = await c.env.DB.prepare(
+    "SELECT id, started_at, status, detail FROM runs WHERE kind = 'scan' ORDER BY id DESC LIMIT 1",
+  ).first<{ id: number; started_at: string; status: string; detail: string | null }>();
+  if (!run) return c.json({ run: null, snapshots: [] });
+  const rows = await c.env.DB.prepare("SELECT features FROM snapshots WHERE run_id = ? ORDER BY id")
+    .bind(run.id)
+    .all<{ features: string }>();
+  return c.json({
+    run: { ...run, detail: run.detail ? JSON.parse(run.detail) : null },
+    snapshots: rows.results.map((r) => JSON.parse(r.features)),
+  });
+});
+
 app.notFound((c) => c.json({ error: "not found" }, 404));
 
 export default {

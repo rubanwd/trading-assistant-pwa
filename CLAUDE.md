@@ -31,4 +31,6 @@ Haiku 5.5 для новин, Sonnet 5.5 для звітів і перевірк�
 
 ## Поточний етап
 
-Каркас. Перша перевірка: рушій у ЄС отримує відповідь від `fapi.binance.com` і від Claude API. Якщо Binance відповідає 451, додати запасну біржу за адаптером `MarketData`.
+Дані і рушій. Скан раз на 30 хв без моделі: `Engine.runScan` бере дані через адаптер `MarketData` (`src/worker/market`), рахує індикатори (`indicators.ts`), режим ринку (`regime.ts`) і пише знімки ознак у `snapshots` (`snapshot.ts`, `scan.ts`). Тести: `npm test`.
+
+Не перевірено на проді: чи відповідає `fapi.binance.com` рушію в ЄС. Якщо Binance відповідає 451, додати запасну біржу за адаптером `MarketData` і підставити її в `Engine.market()`.
