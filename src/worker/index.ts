@@ -1,17 +1,31 @@
 import { Hono } from "hono";
 import type { ReportBody } from "./engine";
+import { checkAccess } from "./access";
 import { engineStub, type Env } from "./env";
 import { parseSubscription } from "./push";
+import { SETTINGS, validatePlaybook, validateSettings } from "../shared/settings";
+import { PLAYBOOK_V1 } from "./signals/review";
+import { calibration, hit, loadStats } from "./stats";
 
 export { Engine } from "./engine";
 
 const app = new Hono<{ Bindings: Env }>();
 
-// Вхід: перед застосунком стоїть Cloudflare Access.
-// TODO(етап «Каркас»): перевіряти підпис JWT за ключами команди, а не лише наявність заголовка.
+// Вхід: перед застосунком стоїть Cloudflare Access, а API ще й перевіряє підпис його токена.
+// Без налаштованих ACCESS_TEAM_DOMAIN і ACCESS_AUD API закрите.
 app.use("/api/*", async (c, next) => {
   if (c.env.DEV === "1" || c.req.path === "/api/health") return next();
-  if (!c.req.header("Cf-Access-Jwt-Assertion")) return c.json({ error: "unauthorized" }, 401);
+  const teamDomain = c.env.ACCESS_TEAM_DOMAIN ?? "";
+  const aud = c.env.ACCESS_AUD ?? "";
+  if (!teamDomain || !aud) return c.json({ error: "Cloudflare Access не налаштовано: задай ACCESS_TEAM_DOMAIN і ACCESS_AUD" }, 401);
+  const token = c.req.header("Cf-Access-Jwt-Assertion") ?? /(?:^|;\s*)CF_Authorization=([^;]+)/.exec(c.req.header("Cookie") ?? "")?.[1];
+  try {
+    const res = await checkAccess(token, { aud, teamDomain, loadKeys: () => engineStub(c.env).accessKeys(teamDomain) });
+    if (!res.ok) return c.json({ error: `unauthorized: ${res.reason}` }, 401);
+  } catch (e) {
+    console.error("перевірка Access:", e);
+    return c.json({ error: "не вдалося перевірити вхід" }, 503);
+  }
   return next();
 });
 
@@ -30,7 +44,13 @@ app.get("/api/status", async (c) => {
     db.prepare("SELECT COALESCE(SUM(cost_usd), 0) AS usd FROM llm_calls WHERE ts >= ?").bind(monthStart).first<{ usd: number }>(),
     db.prepare("SELECT value FROM settings WHERE key = 'llm_budget_usd'").first<{ value: string }>(),
   ]);
+  const btc = await db
+    .prepare(
+      "SELECT json_extract(s.features, '$.price') AS price, r.started_at AS at FROM snapshots s JOIN runs r ON r.id = s.run_id WHERE s.symbol = 'BTCUSDT' ORDER BY s.id DESC LIMIT 1",
+    )
+    .first<{ price: number; at: string }>();
   return c.json({
+    btc,
     lastRun: last ? { ...last, detail: last.detail ? JSON.parse(last.detail) : null } : null,
     lastReport: report ? reportCard(report) : null,
     spend: { monthUsd: spent?.usd ?? 0, budgetUsd: budget ? Number(JSON.parse(budget.value)) : null },
@@ -70,7 +90,7 @@ app.get("/api/reports/:id{[0-9]+}", async (c) => {
     .prepare("SELECT id, statement, probability, resolve_at, outcome, resolved_at FROM forecasts WHERE source = ? ORDER BY id")
     .bind(`report:${id}`)
     .all();
-  const ids = body.newsIds.filter((n) => Number.isInteger(n)).slice(0, 20);
+  const ids = (body.newsIds ?? []).filter((n) => Number.isInteger(n)).slice(0, 20);
   const news = ids.length
     ? await db
         .prepare(`SELECT id, ts, source, url, title, impact, sentiment, category FROM news WHERE id IN (${ids.map(() => "?").join(",")}) ORDER BY relevance DESC`)
@@ -83,14 +103,18 @@ app.get("/api/reports/:id{[0-9]+}", async (c) => {
 /** Ручний запуск звіту. 409, якщо рушій зайнятий або звіт за сьогодні вже є. */
 app.post("/api/reports/run", async (c) => {
   const { kind } = await c.req.json<{ kind?: string }>().catch(() => ({ kind: undefined }));
-  if (kind !== "morning" && kind !== "evening") return c.json({ error: "kind must be morning or evening" }, 400);
+  if (kind === "weekly") {
+    const res = await engineStub(c.env).weeklyNow();
+    return res === null ? c.json({ error: "engine busy" }, 409) : c.json(res);
+  }
+  if (kind !== "morning" && kind !== "evening") return c.json({ error: "kind must be morning, evening or weekly" }, 400);
   const res = await engineStub(c.env).reportNow(kind);
   if (res === null) return c.json({ error: "engine busy" }, 409);
   return "error" in res ? c.json(res, 409) : c.json(res);
 });
 
 const SIGNAL_COLUMNS =
-  "id, created_at, symbol, side, setup, entry_low, entry_high, stop, tp1, tp2, rr, p_analyst, p_skeptic, status, expires_at, result_r, resolved_at";
+  "id, created_at, symbol, side, setup, entry_low, entry_high, stop, tp1, tp2, rr, p_analyst, p_skeptic, status, expires_at, result_r, fee_r, resolved_at, shadow_status, shadow_r";
 
 /** Сигнали: open (чекають входу або активні), closed (із результатом), rejected (відхилені моделлю). */
 app.get("/api/signals", async (c) => {
@@ -102,7 +126,8 @@ app.get("/api/signals", async (c) => {
   const scope = c.req.query("scope") ?? "open";
   if (!where[scope]) return c.json({ error: "scope must be open, closed or rejected" }, 400);
   const rows = await c.env.DB.prepare(
-    `SELECT ${SIGNAL_COLUMNS}, (SELECT action FROM journal WHERE signal_id = signals.id ORDER BY id DESC LIMIT 1) AS action
+    `SELECT ${SIGNAL_COLUMNS}, (SELECT action FROM journal WHERE signal_id = signals.id ORDER BY id DESC LIMIT 1) AS action,
+       EXISTS (SELECT 1 FROM signal_events WHERE signal_id = signals.id AND type = 'tp1') AS tp1_hit
      FROM signals WHERE ${where[scope]} ORDER BY created_at DESC LIMIT 50`,
   ).all();
   return c.json({ signals: rows.results });
@@ -123,8 +148,26 @@ app.get("/api/signals/:id{[0-9]+}", async (c) => {
     const v = settings.results.find((r) => r.key === key)?.value;
     return v === undefined ? null : (JSON.parse(v) as number | null);
   };
+  // «Кожне число пояснює себе»: як часто збувались сигнали з такою самою оцінкою.
+  const history = await db
+    .prepare("SELECT p_analyst, p_skeptic, status, shadow_status FROM signals WHERE id != ? AND (p_analyst IS NOT NULL OR p_skeptic IS NOT NULL)")
+    .bind(id)
+    .all<{ p_analyst: number | null; p_skeptic: number | null; status: string; shadow_status: string | null }>();
+  const similar = (key: "p_analyst" | "p_skeptic") => {
+    const p = row[key] as number | null;
+    if (p === null) return null;
+    const from = Math.min(Math.floor(p * 10), 9) / 10;
+    const pts = history.results.flatMap((h) => {
+      const o = hit(h.status === "rejected" ? h.shadow_status : h.status);
+      const q = h[key];
+      return o === null || q === null || q < from || q >= from + 0.1 ? [] : [{ p: q, hit: o }];
+    });
+    const c = calibration(pts);
+    return { from, to: from + 0.1, n: c.n, hits: pts.filter((x) => x.hit).length };
+  };
   return c.json({
     ...row,
+    similar: { analyst: similar("p_analyst"), skeptic: similar("p_skeptic") },
     reasoning: row.reasoning ? JSON.parse(row.reasoning) : null,
     events: events.results,
     journal: journal.results,
@@ -143,6 +186,85 @@ app.post("/api/signals/:id{[0-9]+}/journal", async (c) => {
     .bind(new Date().toISOString(), id, body.action, typeof body.note === "string" ? body.note.slice(0, 1000) : null, num(body.entry), num(body.exit), num(body.size))
     .run();
   return c.json({ ok: true });
+});
+
+/** Статистика: period=all | 30 | 7 (днів). */
+app.get("/api/stats", async (c) => {
+  const period = c.req.query("period") ?? "all";
+  const days = period === "all" ? null : Number(period);
+  if (days !== null && ![7, 30, 90].includes(days)) return c.json({ error: "period must be all, 7, 30 or 90" }, 400);
+  const now = Date.now();
+  return c.json(await loadStats(c.env.DB, { from: days === null ? null : new Date(now - days * 86_400_000).toISOString(), now }));
+});
+
+/** Свічки для графіка сигналу: бере рушій (зі скану в пам'яті або з біржі). */
+app.get("/api/candles/:symbol{[A-Z0-9]{2,20}USDT}", async (c) => {
+  const tf = c.req.query("tf") ?? "1h";
+  if (tf !== "15m" && tf !== "1h" && tf !== "4h") return c.json({ error: "tf must be 15m, 1h or 4h" }, 400);
+  try {
+    const candles = await engineStub(c.env).candles(c.req.param("symbol"), tf, Number(c.req.query("limit") ?? 96));
+    return c.json({ candles });
+  } catch (e) {
+    return c.json({ error: String(e) }, 502);
+  }
+});
+
+/** Налаштування: значення, схема для форми й поточна біржа. */
+app.get("/api/settings", async (c) => {
+  const rows = await c.env.DB.prepare("SELECT key, value FROM settings").all<{ key: string; value: string }>();
+  const values = Object.fromEntries(rows.results.map((r) => [r.key, JSON.parse(r.value)]));
+  return c.json({
+    values,
+    schema: SETTINGS.map(({ check: _check, ...spec }) => spec),
+  });
+});
+
+/** Зміна налаштувань: усе або нічого; помилки по кожному ключу. */
+app.put("/api/settings", async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => null);
+  if (!body || typeof body !== "object" || Array.isArray(body)) return c.json({ error: "очікується об'єкт ключ: значення" }, 400);
+  const { values, errors } = validateSettings(body);
+  if (Object.keys(errors).length) return c.json({ error: "некоректні значення", errors }, 400);
+  const upsert = c.env.DB.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value");
+  const entries = Object.entries(values);
+  if (entries.length) await c.env.DB.batch(entries.map(([k, v]) => upsert.bind(k, JSON.stringify(v))));
+  return c.json({ ok: true, saved: entries.map(([k]) => k) });
+});
+
+/** Правила сетапів: активна версія, історія і коли можна ввімкнути наступну. */
+app.get("/api/playbook", async (c) => {
+  const db = c.env.DB;
+  const [versions, minDays] = await Promise.all([
+    db.prepare("SELECT version, created_at, active, content FROM playbook_versions ORDER BY version DESC LIMIT 20").all<{ version: number; created_at: string; active: number; content: string }>(),
+    db.prepare("SELECT value FROM settings WHERE key = 'playbook_min_days'").first<{ value: string }>(),
+  ]);
+  const active = versions.results.find((v) => v.active === 1) ?? null;
+  const days = minDays ? Number(JSON.parse(minDays.value)) : 14;
+  return c.json({
+    active: active ? { version: active.version, created_at: active.created_at, rules: JSON.parse(active.content) } : { version: null, created_at: null, rules: PLAYBOOK_V1 },
+    versions: versions.results.map(({ content: _content, ...v }) => v),
+    nextAllowedAt: active ? new Date(Date.parse(active.created_at) + days * 86_400_000).toISOString() : null,
+  });
+});
+
+/** Нова версія правил: вмикає людина, не частіше ніж раз на playbook_min_days. */
+app.post("/api/playbook", async (c) => {
+  const db = c.env.DB;
+  const parsed = validatePlaybook((await c.req.json<{ rules?: unknown }>().catch(() => ({}) as { rules?: unknown })).rules);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  const [active, minDays] = await Promise.all([
+    db.prepare("SELECT version, created_at FROM playbook_versions WHERE active = 1 ORDER BY version DESC LIMIT 1").first<{ version: number; created_at: string }>(),
+    db.prepare("SELECT value FROM settings WHERE key = 'playbook_min_days'").first<{ value: string }>(),
+  ]);
+  const days = minDays ? Number(JSON.parse(minDays.value)) : 14;
+  if (active && Date.now() - Date.parse(active.created_at) < days * 86_400_000) {
+    return c.json({ error: `нову версію правил можна ввімкнути не раніше ${new Date(Date.parse(active.created_at) + days * 86_400_000).toISOString().slice(0, 10)}` }, 409);
+  }
+  const [, inserted] = await db.batch<{ version: number }>([
+    db.prepare("UPDATE playbook_versions SET active = 0 WHERE active = 1"),
+    db.prepare("INSERT INTO playbook_versions (created_at, content, active) VALUES (?, ?, 1) RETURNING version").bind(new Date().toISOString(), JSON.stringify(parsed.rules)),
+  ]);
+  return c.json({ ok: true, version: inserted!.results[0]!.version });
 });
 
 /** Публічний ключ VAPID для підписки в браузері. */

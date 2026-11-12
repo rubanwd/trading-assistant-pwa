@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
+import { SETUP } from "./Signals";
+import { StatsView, type Stats } from "./Stats";
 import { api, c, card, day, dim, h2, KIND, p, secondary, time } from "./ui";
 
 export interface ReportCard {
@@ -54,6 +56,85 @@ function List({ title, items }: { title: string; items: string[] }) {
   );
 }
 
+interface WeeklyReport {
+  id: number;
+  created_at: string;
+  model: string | null;
+  cost_usd: number | null;
+  body: {
+    content: { headline: string };
+    week: Stats;
+    allTime: Stats;
+    review: {
+      summary: string;
+      working: string[];
+      failing: string[];
+      calibration: string;
+      proposals: { target: string; change: string; reason: string; evidence: string }[];
+      nextWeek: string[];
+    } | null;
+    reviewNote: string | null;
+  };
+}
+
+const TARGET: Record<string, string> = { ...SETUP, filter: "Фільтр", general: "Загалом" };
+
+function WeeklyView({ report, onBack }: { report: WeeklyReport; onBack: () => void }) {
+  const [scope, setScope] = useState<"week" | "allTime">("week");
+  const r = report.body.review;
+  return (
+    <>
+      <button type="button" style={{ ...secondary, alignSelf: "flex-start" }} onClick={onBack}>← Усі звіти</button>
+      <section style={card}>
+        <p style={dim}>Тижневий розбір · {day(report.created_at)}</p>
+        <h2 style={{ ...h2, fontSize: 18, lineHeight: 1.3 }}>{report.body.content.headline}</h2>
+        {r ? <p style={p}>{r.summary}</p> : <p style={dim}>Розбору моделі немає: {report.body.reviewNote}. Цифри нижче порахував код.</p>}
+      </section>
+      {r && (
+        <>
+          <section style={card}>
+            <List title="Що працює" items={r.working} />
+            <List title="Що не працює" items={r.failing} />
+            {r.calibration && <p style={p}>{r.calibration}</p>}
+            <List title="На що дивитися наступного тижня" items={r.nextWeek} />
+          </section>
+          <section style={card}>
+            <h2 style={h2}>Пропозиції змін</h2>
+            {r.proposals.length === 0 && <p style={dim}>Цього тижня цифри не вимагають змін.</p>}
+            {r.proposals.map((x) => (
+              <div key={x.change} style={{ display: "flex", flexDirection: "column", gap: 4, paddingBottom: 8, borderBottom: `1px solid ${c.line}` }}>
+                <p style={dim}>{TARGET[x.target] ?? x.target}</p>
+                <p style={{ ...p, fontWeight: 600 }}>{x.change}</p>
+                <p style={p}>{x.reason}</p>
+                {x.evidence && <p style={dim}>Підстава: {x.evidence}</p>}
+              </div>
+            ))}
+            <p style={dim}>Зміни вмикаєш ти в «Налаштуваннях», розділ «Правила сетапів»; не частіше ніж раз на два тижні.</p>
+          </section>
+        </>
+      )}
+      <div style={{ display: "flex", gap: 8 }}>
+        {(["week", "allTime"] as const).map((k) => (
+          <button
+            key={k}
+            type="button"
+            aria-pressed={scope === k}
+            onClick={() => setScope(k)}
+            style={{ ...secondary, flex: 1, minHeight: 40, fontSize: 14, padding: 0, color: scope === k ? c.blue : c.dim, borderColor: scope === k ? c.blue : c.line }}
+          >
+            {k === "week" ? "Цей тиждень" : "Увесь час"}
+          </button>
+        ))}
+      </div>
+      <StatsView stats={report.body[scope]} />
+      <p style={dim}>
+        Модель: {report.model ?? "—"}
+        {report.cost_usd !== null && ` · $${report.cost_usd.toFixed(3)}`} (Batch API, −50%). Це аналіз, а не фінансова порада.
+      </p>
+    </>
+  );
+}
+
 function ReportView({ id, onBack }: { id: number; onBack: () => void }) {
   const [report, setReport] = useState<Report | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -64,6 +145,7 @@ function ReportView({ id, onBack }: { id: number; onBack: () => void }) {
 
   if (error) return <p style={{ ...p, color: c.orange }}>Не вдалося відкрити звіт: {error}</p>;
   if (!report) return <p style={dim}>Завантажую…</p>;
+  if (report.kind === "weekly") return <WeeklyView report={report as unknown as WeeklyReport} onBack={onBack} />;
   const r = report.body.content;
   return (
     <>
@@ -165,11 +247,33 @@ export function Reports({ openId, onOpen }: { openId: number | null; onOpen: (id
     }
   };
 
+  const [note, setNote] = useState<string | null>(null);
+  const weekly = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await api<{ status: string; error?: string }>("/api/reports/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ kind: "weekly" }) });
+      const text: Record<string, string> = {
+        submitted: "Розбір відправлено Opus через Batch API. Він з'явиться тут протягом години, після одного з наступних запусків рушія.",
+        pending: "Розбір за сьогодні вже обробляється.",
+        exists: "Тижневий розбір за сьогодні вже є.",
+        saved: "Розбір моделі зараз недоступний: збережено статистику без нього.",
+      };
+      setNote(text[res.status] ?? res.error ?? res.status);
+      load();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   if (openId !== null) return <ReportView id={openId} onBack={() => onOpen(null)} />;
   return (
     <>
       {error && <p style={{ ...p, color: c.orange }}>{error}</p>}
-      {list?.length === 0 && <p style={dim}>Звітів ще немає. Перший з'явиться о 07:30 або 20:30 за Києвом.</p>}
+      {note && <p style={dim}>{note}</p>}
+      {list?.length === 0 && <p style={dim}>Звітів ще немає. Перший з'явиться о 07:30 або 20:30 за Києвом, тижневий розбір у неділю.</p>}
       {list?.map((r) => (
         <button key={r.id} type="button" onClick={() => onOpen(r.id)} style={{ ...card, color: c.ink, textAlign: "left", font: "inherit", cursor: "pointer" }}>
           <span style={dim}>{KIND[r.kind] ?? r.kind} · {day(r.created_at)}, {time(r.created_at)}</span>
@@ -180,6 +284,7 @@ export function Reports({ openId, onOpen }: { openId: number | null; onOpen: (id
         <button type="button" style={{ ...secondary, flex: 1 }} disabled={busy} onClick={() => run("morning")}>{busy ? "Складаю…" : "Скласти ранковий"}</button>
         <button type="button" style={{ ...secondary, flex: 1 }} disabled={busy} onClick={() => run("evening")}>{busy ? "Складаю…" : "Скласти вечірній"}</button>
       </div>
+      <button type="button" style={secondary} disabled={busy} onClick={weekly}>Тижневий розбір зараз</button>
     </>
   );
 }

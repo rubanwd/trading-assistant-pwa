@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { entryMid, positionSize, riskReward } from "../src/shared/risk";
+import { entryMid, feeR, positionSize, riskReward } from "../src/shared/risk";
 import { decideModel } from "../src/worker/llm";
 import { detect } from "../src/worker/signals/detectors";
 import { candidateKey, minutesToMacro, reject, type FilterContext } from "../src/worker/signals/filter";
@@ -154,7 +154,7 @@ describe("супровід сигналу", () => {
   const T0 = 1_800_000_000_000;
   const HOLD = 48 * 3_600_000;
   const sig = (over: Partial<TrackedSignal> = {}): TrackedSignal => ({
-    side: "long", entryLow: 99, entryHigh: 101, stop: 98, tp1: 104, createdAt: T0, expiresAt: T0 + 12 * 3_600_000, ...over,
+    side: "long", entryLow: 99, entryHigh: 101, stop: 98, tp1: 104, tp2: null, createdAt: T0, expiresAt: T0 + 12 * 3_600_000, ...over,
   });
   /** Свічки 15m від T0: [high, low, close]. */
   const bars = (rows: [number, number, number][]) =>
@@ -162,7 +162,7 @@ describe("супровід сигналу", () => {
   const run = (rows: [number, number, number][], s = sig(), now = T0 + rows.length * M15) => replay(s, bars(rows), now, HOLD);
 
   it("чекає входу, поки ціна над зоною", () => {
-    expect(run([[103, 102, 102.5]])).toEqual({ status: "pending", events: [], resultR: null, resolvedAt: null });
+    expect(run([[103, 102, 102.5]])).toEqual({ status: "pending", events: [], resultR: null, resolvedAt: null, exits: [] });
   });
 
   it("вхід, потім ціль: результат дорівнює R:R від середини зони", () => {
@@ -216,6 +216,48 @@ describe("супровід сигналу", () => {
   it("свічки до створення сигналу не враховуються", () => {
     const s = sig({ createdAt: T0 + 2 * M15 });
     expect(run([[102, 97, 98], [102, 97, 98], [103, 102, 102.5]], s).status).toBe("pending");
+  });
+
+  describe("друга ціль", () => {
+    const s2 = sig({ tp2: 108 });
+    const entered: [number, number, number][] = [[102, 100.5, 101], [104.2, 101, 104]];
+
+    it("половина на першій цілі, решта на другій", () => {
+      const r = run([...entered, [106, 103, 105], [108.5, 105, 108]], s2);
+      expect(r.status).toBe("tp2");
+      expect(r.events.map((e) => e.type)).toEqual(["entry", "tp1", "tp2"]);
+      expect(r.resultR).toBe(3); // 0.5 × 2 + 0.5 × 4
+      expect(r.exits).toEqual([{ price: 104, share: 0.5 }, { price: 108, share: 0.5 }]);
+    });
+
+    it("після першої цілі стоп у беззбитку: результат лише з першої половини", () => {
+      const r = run([...entered, [103, 99.8, 100.2]], s2);
+      expect(r).toMatchObject({ status: "tp1", resultR: 1 });
+      expect(r.events.map((e) => e.type)).toEqual(["entry", "tp1", "breakeven"]);
+    });
+
+    it("поки перша ціль не взята, сигнал активний; після неї теж, доки не закриється решта", () => {
+      expect(run(entered, s2).status).toBe("active");
+      expect(run(entered, s2).events.map((e) => e.type)).toEqual(["entry", "tp1"]);
+    });
+
+    it("у свічці першої цілі друга не рахується, а свічка з беззбитком і другою ціллю дає беззбиток", () => {
+      expect(run([[102, 100.5, 101], [108.5, 101, 108]], s2).status).toBe("active");
+      expect(run([...entered, [108.5, 99.5, 104]], s2).status).toBe("tp1");
+    });
+
+    it("закриття за часом після першої цілі", () => {
+      const r = replay(s2, bars([...entered, [105, 103, 104], [105, 103, 102]]), T0 + 4 * M15, 3 * M15 - 2);
+      expect(r).toMatchObject({ status: "tp1", resultR: 1.5 }); // 0.5 × 2 + 0.5 × (102 − 100) / 2
+    });
+  });
+
+  it("комісії в R", () => {
+    // Вхід 100, стоп 98, вихід 104: обіг 204 × 0.05% = 0.102 на одиницю, ризик 2 → 0.051R.
+    expect(feeR(100, 98, [{ price: 104, share: 1 }], 0.05)).toBe(0.051);
+    expect(feeR(100, 98, [{ price: 104, share: 0.5 }, { price: 108, share: 0.5 }], 0.05)).toBeCloseTo(0.0515, 2); // обіг 206
+    expect(feeR(100, 98, [], 0.05)).toBe(0);
+    expect(feeR(100, 100, [{ price: 104, share: 1 }], 0.05)).toBe(0);
   });
 
   it("відтворення детерміноване: повторний прогін дає той самий результат", () => {
