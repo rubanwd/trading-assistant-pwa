@@ -1,2 +1,11 @@
 ANTHROPIC_API_KEY=
 DEV=1
+# Web Push: `npx @pushforge/builder vapid` дає публічний ключ і приватний у форматі JWK (один рядок JSON).
+VAPID_PUBLIC_KEY=
+VAPID_PRIVATE_KEY=
+VAPID_SUBJECT=
+# Telegram як запасний канал сповіщень.
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+# Необов'язково: ключ плану Demo CoinGecko.
+COINGECKO_API_KEY=

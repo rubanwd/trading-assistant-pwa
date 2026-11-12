@@ -33,16 +33,31 @@ npm install
 cp .dev.vars.example .dev.vars
 npm run db:migrate:local
 npm run dev            # http://localhost:8787
-npm test               # тести індикаторів, режиму ринку і скану
+npm test               # тести індикаторів, режиму ринку, скану, новин, звітів і push
 ```
 
 Скан можна запустити вручну: `POST /api/scan`. Знімки останнього скану: `GET /api/snapshots/latest`.
+Звіт поза розкладом: `POST /api/reports/run` з тілом `{"kind":"morning"}` або `{"kind":"evening"}`; стрічка звітів: `GET /api/reports`.
+
+## Звіти і сповіщення
+
+Кожні 30 хв після скану рушій забирає RSS-стрічки (`settings.news_feeds`), а Haiku перетворює нові заголовки на поля за схемою. О 07:30 і 20:30 за Києвом Sonnet складає звіт зі знімків ринку, полів новин і результатів попередніх прогнозів. Кожен сценарій звіту стає рядком у `forecasts` з правилом, яке код перевіряє за свічками 1h.
+
+Сповіщення про готовий звіт ідуть у Web Push і дублюються в Telegram:
+
+1. `npx @pushforge/builder vapid` видасть публічний ключ і приватний у форматі JWK.
+2. Публічний ключ і контакт (`mailto:…`) встав у `vars` у `wrangler.jsonc`: `VAPID_PUBLIC_KEY`, `VAPID_SUBJECT`.
+3. `npx wrangler secret put VAPID_PRIVATE_KEY` (JWK одним рядком).
+4. Для Telegram: `npx wrangler secret put TELEGRAM_BOT_TOKEN` і `npx wrangler secret put TELEGRAM_CHAT_ID`.
+5. У застосунку на екрані «Сьогодні» натисни «Увімкнути сповіщення». На iPhone спершу додай застосунок на початковий екран.
+
+Необов'язково: `npx wrangler secret put COINGECKO_API_KEY` (план Demo) для домінації BTC у звітах.
 
 ## Перший деплой
 
 1. `npx wrangler login`
 2. `npx wrangler d1 create trading-assistant`, потім встав `database_id` у `wrangler.jsonc`.
-3. `npm run db:migrate`
+3. `npm run db:migrate` (повтори після кожного оновлення з новими міграціями)
 4. `npx wrangler secret put ANTHROPIC_API_KEY`
 5. `npm run deploy`
 6. Увімкни Cloudflare Access для домену застосунку.
