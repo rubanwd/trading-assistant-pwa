@@ -3,15 +3,17 @@ import { isTeamDomain, type AccessJwk } from "./access";
 import { marketContext } from "./context";
 import type { Env } from "./env";
 import { resolveForecast, type ForecastRule } from "./forecasts";
+import { AGENTS, AI_KEYS, aiFromSettings, type AgentConfig, type AgentId, type AiConfig, type ModelInfo } from "../shared/ai";
 import {
-  anthropicBatch,
-  anthropicTransport,
-  BATCH_DISCOUNT,
+  compactModels,
   costUsd,
   decideModel,
+  LlmError,
   monthStart,
-  type Effort,
-  type BatchTransport,
+  OPENROUTER,
+  openRouterTransport,
+  parseKeyInfo,
+  type KeyInfo,
   type Pipeline,
   type Transport,
 } from "./llm";
@@ -325,7 +327,7 @@ export class Engine extends DurableObject<Env> {
       this.check("binance-futures", "https://fapi.binance.com/fapi/v1/time"),
       this.check("binance-spot-data", "https://data-api.binance.vision/api/v3/time"),
       this.check("bybit-linear", "https://api.bybit.com/v5/market/time"),
-      this.checkClaude(),
+      this.checkOpenRouter(),
     ]);
     const ok = targets.every((t) => t.ok);
     await this.env.DB.prepare(
@@ -360,29 +362,25 @@ export class Engine extends DurableObject<Env> {
     }
   }
 
-  /**
-   * Без ключа очікуємо 401: це означає, що API доступний з цієї локації.
-   * 403 означає блокування за регіоном.
-   */
-  private async checkClaude(): Promise<ProbeTarget> {
+  /** OpenRouter: з ключем перевіряємо сам ключ, без ключа лише доступність каталогу моделей. */
+  private async checkOpenRouter(): Promise<ProbeTarget> {
     const t0 = Date.now();
-    const key = this.env.ANTHROPIC_API_KEY;
+    const key = this.env.OPENROUTER_API_KEY;
     try {
-      const res = await fetch("https://api.anthropic.com/v1/models?limit=1", {
-        headers: { "anthropic-version": "2023-06-01", ...(key ? { "x-api-key": key } : {}) },
+      const res = await fetch(key ? `${OPENROUTER}/key` : `${OPENROUTER}/models`, {
+        headers: key ? { authorization: `Bearer ${key}` } : {},
         signal: AbortSignal.timeout(10_000),
       });
       await res.body?.cancel();
-      const reachable = res.ok || (!key && res.status === 401);
       return {
-        name: "claude-api",
-        ok: reachable,
+        name: "openrouter",
+        ok: res.ok,
         status: res.status,
         ms: Date.now() - t0,
-        note: key ? undefined : "ключ не задано, перевірено лише доступність",
+        note: key ? (res.status === 401 ? "ключ не прийнято" : undefined) : "ключ не задано, перевірено лише доступність",
       };
     } catch (e) {
-      return { name: "claude-api", ok: false, status: null, ms: Date.now() - t0, note: String(e) };
+      return { name: "openrouter", ok: false, status: null, ms: Date.now() - t0, note: String(e) };
     }
   }
 
@@ -408,42 +406,121 @@ export class Engine extends DurableObject<Env> {
 
   // ── Модель ───────────────────────────────────────────────────────────────
 
-  /** Підміняється в тестах; у роботі це Message Batches API. */
-  protected batchTransport(): BatchTransport {
-    if (!this.env.ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY не задано");
-    return anthropicBatch(this.env.ANTHROPIC_API_KEY);
+  /** Підміняється в тестах; у роботі це OpenRouter. */
+  protected transport(): Transport {
+    if (!this.env.OPENROUTER_API_KEY) throw new LlmError("OPENROUTER_API_KEY не задано");
+    return openRouterTransport(this.env.OPENROUTER_API_KEY, this.env.APP_ORIGIN || undefined);
   }
 
-  /** Підміняється в тестах; у роботі це Claude API. */
-  protected transport(): Transport {
-    if (!this.env.ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY не задано");
-    return anthropicTransport(this.env.ANTHROPIC_API_KEY);
+  private async aiConfig(): Promise<AiConfig> {
+    const rows = await this.env.DB.prepare("SELECT key, value FROM settings WHERE key IN (?, ?, ?, ?)")
+      .bind(AI_KEYS.agents, AI_KEYS.budgetUsd, AI_KEYS.budgetFallbackModel, AI_KEYS.dataCollection)
+      .all<{ key: string; value: string }>();
+    const values: Record<string, unknown> = {};
+    for (const r of rows.results) {
+      try {
+        values[r.key] = JSON.parse(r.value);
+      } catch {
+        // Пошкоджене значення: візьметься значення за замовчуванням.
+      }
+    }
+    return aiFromSettings(values);
+  }
+
+  private async spentThisMonth(): Promise<number> {
+    const row = await this.env.DB.prepare("SELECT COALESCE(SUM(cost_usd), 0) AS spent FROM llm_calls WHERE ts >= ?")
+      .bind(monthStart(Date.now()))
+      .first<{ spent: number }>();
+    return row?.spent ?? 0;
   }
 
   /**
    * Єдиний шлях до моделі: стеля місячних витрат перевіряється перед викликом,
-   * кожен виклик пишеться в llm_calls. null, якщо стеля не дозволяє цей конвеєр.
+   * кожен виклик пишеться в llm_calls. Модель, рівень міркування й ліміт беруться з налаштувань агента.
+   * null, якщо стеля не дозволяє цей конвеєр.
    */
   private async llm(
-    pipeline: Pipeline,
-    req: { system: string; user: string; schema: Record<string, unknown>; maxTokens: number; effort: Effort },
+    pipeline: Exclude<Pipeline, "test">,
+    req: { system: string; user: string; schema: Record<string, unknown> },
   ): Promise<{ data: unknown; model: string; costUsd: number } | null> {
-    const budget = await this.setting("llm_budget_usd", 25);
-    const spent = await this.env.DB.prepare("SELECT COALESCE(SUM(cost_usd), 0) AS spent FROM llm_calls WHERE ts >= ?")
-      .bind(monthStart(Date.now()))
-      .first<{ spent: number }>();
-    const decision = decideModel(pipeline, spent?.spent ?? 0, budget);
+    const ai = await this.aiConfig();
+    const decision = decideModel(pipeline, await this.spentThisMonth(), ai);
     if (!decision.allowed) return null;
+    const res = await this.call(pipeline, decision.agent, ai, req);
+    return { data: JSON.parse(res.text) as unknown, model: res.model, costUsd: res.cost };
+  }
 
+  /** Виклик і запис у llm_calls. Вартість: від OpenRouter, інакше за ціною з каталогу. */
+  private async call(pipeline: Pipeline, agent: AgentConfig, ai: AiConfig, req: { system: string; user: string; schema: Record<string, unknown> }) {
     const t0 = Date.now();
-    const res = await this.transport()({ ...req, model: decision.model });
-    const cost = costUsd(res.model, res.usage);
+    const res = await this.transport()({
+      ...req,
+      model: agent.model,
+      fallback: agent.fallback,
+      effort: agent.effort,
+      maxTokens: agent.maxTokens,
+      dataCollection: ai.dataCollection,
+    });
+    const price = res.costUsd === null ? ((await this.models().catch(() => [] as ModelInfo[])).find((m) => m.id === res.model) ?? null) : null;
+    const cost = costUsd(res.costUsd, res.usage, price);
+    const latencyMs = Date.now() - t0;
     await this.env.DB.prepare(
       "INSERT INTO llm_calls (ts, pipeline, model, tokens_in, tokens_out, cost_usd, latency_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
-      .bind(new Date(t0).toISOString(), pipeline, res.model, res.usage.inputTokens, res.usage.outputTokens, cost, Date.now() - t0)
+      .bind(new Date(t0).toISOString(), pipeline, res.model, res.usage.inputTokens, res.usage.outputTokens, cost, latencyMs)
       .run();
-    return { data: JSON.parse(res.text) as unknown, model: res.model, costUsd: cost };
+    return { ...res, cost, latencyMs };
+  }
+
+  private modelsCache: { at: number; models: ModelInfo[] } | null = null;
+
+  /** Каталог моделей OpenRouter із підтримкою JSON-схеми. Кеш на 6 годин. */
+  async models(): Promise<ModelInfo[]> {
+    if (this.modelsCache && Date.now() - this.modelsCache.at < 6 * HOUR) return this.modelsCache.models;
+    const res = await fetch(`${OPENROUTER}/models`, { signal: AbortSignal.timeout(15_000) });
+    if (!res.ok) throw new Error(`каталог моделей OpenRouter: HTTP ${res.status}`);
+    const models = compactModels(((await res.json()) as { data?: Parameters<typeof compactModels>[0] }).data ?? []);
+    this.modelsCache = { at: Date.now(), models };
+    return models;
+  }
+
+  /** Стан ключа OpenRouter: використано, ліміт. null, якщо ключа немає. */
+  async keyInfo(): Promise<KeyInfo | null> {
+    const key = this.env.OPENROUTER_API_KEY;
+    if (!key) return null;
+    const res = await fetch(`${OPENROUTER}/key`, { headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) throw new Error(res.status === 401 ? "OpenRouter не прийняв ключ" : `OpenRouter: HTTP ${res.status}`);
+    return parseKeyInfo(await res.json());
+  }
+
+  /**
+   * Пробний виклик агента з поточними (або переданими з форми) налаштуваннями: чи відповідає модель JSON за схемою.
+   * Теж під стелею витрат і теж пишеться в llm_calls.
+   */
+  async testAgent(
+    id: AgentId,
+    override?: AgentConfig,
+  ): Promise<{ ok: boolean; model?: string; latencyMs?: number; costUsd?: number; error?: string }> {
+    if (!AGENTS.some((a) => a.id === id)) return { ok: false, error: "невідомий агент" };
+    const ai = await this.aiConfig();
+    if ((await this.spentThisMonth()) >= ai.budgetUsd) return { ok: false, error: `стелю $${ai.budgetUsd} вичерпано` };
+    try {
+      const res = await this.call("test", override ?? ai.agents[id], ai, {
+        system: "Ти перевіряєш з'єднання. Поверни JSON за схемою: ok = true, echo = слово з поля word у вхідних даних.",
+        user: JSON.stringify({ word: "ping" }),
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          required: ["ok", "echo"],
+          properties: { ok: { type: "boolean" }, echo: { type: "string" } },
+        },
+      });
+      const data = JSON.parse(res.text) as { ok?: unknown };
+      const ok = data.ok === true;
+      return { ok, model: res.model, latencyMs: res.latencyMs, costUsd: res.cost, ...(ok ? {} : { error: "модель відповіла не за схемою" }) };
+    } catch (e) {
+      return { ok: false, error: e instanceof LlmError ? e.message : String(e) };
+    }
   }
 
   // ── Новини ───────────────────────────────────────────────────────────────
@@ -502,8 +579,6 @@ export class Engine extends DurableObject<Env> {
           system: TRIAGE_SYSTEM,
           user: triageUser(pending.results),
           schema: triageSchema(symbols),
-          maxTokens: 8000,
-          effort: "low",
         });
         if (!res) skipped = "стелю витрат вичерпано";
         else {
@@ -665,8 +740,6 @@ export class Engine extends DurableObject<Env> {
       system: reportSystem(kind),
       user: JSON.stringify(input),
       schema: reportSchema(symbols),
-      maxTokens: 16000,
-      effort: "medium",
     });
     if (!res) throw new Error("стеля витрат не дозволяє звіт");
 
@@ -912,7 +985,7 @@ export class Engine extends DurableObject<Env> {
             minutesToMacro: toMacro,
           }),
         );
-        const review = { user, maxTokens: 8000, effort: "medium" as const };
+        const review = { user };
         const first = await this.llm("analyst", { ...review, system: ANALYST_SYSTEM, schema: ANALYST_SCHEMA });
         if (!first) {
           summary.notes.push("стелю витрат вичерпано: нові сигнали не публікуються");
@@ -1022,22 +1095,15 @@ export class Engine extends DurableObject<Env> {
   // ── Тижневий розбір ──────────────────────────────────────────────────────
 
   /**
-   * Спершу забирає готові пакети, потім, якщо настала неділя, рахує статистику й відправляє пакет Opus.
-   * Якщо стеля витрат не дозволяє або пакет не вдався, звіт виходить зі статистикою без розбору моделі.
+   * У неділю рахує статистику тижня й просить агента «Тижневий розбір» пояснити її.
+   * Якщо стеля витрат не дозволяє або виклик не вдався, звіт виходить зі статистикою без розбору моделі.
    */
-  private async runWeekly(now: number, force = false): Promise<"collected" | "submitted" | "saved" | "exists" | "pending" | "not_due"> {
+  private async runWeekly(now: number, force = false): Promise<{ status: "saved" | "exists" | "not_due"; id?: number }> {
     const db = this.env.DB;
-    const pending = await db
-      .prepare("SELECT id, report_date, created_at, input FROM llm_batches WHERE status = 'pending' AND pipeline = 'weekly_review'")
-      .all<{ id: string; report_date: string; created_at: string; input: string }>();
-    for (const b of pending.results) await this.collectWeekly(b, now);
-
     const timezone = await this.setting("timezone", "Europe/Kyiv");
     const due = force ? { date: localTime(now, timezone).date } : dueWeekly(now, timezone, await this.setting("weekly_review_time", "12:00"));
-    if (!due) return "not_due";
-    if (await this.reportExists("weekly", due.date)) return "exists";
-    const busy = await db.prepare("SELECT 1 AS x FROM llm_batches WHERE report_date = ? AND status = 'pending'").bind(due.date).first();
-    if (busy) return "pending";
+    if (!due) return { status: "not_due" };
+    if (await this.reportExists("weekly", due.date)) return { status: "exists" };
 
     const started = Date.now();
     const [week, allTime] = await Promise.all([
@@ -1046,12 +1112,6 @@ export class Engine extends DurableObject<Env> {
     ]);
     const stats = { week, allTime };
 
-    const spent = await db.prepare("SELECT COALESCE(SUM(cost_usd), 0) AS spent FROM llm_calls WHERE ts >= ?").bind(monthStart(now)).first<{ spent: number }>();
-    const decision = decideModel("weekly_review", spent?.spent ?? 0, await this.setting("llm_budget_usd", 25));
-    if (!decision.allowed) {
-      await this.saveWeekly(due.date, stats, null, "стеля витрат вичерпана: розбір моделі пропущено", started);
-      return "saved";
-    }
     const playbook = await this.playbook();
     const notes = await db
       .prepare("SELECT ts, action, note FROM journal WHERE ts >= ? AND note IS NOT NULL ORDER BY id DESC LIMIT 20")
@@ -1063,75 +1123,33 @@ export class Engine extends DurableObject<Env> {
       ),
     );
     const input = weeklyInput({ week, allTime, playbook: { version: playbook.version, rules: playbook.rules as Record<string, string> }, settings, notes: notes.results.map((n) => ({ ...n, note: n.note.slice(0, 300) })) });
+    let review: WeeklyReview | null = null;
+    let note: string | null = null;
+    let llm: { model: string; cost: number } | null = null;
     try {
-      const id = await this.batchTransport().submit(`weekly-${due.date}`, {
-        model: decision.model,
-        system: WEEKLY_SYSTEM,
-        user: JSON.stringify(input),
-        schema: WEEKLY_SCHEMA,
-        maxTokens: 16000,
-        effort: "high",
-      });
-      await db
-        .prepare("INSERT INTO llm_batches (id, pipeline, report_date, created_at, status, input) VALUES (?, 'weekly_review', ?, ?, 'pending', ?)")
-        .bind(id, due.date, new Date(now).toISOString(), JSON.stringify(stats))
-        .run();
-      return "submitted";
+      const res = await this.llm("weekly_review", { system: WEEKLY_SYSTEM, user: JSON.stringify(input), schema: WEEKLY_SCHEMA });
+      if (!res) note = "стеля витрат вичерпана: розбір моделі пропущено";
+      else {
+        llm = { model: res.model, cost: res.costUsd };
+        review = sanitizeWeekly(res.data);
+      }
     } catch (e) {
-      await this.saveWeekly(due.date, stats, null, `пакет не відправлено: ${String(e)}`, started);
-      return "saved";
+      note = `розбір моделі не вдався: ${e instanceof Error ? e.message : String(e)}`;
     }
+    return { status: "saved", id: await this.saveWeekly(due.date, stats, review, note, started, llm) };
   }
 
-  /** Тижневий розбір поза розкладом: за сьогоднішньою місцевою датою. Результат пакета забере наступний запуск. */
-  async weeklyNow(): Promise<{ status: string } | null> {
+  /** Тижневий розбір поза розкладом: за сьогоднішньою місцевою датою. */
+  async weeklyNow(): Promise<{ status: string; id?: number; error?: string } | null> {
     if (this.running) return null;
     this.running = true;
     try {
-      return { status: await this.runWeekly(Date.now(), true) };
+      return await this.runWeekly(Date.now(), true);
     } catch (e) {
-      return { status: "error", error: String(e) } as { status: string };
+      return { status: "error", error: String(e) };
     } finally {
       this.running = false;
     }
-  }
-
-  private async collectWeekly(b: { id: string; report_date: string; created_at: string; input: string }, now: number): Promise<void> {
-    const db = this.env.DB;
-    const stats = JSON.parse(b.input) as { week: Awaited<ReturnType<typeof loadStats>>; allTime: Awaited<ReturnType<typeof loadStats>> };
-    const finish = async (status: "done" | "error", error: string | null) =>
-      db.prepare("UPDATE llm_batches SET status = ?, ended_at = ?, error = ? WHERE id = ?").bind(status, new Date(now).toISOString(), error, b.id).run();
-    const transport = this.batchTransport();
-    const state = await transport.status(b.id);
-    if (!state.ended) {
-      // Пакет живе до 24 годин; після цього звіт виходить без розбору.
-      if (now - Date.parse(b.created_at) > 26 * HOUR) {
-        await finish("error", "пакет не завершився за 26 годин");
-        await this.saveWeekly(b.report_date, stats, null, "розбір моделі не встиг", now);
-      }
-      return;
-    }
-    const outcome = await transport.result(b.id);
-    if (!outcome.ok) {
-      await finish("error", outcome.error);
-      await this.saveWeekly(b.report_date, stats, null, `розбір моделі не вдався: ${outcome.error}`, now);
-      return;
-    }
-    const res = outcome.response;
-    const cost = costUsd(res.model, res.usage) * BATCH_DISCOUNT;
-    await db
-      .prepare("INSERT INTO llm_calls (ts, pipeline, model, tokens_in, tokens_out, cost_usd, latency_ms) VALUES (?, 'weekly_review', ?, ?, ?, ?, ?)")
-      .bind(new Date(now).toISOString(), res.model, res.usage.inputTokens, res.usage.outputTokens, cost, now - Date.parse(b.created_at))
-      .run();
-    let review: WeeklyReview | null = null;
-    let note: string | null = null;
-    try {
-      review = sanitizeWeekly(JSON.parse(res.text));
-    } catch (e) {
-      note = `розбір моделі непридатний: ${String(e)}`;
-    }
-    await finish(review ? "done" : "error", note);
-    await this.saveWeekly(b.report_date, stats, review, note, now, { model: res.model, cost });
   }
 
   private async saveWeekly(
@@ -1141,14 +1159,15 @@ export class Engine extends DurableObject<Env> {
     note: string | null,
     started: number,
     llm: { model: string; cost: number } | null = null,
-  ): Promise<void> {
-    if (await this.reportExists("weekly", date)) return;
+  ): Promise<number | undefined> {
+    if (await this.reportExists("weekly", date)) return undefined;
     const body = weeklyBody(stats.week, stats.allTime, review, note);
     const row = await this.env.DB.prepare("INSERT INTO reports (kind, date, body, model, cost_usd, created_at) VALUES ('weekly', ?, ?, ?, ?, ?) RETURNING id")
       .bind(date, JSON.stringify(body), llm?.model ?? null, llm?.cost ?? null, new Date().toISOString())
       .first<{ id: number }>();
     await this.logRun("weekly_review", started, { id: row!.id, date, review: review !== null, note }, null);
     await this.push({ title: "Тижневий розбір готовий", body: body.content.headline, url: `/?report=${row!.id}`, tag: `report-${row!.id}` });
+    return row!.id;
   }
 
   // ── Прибирання ───────────────────────────────────────────────────────────

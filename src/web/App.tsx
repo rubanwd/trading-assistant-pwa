@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { fmtPrice, useLivePrice } from "./live";
 import { Push } from "./Push";
 import { Reports, type ReportCard } from "./Reports";
+import { AiSettings } from "./Ai";
 import { Settings } from "./Settings";
 import { OpenSignals, Signals } from "./Signals";
 import { Stats } from "./Stats";
@@ -23,9 +24,9 @@ interface Status {
 
 const MOOD = { risk_on: "ризик-он", risk_off: "ризик-оф", mixed: "змішаний" } as const;
 const TREND = { up: "вгору", down: "вниз", range: "боковик" } as const;
-type Tab = "today" | "signals" | "reports" | "stats" | "settings";
-const NAV: Exclude<Tab, "settings">[] = ["today", "signals", "reports", "stats"];
-const TABS: Record<Tab, string> = { today: "Сьогодні", signals: "Сигнали", reports: "Звіти", stats: "Статистика", settings: "Налаштування" };
+type Tab = "today" | "signals" | "reports" | "stats" | "settings" | "ai";
+const NAV: Exclude<Tab, "settings" | "ai">[] = ["today", "signals", "reports", "stats"];
+const TABS: Record<Tab, string> = { today: "Сьогодні", signals: "Сигнали", reports: "Звіти", stats: "Статистика", settings: "Налаштування", ai: "Моделі ШІ" };
 
 /** Банер «дані з кешу»: service worker віддав збережену відповідь, бо мережі немає. */
 function OfflineBanner() {
@@ -155,16 +156,25 @@ export function App() {
     history.replaceState(null, "", id ? `/?${kind}=${id}` : "/");
     window.scrollTo(0, 0);
   };
+  const go = (t: Tab) => {
+    setTab(t);
+    window.scrollTo(0, 0);
+  };
 
   return (
     <div style={{ minHeight: "100dvh", background: c.bg, color: c.ink, fontFamily: "Inter, system-ui, sans-serif", display: "flex", flexDirection: "column" }}>
       <main style={{ flex: 1, padding: "24px 20px 16px", boxSizing: "border-box", display: "flex", flexDirection: "column", gap: 12, width: "100%", maxWidth: 640, margin: "0 auto" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
           <h1 style={{ margin: 0, fontSize: 28, fontWeight: 600 }}>{TABS[tab]}</h1>
           {tab === "today" && (
-            <button type="button" onClick={() => { setTab("settings"); window.scrollTo(0, 0); }} style={{ ...secondary, minHeight: 40, fontSize: 14 }}>
-              Налаштування
-            </button>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button type="button" onClick={() => go("ai")} style={{ ...secondary, minHeight: 40, fontSize: 14, padding: "0 12px", whiteSpace: "nowrap" }}>
+                Моделі ШІ
+              </button>
+              <button type="button" onClick={() => go("settings")} style={{ ...secondary, minHeight: 40, fontSize: 14, padding: "0 12px", whiteSpace: "nowrap" }}>
+                Налаштування
+              </button>
+            </div>
           )}
         </div>
         <OfflineBanner />
@@ -172,7 +182,8 @@ export function App() {
         {tab === "signals" && <Signals openId={signalId} onOpen={(id) => open("signal", id)} />}
         {tab === "reports" && <Reports openId={reportId} onOpen={(id) => open("report", id)} />}
         {tab === "stats" && <Stats />}
-        {tab === "settings" && <Settings onBack={() => setTab("today")} />}
+        {tab === "settings" && <Settings onBack={() => setTab("today")} onOpenAi={() => go("ai")} />}
+        {tab === "ai" && <AiSettings onBack={() => setTab("today")} />}
       </main>
       <nav style={{ position: "sticky", bottom: 0, display: "flex", background: c.card, borderTop: `1px solid ${c.line}`, paddingBottom: "env(safe-area-inset-bottom)" }}>
         {NAV.map((t) => (

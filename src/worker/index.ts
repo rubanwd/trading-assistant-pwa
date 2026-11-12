@@ -4,6 +4,8 @@ import { checkAccess } from "./access";
 import { engineStub, type Env } from "./env";
 import { parseSubscription } from "./push";
 import { SETTINGS, validatePlaybook, validateSettings } from "../shared/settings";
+import { AGENTS, AI_KEYS, aiFromSettings, DEFAULT_AI, validateAi, type AgentConfig, type AiConfig, type ModelInfo } from "../shared/ai";
+import { PIPELINE_AGENT } from "./llm";
 import { PLAYBOOK_V1 } from "./signals/review";
 import { calibration, hit, loadStats } from "./stats";
 
@@ -265,6 +267,88 @@ app.post("/api/playbook", async (c) => {
     db.prepare("INSERT INTO playbook_versions (created_at, content, active) VALUES (?, ?, 1) RETURNING version").bind(new Date().toISOString(), JSON.stringify(parsed.rules)),
   ]);
   return c.json({ ok: true, version: inserted!.results[0]!.version });
+});
+
+async function loadAi(db: D1Database): Promise<AiConfig> {
+  const rows = await db
+    .prepare("SELECT key, value FROM settings WHERE key IN (?, ?, ?, ?)")
+    .bind(AI_KEYS.agents, AI_KEYS.budgetUsd, AI_KEYS.budgetFallbackModel, AI_KEYS.dataCollection)
+    .all<{ key: string; value: string }>();
+  return aiFromSettings(Object.fromEntries(rows.results.map((r) => [r.key, JSON.parse(r.value)])));
+}
+
+/** Моделі для перевірки форми: каталог OpenRouter через рушій; без мережі null (перевіряється лише формат). */
+async function knownModels(env: Env): Promise<{ models: ModelInfo[]; error: string | null }> {
+  try {
+    return { models: await engineStub(env).models(), error: null };
+  } catch (e) {
+    return { models: [], error: String(e) };
+  }
+}
+
+/** Сторінка «Моделі ШІ»: налаштування агентів, каталог моделей, стан ключа і витрати за агентами. */
+app.get("/api/ai", async (c) => {
+  const db = c.env.DB;
+  const now = new Date();
+  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+  const [config, catalog, spend, key] = await Promise.all([
+    loadAi(db),
+    knownModels(c.env),
+    db
+      .prepare("SELECT pipeline, SUM(cost_usd) AS usd, COUNT(*) AS calls FROM llm_calls WHERE ts >= ? GROUP BY pipeline")
+      .bind(monthStart)
+      .all<{ pipeline: string; usd: number; calls: number }>(),
+    engineStub(c.env)
+      .keyInfo()
+      .then((info) => ({ configured: info !== null, info, error: null as string | null }))
+      .catch((e) => ({ configured: true, info: null, error: String(e) })),
+  ]);
+  const byAgent: Record<string, { usd: number; calls: number }> = {};
+  for (const row of spend.results) {
+    const agent = row.pipeline === "test" ? "test" : (PIPELINE_AGENT as Record<string, string>)[row.pipeline] ?? row.pipeline;
+    const cur = (byAgent[agent] ??= { usd: 0, calls: 0 });
+    cur.usd += row.usd;
+    cur.calls += row.calls;
+  }
+  return c.json({
+    config,
+    agents: AGENTS,
+    models: catalog.models,
+    modelsError: catalog.error,
+    key,
+    spend: { monthUsd: spend.results.reduce((s, r) => s + r.usd, 0), byAgent },
+  });
+});
+
+/** Збереження налаштувань моделей. Моделі звіряються з каталогом OpenRouter. */
+app.put("/api/ai", async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const { models } = await knownModels(c.env);
+  const res = validateAi(body, models.length ? new Set(models.map((m) => m.id)) : null);
+  if (!res.ok) return c.json({ error: "некоректні значення", errors: res.errors }, 400);
+  const upsert = c.env.DB.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value");
+  await c.env.DB.batch([
+    upsert.bind(AI_KEYS.agents, JSON.stringify(res.config.agents)),
+    upsert.bind(AI_KEYS.budgetUsd, JSON.stringify(res.config.budgetUsd)),
+    upsert.bind(AI_KEYS.budgetFallbackModel, JSON.stringify(res.config.budgetFallbackModel)),
+    upsert.bind(AI_KEYS.dataCollection, JSON.stringify(res.config.dataCollection)),
+  ]);
+  return c.json({ ok: true });
+});
+
+/** Пробний виклик агента. Можна передати незбережені налаштування з форми. Витрата пишеться в llm_calls. */
+app.post("/api/ai/test", async (c) => {
+  const body = await c.req.json<{ agent?: string; config?: unknown }>().catch(() => ({}) as { agent?: string; config?: unknown });
+  const agent = AGENTS.find((a) => a.id === body.agent);
+  if (!agent) return c.json({ error: "невідомий агент" }, 400);
+  let override: AgentConfig | undefined;
+  if (body.config) {
+    const { models } = await knownModels(c.env);
+    const res = validateAi({ ...DEFAULT_AI, agents: { ...DEFAULT_AI.agents, [agent.id]: body.config } }, models.length ? new Set(models.map((m) => m.id)) : null);
+    if (!res.ok) return c.json({ ok: false, error: Object.values(res.errors).join("; ") }, 400);
+    override = res.config.agents[agent.id];
+  }
+  return c.json(await engineStub(c.env).testAgent(agent.id, override));
 });
 
 /** Публічний ключ VAPID для підписки в браузері. */

@@ -1,4 +1,4 @@
-ANTHROPIC_API_KEY=
+OPENROUTER_API_KEY=
 DEV=1
 # Web Push: `npx @pushforge/builder vapid` дає публічний ключ і приватний у форматі JWK (один рядок JSON).
 VAPID_PUBLIC_KEY=

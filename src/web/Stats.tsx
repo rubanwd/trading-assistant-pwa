@@ -19,7 +19,7 @@ export interface Stats {
 
 const PIPELINE: Record<string, string> = {
   news: "Сортувальник новин", morning_report: "Ранкові звіти", evening_report: "Вечірні звіти",
-  analyst: "Аналітик", skeptic: "Скептик", weekly_review: "Тижневий розбір",
+  analyst: "Аналітик", skeptic: "Скептик", weekly_review: "Тижневий розбір", test: "Пробні виклики",
 };
 const FILTER: Record<string, string> = {
   rr: "R:R нижче порога", regime: "проти режиму", market: "проти настрою ринку", duplicate: "уже є сигнал по монеті",

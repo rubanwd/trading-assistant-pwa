@@ -272,11 +272,15 @@ function PlaybookEditor() {
   );
 }
 
-export function Settings({ onBack }: { onBack: () => void }) {
+export function Settings({ onBack, onOpenAi }: { onBack: () => void; onOpenAi: () => void }) {
   return (
     <>
       <button type="button" style={{ ...secondary, alignSelf: "flex-start" }} onClick={onBack}>← Назад</button>
       <p style={{ ...p, color: c.dim }}>Зміни діють без деплою: рушій читає налаштування на кожному запуску.</p>
+      <button type="button" onClick={onOpenAi} style={{ ...card, color: c.ink, textAlign: "left", font: "inherit", cursor: "pointer" }}>
+        <span style={{ ...p, fontWeight: 600 }}>Моделі ШІ та бюджет →</span>
+        <span style={dim}>Модель для кожного агента через OpenRouter, рівень міркування, стеля витрат, приватність.</span>
+      </button>
       <SettingsForm />
       <PlaybookEditor />
     </>

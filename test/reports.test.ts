@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { resolveForecast, statement, type ForecastRule } from "../src/worker/forecasts";
-import { costUsd, decideModel, MODELS, monthStart } from "../src/worker/llm";
+import { DEFAULT_AI } from "../src/shared/ai";
+import { costUsd, decideModel, monthStart } from "../src/worker/llm";
 import { decodeEntities, newsHash, parseFeed } from "../src/worker/news/rss";
 import { sanitizeTriage, triageSchema } from "../src/worker/news/triage";
 import { parseSubscription, sendPush } from "../src/worker/push";
@@ -153,22 +154,25 @@ describe("сортувальник новин", () => {
 });
 
 describe("бюджет і вартість", () => {
-  it("рахує вартість за тарифом моделі", () => {
-    expect(costUsd("claude-sonnet-5-5", { inputTokens: 25_000, outputTokens: 3_000 })).toBeCloseTo(0.08, 10);
-    expect(costUsd("claude-haiku-5-5", { inputTokens: 1_000_000, outputTokens: 1_000_000 })).toBeCloseTo(0.6, 10);
-    // Запасна модель після відмови та невідомі моделі не занижують витрати.
-    expect(costUsd("claude-sonnet-5", { inputTokens: 1_000_000, outputTokens: 0 })).toBe(2);
-    expect(costUsd("something-new", { inputTokens: 1_000_000, outputTokens: 1_000_000 })).toBe(30);
+  it("бере вартість від OpenRouter, інакше рахує за ціною каталогу, інакше за консервативною", () => {
+    const usage = { inputTokens: 25_000, outputTokens: 3_000 };
+    expect(costUsd(0.0123, usage, null)).toBe(0.0123);
+    expect(costUsd(null, usage, { inputPrice: 2, outputPrice: 10 })).toBeCloseTo(0.08, 10);
+    // Невідома модель без вартості не занижує витрати проти стелі.
+    expect(costUsd(null, { inputTokens: 1_000_000, outputTokens: 1_000_000 }, null)).toBe(90);
   });
 
-  it("до стелі працює модель ролі", () => {
-    expect(decideModel("news", 24.99, 25)).toEqual({ allowed: true, model: MODELS.news });
-    expect(decideModel("morning_report", 0, 25)).toEqual({ allowed: true, model: MODELS.report });
+  it("до стелі працює модель агента", () => {
+    expect(decideModel("news", 24.99, DEFAULT_AI)).toEqual({ allowed: true, agent: DEFAULT_AI.agents.news });
+    expect(decideModel("morning_report", 0, DEFAULT_AI)).toEqual({ allowed: true, agent: DEFAULT_AI.agents.report });
+    expect(decideModel("weekly_review", 0, DEFAULT_AI)).toEqual({ allowed: true, agent: DEFAULT_AI.agents.weekly });
   });
 
-  it("після стелі звіти пише Haiku, сортування новин зупиняється", () => {
-    expect(decideModel("evening_report", 25, 25)).toEqual({ allowed: true, model: MODELS.news });
-    expect(decideModel("news", 25, 25).allowed).toBe(false);
+  it("після стелі звіти пише запасна модель, решта зупиняється", () => {
+    const after = decideModel("evening_report", 25, DEFAULT_AI);
+    expect(after).toEqual({ allowed: true, agent: { ...DEFAULT_AI.agents.report, model: DEFAULT_AI.budgetFallbackModel, effort: "default", fallback: null } });
+    expect(decideModel("news", 25, DEFAULT_AI).allowed).toBe(false);
+    expect(decideModel("weekly_review", 30, DEFAULT_AI).allowed).toBe(false);
   });
 
   it("місяць починається в UTC", () => {
