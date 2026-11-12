@@ -4,7 +4,8 @@ export interface Env {
   ASSETS: Fetcher;
   DB: D1Database;
   ENGINE: DurableObjectNamespace<Engine>;
-  ANTHROPIC_API_KEY?: string;
+  /** Ключ OpenRouter: усі виклики моделей. Лише через `wrangler secret put`. */
+  OPENROUTER_API_KEY?: string;
   /** Cloudflare Access: домен команди (team.cloudflareaccess.com) і тег AUD застосунку. */
   ACCESS_TEAM_DOMAIN?: string;
   ACCESS_AUD?: string;

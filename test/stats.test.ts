@@ -144,7 +144,7 @@ describe("налаштування", () => {
   it("кожне стартове налаштування з міграцій проходить перевірку", () => {
     const defaults: Record<string, unknown> = {
       timezone: "Europe/Kyiv", report_times: { morning: "07:30", evening: "20:30" }, risk_per_trade_pct: 1, min_rr: 2, skeptic_threshold: 0.6,
-      max_active_signals: 3, macro_blackout_hours: 2, max_signal_pushes_per_day: 5, llm_budget_usd: 25, signal_ttl_hours: 12, signal_max_hold_hours: 48,
+      max_active_signals: 3, macro_blackout_hours: 2, max_signal_pushes_per_day: 5, signal_ttl_hours: 12, signal_max_hold_hours: 48,
       signal_cooldown_hours: 6, max_candidates_per_scan: 3, quiet_hours: { from: "23:00", to: "07:00" }, macro_events: [], deposit_usd: null,
       fee_pct_per_side: 0.05, retention_days: 30, weekly_review_time: "12:00", playbook_min_days: 14, market_source: "auto",
       watchlist: ["BTCUSDT", "ETHUSDT"], news_feeds: [{ source: "coindesk", url: "https://www.coindesk.com/arc/outboundfeeds/rss" }],

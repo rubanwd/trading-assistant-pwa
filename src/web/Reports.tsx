@@ -129,7 +129,7 @@ function WeeklyView({ report, onBack }: { report: WeeklyReport; onBack: () => vo
       <StatsView stats={report.body[scope]} />
       <p style={dim}>
         Модель: {report.model ?? "—"}
-        {report.cost_usd !== null && ` · $${report.cost_usd.toFixed(3)}`} (Batch API, −50%). Це аналіз, а не фінансова порада.
+        {report.cost_usd !== null && ` · $${report.cost_usd.toFixed(3)}`}. Це аналіз, а не фінансова порада.
       </p>
     </>
   );
@@ -252,15 +252,10 @@ export function Reports({ openId, onOpen }: { openId: number | null; onOpen: (id
     setBusy(true);
     setError(null);
     try {
-      const res = await api<{ status: string; error?: string }>("/api/reports/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ kind: "weekly" }) });
-      const text: Record<string, string> = {
-        submitted: "Розбір відправлено Opus через Batch API. Він з'явиться тут протягом години, після одного з наступних запусків рушія.",
-        pending: "Розбір за сьогодні вже обробляється.",
-        exists: "Тижневий розбір за сьогодні вже є.",
-        saved: "Розбір моделі зараз недоступний: збережено статистику без нього.",
-      };
-      setNote(text[res.status] ?? res.error ?? res.status);
+      const res = await api<{ status: string; id?: number; error?: string }>("/api/reports/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ kind: "weekly" }) });
       load();
+      if (res.status === "saved" && res.id) onOpen(res.id);
+      else setNote(res.status === "exists" ? "Тижневий розбір за сьогодні вже є." : res.error ?? res.status);
     } catch (e) {
       setError(String(e));
     } finally {

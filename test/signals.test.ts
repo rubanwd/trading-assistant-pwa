@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { entryMid, feeR, positionSize, riskReward } from "../src/shared/risk";
+import { DEFAULT_AI } from "../src/shared/ai";
 import { decideModel } from "../src/worker/llm";
 import { detect } from "../src/worker/signals/detectors";
 import { candidateKey, minutesToMacro, reject, type FilterContext } from "../src/worker/signals/filter";
@@ -298,8 +299,9 @@ describe("аналітик і скептик", () => {
   });
 
   it("після стелі витрат перевірка сигналів зупиняється", () => {
-    expect(decideModel("analyst", 10, 25)).toEqual({ allowed: true, model: "claude-sonnet-5-5" });
-    expect(decideModel("analyst", 25, 25).allowed).toBe(false);
-    expect(decideModel("skeptic", 30, 25).allowed).toBe(false);
+    const ai = { ...DEFAULT_AI, budgetUsd: 25 };
+    expect(decideModel("analyst", 10, ai)).toEqual({ allowed: true, agent: DEFAULT_AI.agents.analyst });
+    expect(decideModel("analyst", 25, ai).allowed).toBe(false);
+    expect(decideModel("skeptic", 30, ai).allowed).toBe(false);
   });
 });

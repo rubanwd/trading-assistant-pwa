@@ -120,7 +120,6 @@ export const SETTINGS: SettingSpec[] = [
     },
   },
   { key: "market_source", group: "Ринок", label: "Джерело даних", help: "auto: Binance, а якщо він недоступний з ЄС, то Bybit.", kind: "enum", options: ["auto", "binance", "bybit"], check: (v) => (v === "auto" || v === "binance" || v === "bybit" ? ok(v) : fail("auto, binance або bybit")) },
-  { key: "llm_budget_usd", group: "Модель і дані", label: "Стеля витрат на моделі, $ на місяць", kind: "number", check: num(1, 500) },
   {
     key: "news_feeds",
     group: "Модель і дані",
