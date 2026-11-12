@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Push } from "./Push";
 import { Reports, type ReportCard } from "./Reports";
+import { OpenSignals, Signals } from "./Signals";
 import { api, c, card, dim, h2, KIND, p, primary, secondary, time } from "./ui";
 
 interface Target { name: string; ok: boolean; status: number | null; ms: number; note?: string }
@@ -17,9 +18,10 @@ interface Status {
 
 const MOOD = { risk_on: "ризик-он", risk_off: "ризик-оф", mixed: "змішаний" } as const;
 const TREND = { up: "вгору", down: "вниз", range: "боковик" } as const;
-type Tab = "today" | "reports";
+type Tab = "today" | "signals" | "reports";
+const TABS: Record<Tab, string> = { today: "Сьогодні", signals: "Сигнали", reports: "Звіти" };
 
-function Today({ onOpenReport }: { onOpenReport: (id: number) => void }) {
+function Today({ onOpenReport, onOpenSignal }: { onOpenReport: (id: number) => void; onOpenSignal: (id: number) => void }) {
   const [status, setStatus] = useState<Status | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -63,6 +65,7 @@ function Today({ onOpenReport }: { onOpenReport: (id: number) => void }) {
           <p style={dim}>Звітів ще немає. Перший з'явиться о 07:30 або 20:30 за Києвом.</p>
         </section>
       )}
+      <OpenSignals onOpen={onOpenSignal} lastScan={run?.kind === "scan" ? run.started_at : null} />
       <section style={card}>
         <h2 style={h2}>Пульс системи</h2>
         {error && <p style={{ ...p, color: c.orange }}>Немає зв'язку з API: {error}</p>}
@@ -97,35 +100,40 @@ function Today({ onOpenReport }: { onOpenReport: (id: number) => void }) {
         <button type="button" onClick={() => post("/api/scan")} disabled={busy} style={secondary}>Запустити скан</button>
       </section>
       <Push />
-      <p style={dim}>Етап «Звіти»: скан раз на 30 хв, звіти о 07:30 і 20:30. Сигналів ще немає.</p>
+      <p style={dim}>Скан раз на 30 хв, звіти о 07:30 і 20:30. Система пропонує, рішення за тобою.</p>
     </>
   );
 }
 
 export function App() {
-  // Сповіщення відкриває застосунок з ?report=<id>.
-  const initial = Number(new URLSearchParams(location.search).get("report")) || null;
-  const [tab, setTab] = useState<Tab>(initial ? "reports" : "today");
-  const [reportId, setReportId] = useState<number | null>(initial);
+  // Сповіщення відкриває застосунок з ?report=<id> або ?signal=<id>.
+  const query = new URLSearchParams(location.search);
+  const initialReport = Number(query.get("report")) || null;
+  const initialSignal = Number(query.get("signal")) || null;
+  const [tab, setTab] = useState<Tab>(initialSignal ? "signals" : initialReport ? "reports" : "today");
+  const [reportId, setReportId] = useState<number | null>(initialReport);
+  const [signalId, setSignalId] = useState<number | null>(initialSignal);
 
-  const openReport = (id: number | null) => {
-    setReportId(id);
-    setTab("reports");
-    history.replaceState(null, "", id ? `/?report=${id}` : "/");
+  const open = (kind: "report" | "signal", id: number | null) => {
+    (kind === "report" ? setReportId : setSignalId)(id);
+    setTab(kind === "report" ? "reports" : "signals");
+    history.replaceState(null, "", id ? `/?${kind}=${id}` : "/");
     window.scrollTo(0, 0);
   };
 
   return (
     <div style={{ minHeight: "100dvh", background: c.bg, color: c.ink, fontFamily: "Inter, system-ui, sans-serif", display: "flex", flexDirection: "column" }}>
       <main style={{ flex: 1, padding: "24px 20px 16px", boxSizing: "border-box", display: "flex", flexDirection: "column", gap: 12, width: "100%", maxWidth: 640, margin: "0 auto" }}>
-        <h1 style={{ margin: 0, fontSize: 28, fontWeight: 600 }}>{tab === "today" ? "Сьогодні" : "Звіти"}</h1>
-        {tab === "today" ? <Today onOpenReport={openReport} /> : <Reports openId={reportId} onOpen={openReport} />}
+        <h1 style={{ margin: 0, fontSize: 28, fontWeight: 600 }}>{TABS[tab]}</h1>
+        {tab === "today" && <Today onOpenReport={(id) => open("report", id)} onOpenSignal={(id) => open("signal", id)} />}
+        {tab === "signals" && <Signals openId={signalId} onOpen={(id) => open("signal", id)} />}
+        {tab === "reports" && <Reports openId={reportId} onOpen={(id) => open("report", id)} />}
       </main>
       <nav style={{ position: "sticky", bottom: 0, display: "flex", background: c.card, borderTop: `1px solid ${c.line}`, paddingBottom: "env(safe-area-inset-bottom)" }}>
-        {(["today", "reports"] as const).map((t) => (
-          <button key={t} type="button" aria-current={tab === t ? "page" : undefined} onClick={() => { setTab(t); if (t === "today") history.replaceState(null, "", "/"); }}
+        {(Object.keys(TABS) as Tab[]).map((t) => (
+          <button key={t} type="button" aria-current={tab === t ? "page" : undefined} onClick={() => { setTab(t); history.replaceState(null, "", "/"); if (t === "signals") setSignalId(null); if (t === "reports") setReportId(null); }}
             style={{ flex: 1, minHeight: 56, border: 0, background: "transparent", color: tab === t ? c.blue : c.dim, font: "600 14px Inter, system-ui, sans-serif" }}>
-            {t === "today" ? "Сьогодні" : "Звіти"}
+            {TABS[t]}
           </button>
         ))}
       </nav>

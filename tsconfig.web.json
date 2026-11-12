@@ -4,5 +4,5 @@
     "strict": true, "skipLibCheck": true, "noEmit": true, "jsx": "react-jsx",
     "lib": ["ES2022", "DOM", "DOM.Iterable"]
   },
-  "include": ["src/web"]
+  "include": ["src/shared", "src/web"]
 }

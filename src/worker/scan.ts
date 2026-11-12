@@ -14,6 +14,8 @@ const CONCURRENCY = 3;
 
 export interface ScanResult {
   snapshots: Snapshot[];
+  /** Свічки, з яких пораховано знімки: потрібні детекторам і супроводу сигналів, у базу не йдуть. */
+  candles: Map<string, Record<Timeframe, Candle[]>>;
   market: MarketRegime;
   /** Монети без знімка та некритичні збої (фандинг, відкритий інтерес). */
   errors: { symbol: string | null; message: string }[];
@@ -44,6 +46,7 @@ export async function scan(market: MarketData, symbols: string[], now: number): 
     errors.push({ symbol: null, message: `фандинг: ${String(e)}` });
   }
 
+  const candlesBySymbol: ScanResult["candles"] = new Map();
   const results = await pool(symbols, CONCURRENCY, async (symbol): Promise<Snapshot | null> => {
     // Збій відкритого інтересу некритичний; пишемо його, лише якщо знімок таки вийшов.
     let oiError: string | null = null;
@@ -56,6 +59,7 @@ export async function scan(market: MarketData, symbols: string[], now: number): 
         }),
       ]);
       const candles = Object.fromEntries(TIMEFRAMES.map((tf, i) => [tf, series[i]!])) as Record<Timeframe, Candle[]>;
+      candlesBySymbol.set(symbol, candles);
       const snapshot = buildSnapshot({ symbol, now, candles, funding: funding.get(symbol) ?? null, openInterest });
       if (oiError) errors.push({ symbol, message: oiError });
       return snapshot;
@@ -71,5 +75,5 @@ export async function scan(market: MarketData, symbols: string[], now: number): 
     btc?.regime.trend ?? null,
     snapshots.map((s) => (s.tf["4h"].ema200 === null ? null : s.tf["4h"].close > s.tf["4h"].ema200)),
   );
-  return { snapshots, market: market_, errors };
+  return { snapshots, candles: candlesBySymbol, market: market_, errors };
 }

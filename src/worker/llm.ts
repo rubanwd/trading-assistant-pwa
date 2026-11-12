@@ -6,7 +6,7 @@ export const MODELS = {
   report: "claude-sonnet-5-5",
 } as const;
 
-export type Pipeline = "news" | "morning_report" | "evening_report";
+export type Pipeline = "news" | "morning_report" | "evening_report" | "analyst" | "skeptic";
 export type Effort = "low" | "medium" | "high";
 
 /** Ціни за 1 млн токенів, $: вхід і вихід. */
@@ -40,12 +40,13 @@ export type BudgetDecision = { allowed: true; model: string } | { allowed: false
 
 /**
  * Перевірка стелі перед викликом. Поки стелю не вичерпано, працює модель ролі.
- * Після стелі звіти пише Haiku, а сортування новин зупиняється до наступного місяця.
+ * Після стелі звіти пише Haiku; сортування новин і перевірка сигналів зупиняються до наступного місяця,
+ * тож нові сигнали не публікуються.
  */
 export function decideModel(pipeline: Pipeline, spentUsd: number, budgetUsd: number): BudgetDecision {
   if (spentUsd < budgetUsd) return { allowed: true, model: pipeline === "news" ? MODELS.news : MODELS.report };
-  if (pipeline === "news") return { allowed: false, reason: `стелю $${budgetUsd} вичерпано` };
-  return { allowed: true, model: MODELS.news };
+  if (pipeline === "morning_report" || pipeline === "evening_report") return { allowed: true, model: MODELS.news };
+  return { allowed: false, reason: `стелю $${budgetUsd} вичерпано` };
 }
 
 export interface LlmRequest {
