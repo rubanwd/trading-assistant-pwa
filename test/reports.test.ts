@@ -13,8 +13,8 @@ describe("час звітів", () => {
   const kyiv = "Europe/Kyiv";
 
   it("рахує київський час узимку (UTC+2) і влітку (UTC+3)", () => {
-    expect(localTime(Date.UTC(2026, 10, 12, 5, 30), kyiv)).toEqual({ date: "2026-11-12", minutes: 7 * 60 + 30 });
-    expect(localTime(Date.UTC(2026, 6, 1, 4, 30), kyiv)).toEqual({ date: "2026-07-01", minutes: 7 * 60 + 30 });
+    expect(localTime(Date.UTC(2026, 10, 12, 5, 30), kyiv)).toEqual({ date: "2026-11-12", minutes: 7 * 60 + 30, weekday: 4 });
+    expect(localTime(Date.UTC(2026, 6, 1, 4, 30), kyiv)).toEqual({ date: "2026-07-01", minutes: 7 * 60 + 30, weekday: 3 });
     expect(localTime(Date.UTC(2026, 10, 12, 22, 30), kyiv).date).toBe("2026-11-13");
     expect(clock(Date.UTC(2026, 10, 12, 17, 5), kyiv)).toBe("19:05");
   });

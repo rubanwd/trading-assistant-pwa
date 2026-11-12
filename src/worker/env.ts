@@ -5,6 +5,9 @@ export interface Env {
   DB: D1Database;
   ENGINE: DurableObjectNamespace<Engine>;
   ANTHROPIC_API_KEY?: string;
+  /** Cloudflare Access: домен команди (team.cloudflareaccess.com) і тег AUD застосунку. */
+  ACCESS_TEAM_DOMAIN?: string;
+  ACCESS_AUD?: string;
   /** Web Push: публічний ключ VAPID (змінна) і приватний у форматі JWK (секрет). */
   VAPID_PUBLIC_KEY?: string;
   VAPID_PRIVATE_KEY?: string;

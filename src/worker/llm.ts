@@ -4,9 +4,13 @@ import Anthropic from "@anthropic-ai/sdk";
 export const MODELS = {
   news: "claude-haiku-5-5",
   report: "claude-sonnet-5-5",
+  weekly: "claude-opus-5-5",
 } as const;
 
-export type Pipeline = "news" | "morning_report" | "evening_report" | "analyst" | "skeptic";
+/** Знижка Message Batches API. */
+export const BATCH_DISCOUNT = 0.5;
+
+export type Pipeline = "news" | "morning_report" | "evening_report" | "analyst" | "skeptic" | "weekly_review";
 export type Effort = "low" | "medium" | "high";
 
 /** Ціни за 1 млн токенів, $: вхід і вихід. */
@@ -44,7 +48,9 @@ export type BudgetDecision = { allowed: true; model: string } | { allowed: false
  * тож нові сигнали не публікуються.
  */
 export function decideModel(pipeline: Pipeline, spentUsd: number, budgetUsd: number): BudgetDecision {
-  if (spentUsd < budgetUsd) return { allowed: true, model: pipeline === "news" ? MODELS.news : MODELS.report };
+  if (spentUsd < budgetUsd) {
+    return { allowed: true, model: pipeline === "news" ? MODELS.news : pipeline === "weekly_review" ? MODELS.weekly : MODELS.report };
+  }
   if (pipeline === "morning_report" || pipeline === "evening_report") return { allowed: true, model: MODELS.news };
   return { allowed: false, reason: `стелю $${budgetUsd} вичерпано` };
 }
@@ -99,5 +105,67 @@ export function anthropicTransport(apiKey: string): Transport {
         outputTokens: res.usage.output_tokens,
       },
     };
+  };
+}
+
+export interface BatchStatus {
+  ended: boolean;
+}
+
+export type BatchOutcome = { ok: true; response: LlmResponse } | { ok: false; error: string };
+
+/** Message Batches API: пакет з одного запиту, результат забирається на наступних запусках рушія. */
+export interface BatchTransport {
+  submit(customId: string, req: LlmRequest): Promise<string>;
+  status(batchId: string): Promise<BatchStatus>;
+  result(batchId: string): Promise<BatchOutcome>;
+}
+
+export function anthropicBatch(apiKey: string): BatchTransport {
+  const client = new Anthropic({ apiKey, maxRetries: 1, timeout: 60_000 });
+  return {
+    async submit(customId, req) {
+      const batch = await client.messages.batches.create({
+        requests: [
+          {
+            custom_id: customId,
+            params: {
+              model: req.model,
+              max_tokens: req.maxTokens,
+              system: req.system,
+              messages: [{ role: "user", content: req.user }],
+              output_config: { effort: req.effort, format: { type: "json_schema", schema: req.schema } },
+            },
+          },
+        ],
+      });
+      return batch.id;
+    },
+    async status(batchId) {
+      const batch = await client.messages.batches.retrieve(batchId);
+      return { ended: batch.processing_status === "ended" };
+    },
+    async result(batchId) {
+      for await (const item of await client.messages.batches.results(batchId)) {
+        const r = item.result;
+        if (r.type !== "succeeded") return { ok: false, error: `пакет: ${r.type}` };
+        const m = r.message;
+        if (m.stop_reason === "refusal") return { ok: false, error: "модель відмовилась відповідати" };
+        if (m.stop_reason === "max_tokens") return { ok: false, error: "відповідь обрізано за max_tokens" };
+        const text = m.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("");
+        return {
+          ok: true,
+          response: {
+            model: m.model,
+            text,
+            usage: {
+              inputTokens: m.usage.input_tokens + (m.usage.cache_creation_input_tokens ?? 0) + (m.usage.cache_read_input_tokens ?? 0),
+              outputTokens: m.usage.output_tokens,
+            },
+          },
+        };
+      }
+      return { ok: false, error: "пакет без результатів" };
+    },
   };
 }

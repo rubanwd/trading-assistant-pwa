@@ -8,6 +8,8 @@ export interface LocalTime {
   date: string;
   /** Хвилини від місцевої півночі. */
   minutes: number;
+  /** День тижня: 0 неділя … 6 субота. */
+  weekday: number;
 }
 
 export function localTime(now: number, timeZone: string): LocalTime {
@@ -18,13 +20,22 @@ export function localTime(now: number, timeZone: string): LocalTime {
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
+    weekday: "short",
     hourCycle: "h23",
   }).formatToParts(new Date(now));
   const get = (type: string) => parts.find((p) => p.type === type)!.value;
   return {
     date: `${get("year")}-${get("month")}-${get("day")}`,
     minutes: Number(get("hour")) * 60 + Number(get("minute")),
+    weekday: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(get("weekday")),
   };
+}
+
+/** Тижневий розбір: неділя за місцевим часом, від призначеного часу до кінця доби. */
+export function dueWeekly(now: number, timeZone: string, time: string): { date: string } | null {
+  const local = localTime(now, timeZone);
+  const at = parseClock(time);
+  return local.weekday === 0 && at !== null && local.minutes >= at ? { date: local.date } : null;
 }
 
 export function parseClock(value: string): number | null {

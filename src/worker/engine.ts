@@ -1,18 +1,26 @@
 import { DurableObject } from "cloudflare:workers";
+import { isTeamDomain, type AccessJwk } from "./access";
 import { marketContext } from "./context";
 import type { Env } from "./env";
 import { resolveForecast, type ForecastRule } from "./forecasts";
 import {
+  anthropicBatch,
   anthropicTransport,
+  BATCH_DISCOUNT,
   costUsd,
   decideModel,
   monthStart,
   type Effort,
+  type BatchTransport,
   type Pipeline,
   type Transport,
 } from "./llm";
+import { loadStats } from "./stats";
+import { sanitizeWeekly, WEEKLY_SCHEMA, WEEKLY_SYSTEM, weeklyBody, weeklyInput, type WeeklyReview } from "./weekly";
 import { BinanceFutures } from "./market/binance";
-import type { MarketData } from "./market/types";
+import { BybitLinear } from "./market/bybit";
+import { FailoverMarket } from "./market/failover";
+import type { Candle, MarketData } from "./market/types";
 import { newsHash, parseFeed } from "./news/rss";
 import { sanitizeTriage, TRIAGE_SYSTEM, triageSchema, triageUser, type TriageInput } from "./news/triage";
 import { parseSubscription, sendPush, type PushMessage, type PushOutcome, type StoredSubscription } from "./push";
@@ -20,7 +28,7 @@ import type { MarketRegime } from "./regime";
 import { reportInput, type NewsField, type PriorForecast } from "./report/input";
 import { reportSchema, reportSystem, sanitizeReport, type ReportContent } from "./report/schema";
 import { scan, type ScanResult } from "./scan";
-import { entryMid, positionSize } from "../shared/risk";
+import { entryMid, feeR, positionSize } from "../shared/risk";
 import { detect } from "./signals/detectors";
 import { candidateKey, minutesToMacro, reject, type Rejection } from "./signals/filter";
 import {
@@ -39,7 +47,7 @@ import {
 import { replay, type EventType } from "./signals/track";
 import { SETUP_NAME, type Candidate, type SetupId, type SignalStatus } from "./signals/types";
 import type { Snapshot } from "./snapshot";
-import { clock, dueReports, localTime, parseClock, type ReportKind, type ReportTimes } from "./time";
+import { clock, dueReports, dueWeekly, localTime, parseClock, type ReportKind, type ReportTimes } from "./time";
 
 export interface ProbeTarget {
   name: string;
@@ -115,6 +123,7 @@ interface SignalRow {
   entry_high: number;
   stop: number;
   tp1: number;
+  tp2: number | null;
   rr: number;
   status: SignalStatus;
   expires_at: string;
@@ -156,6 +165,8 @@ export class Engine extends DurableObject<Env> {
       for (const due of await this.dueReports(now)) {
         await step(`${due.kind}_report`, () => this.runReport(due.kind, due.date));
       }
+      await step("weekly", () => this.runWeekly(now));
+      await step("cleanup", () => this.cleanup(now));
       return { ran };
     } finally {
       this.running = false;
@@ -198,16 +209,27 @@ export class Engine extends DurableObject<Env> {
     }
   }
 
-  /** Джерело ринкових даних. Запасна біржа підставляється тут за тим самим інтерфейсом. */
-  private market(): MarketData {
-    return new BinanceFutures();
+  private marketCache: { source: string; market: MarketData } | null = null;
+
+  /**
+   * Джерело ринкових даних за settings.market_source: binance, bybit або auto
+   * (Binance, а якщо він відмовляє за локацією, то Bybit до перезапуску рушія).
+   */
+  private async market(): Promise<MarketData> {
+    const source = await this.setting("market_source", "auto");
+    if (this.marketCache?.source !== source) {
+      const market =
+        source === "binance" ? new BinanceFutures() : source === "bybit" ? new BybitLinear() : new FailoverMarket(new BinanceFutures(), new BybitLinear());
+      this.marketCache = { source, market };
+    }
+    return this.marketCache.market;
   }
 
   /** Скан без моделі: дані з біржі, індикатори, режим ринку, запис знімків у snapshots. */
   private async runScan(): Promise<ScanSummary> {
     const started = Date.now();
     const at = new Date(started).toISOString();
-    const market = this.market();
+    const market = await this.market();
     let symbols: string[] = [];
     let result: ScanResult = {
       snapshots: [],
@@ -246,7 +268,22 @@ export class Engine extends DurableObject<Env> {
       await this.env.DB.batch(result.snapshots.map((s) => insert.bind(runId, s.symbol, JSON.stringify(s))));
     }
     this.lastScan = { runId, at: started, result };
+    await this.recordDailyPrices(result).catch((e) => console.error("денні ціни:", e));
     return { runId, at, ...summary };
+  }
+
+  /**
+   * Денні закриття для порівняння з утриманням BTC. Щоразу пишемо останню закриту денну свічку;
+   * якщо таблиця порожня, заповнюємо 120 днів історії.
+   */
+  private async recordDailyPrices(result: ScanResult): Promise<void> {
+    const db = this.env.DB;
+    const empty = (await db.prepare("SELECT 1 AS x FROM prices_daily LIMIT 1").first()) === null;
+    const insert = db.prepare("INSERT OR IGNORE INTO prices_daily (symbol, date, close) VALUES (?, ?, ?)");
+    const rows = [...result.candles].flatMap(([symbol, c]) =>
+      c["1d"].slice(empty ? -120 : -1).map((d) => insert.bind(symbol, new Date(d.closeTime).toISOString().slice(0, 10), d.close)),
+    );
+    if (rows.length) await db.batch(rows);
   }
 
   private async watchlist(): Promise<string[]> {
@@ -256,6 +293,30 @@ export class Engine extends DurableObject<Env> {
     return list.filter((s): s is string => typeof s === "string" && /^[A-Z0-9]{2,20}$/.test(s));
   }
 
+  /** Свічки для графіка в застосунку: зі скану в пам'яті, якщо він свіжий, інакше з біржі. */
+  async candles(symbol: string, timeframe: "15m" | "1h" | "4h", limit: number): Promise<Candle[]> {
+    if (!/^[A-Z0-9]{2,20}USDT$/.test(symbol)) throw new Error("невідомий символ");
+    const n = Math.min(Math.max(Math.trunc(limit) || 96, 10), 300);
+    const scanned = this.lastScan;
+    const cached = scanned && Date.now() - scanned.at < 35 * 60_000 ? scanned.result.candles.get(symbol)?.[timeframe] : undefined;
+    const candles = cached ?? (await (await this.market()).candles(symbol, timeframe, n));
+    return candles.slice(-n);
+  }
+
+  private accessKeysCache: { domain: string; keys: AccessJwk[]; at: number } | null = null;
+
+  /** Публічні ключі команди Cloudflare Access для перевірки токенів у Worker. Кеш на 10 хв. */
+  async accessKeys(teamDomain: string): Promise<AccessJwk[]> {
+    if (!isTeamDomain(teamDomain)) throw new Error("ACCESS_TEAM_DOMAIN має бути <команда>.cloudflareaccess.com");
+    const cached = this.accessKeysCache;
+    if (cached && cached.domain === teamDomain && Date.now() - cached.at < 10 * 60_000) return cached.keys;
+    const res = await fetch(`https://${teamDomain}/cdn-cgi/access/certs`, { signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) throw new Error(`ключі Access: HTTP ${res.status}`);
+    const keys = ((await res.json()) as { keys?: AccessJwk[] }).keys ?? [];
+    this.accessKeysCache = { domain: teamDomain, keys, at: Date.now() };
+    return keys;
+  }
+
   /** Перевірка: чи відповідають Binance і Claude API з дата-центру рушія. */
   async probe(): Promise<ProbeResult> {
     const started = Date.now();
@@ -263,6 +324,7 @@ export class Engine extends DurableObject<Env> {
     const targets = await Promise.all([
       this.check("binance-futures", "https://fapi.binance.com/fapi/v1/time"),
       this.check("binance-spot-data", "https://data-api.binance.vision/api/v3/time"),
+      this.check("bybit-linear", "https://api.bybit.com/v5/market/time"),
       this.checkClaude(),
     ]);
     const ok = targets.every((t) => t.ok);
@@ -345,6 +407,12 @@ export class Engine extends DurableObject<Env> {
   }
 
   // ── Модель ───────────────────────────────────────────────────────────────
+
+  /** Підміняється в тестах; у роботі це Message Batches API. */
+  protected batchTransport(): BatchTransport {
+    if (!this.env.ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY не задано");
+    return anthropicBatch(this.env.ANTHROPIC_API_KEY);
+  }
 
   /** Підміняється в тестах; у роботі це Claude API. */
   protected transport(): Transport {
@@ -468,7 +536,7 @@ export class Engine extends DurableObject<Env> {
       .bind(new Date(now).toISOString())
       .all<{ id: number; rule: string; resolve_at: string }>();
     if (!due.results.length) return;
-    const market = this.market();
+    const market = await this.market();
     const bySymbol = new Map<string, { id: number; rule: ForecastRule; resolveAt: number }[]>();
     for (const row of due.results) {
       try {
@@ -495,7 +563,7 @@ export class Engine extends DurableObject<Env> {
 
   // ── Звіти ────────────────────────────────────────────────────────────────
 
-  private async reportExists(kind: ReportKind, date: string): Promise<boolean> {
+  private async reportExists(kind: ReportKind | "weekly", date: string): Promise<boolean> {
     return (await this.env.DB.prepare("SELECT 1 AS x FROM reports WHERE kind = ? AND date = ?").bind(kind, date).first()) !== null;
   }
 
@@ -658,14 +726,14 @@ export class Engine extends DurableObject<Env> {
   private async trackSignals(now: number, scanned: ScanResult): Promise<number> {
     const db = this.env.DB;
     const open = await db
-      .prepare("SELECT id, created_at, symbol, side, setup, entry_low, entry_high, stop, tp1, rr, status, expires_at FROM signals WHERE status IN ('pending', 'active') ORDER BY id")
+      .prepare("SELECT id, created_at, symbol, side, setup, entry_low, entry_high, stop, tp1, tp2, rr, status, expires_at FROM signals WHERE status IN ('pending', 'active') ORDER BY id")
       .all<SignalRow>();
-    if (!open.results.length) return 0;
     const maxHoldMs = (await this.setting("signal_max_hold_hours", 48)) * HOUR;
+    const feePct = await this.setting("fee_pct_per_side", 0.05);
     let updated = 0;
     for (const sig of open.results) {
       // Монету могли прибрати зі списку: тоді свічки беремо окремим запитом.
-      const candles = scanned.candles.get(sig.symbol)?.["15m"] ?? (await this.market().candles(sig.symbol, "15m", 498));
+      const candles = scanned.candles.get(sig.symbol)?.["15m"] ?? (await (await this.market()).candles(sig.symbol, "15m", 498));
       const res = replay(
         {
           side: sig.side,
@@ -673,6 +741,7 @@ export class Engine extends DurableObject<Env> {
           entryHigh: sig.entry_high,
           stop: sig.stop,
           tp1: sig.tp1,
+          tp2: sig.tp2,
           createdAt: Date.parse(sig.created_at),
           expiresAt: Date.parse(sig.expires_at),
         },
@@ -689,13 +758,24 @@ export class Engine extends DurableObject<Env> {
       await db.batch([
         ...fresh.map((e) => insert.bind(sig.id, new Date(e.ts).toISOString(), e.type, e.price)),
         db
-          .prepare("UPDATE signals SET status = ?, result_r = ?, resolved_at = ? WHERE id = ?")
-          .bind(res.status, res.resultR, res.resolvedAt === null ? null : new Date(res.resolvedAt).toISOString(), sig.id),
+          .prepare("UPDATE signals SET status = ?, result_r = ?, fee_r = ?, resolved_at = ? WHERE id = ?")
+          .bind(
+            res.status,
+            res.resultR,
+            res.resolvedAt === null ? null : feeR(entryMid(sig.entry_low, sig.entry_high), sig.stop, res.exits, feePct),
+            res.resolvedAt === null ? null : new Date(res.resolvedAt).toISOString(),
+            sig.id,
+          ),
       ]);
       const name = `${coin(sig.symbol)} ${SIDE_NAME[sig.side]}`;
       const text: Partial<Record<EventType, [title: string, body: string]>> = {
         entry: [`Вхід: ${name}`, `Ціна в зоні входу ${sig.entry_low}–${sig.entry_high}. Стоп ${sig.stop}, ціль ${sig.tp1}.`],
-        tp1: [`Ціль: ${name}`, `Ціна дійшла до ${sig.tp1}. Результат +${res.resultR ?? sig.rr}R.`],
+        tp1:
+          sig.tp2 === null
+            ? [`Ціль: ${name}`, `Ціна дійшла до ${sig.tp1}. Результат +${res.resultR ?? sig.rr}R.`]
+            : [`Ціль 1: ${name}`, `Ціна дійшла до ${sig.tp1}. Половину зафіксовано, стоп решти в беззбиток, далі ціль ${sig.tp2}.`],
+        tp2: [`Ціль 2: ${name}`, `Ціна дійшла до ${sig.tp2}. Результат +${res.resultR}R.`],
+        breakeven: [`Беззбиток: ${name}`, `Решта позиції закрилась у беззбиток. Результат +${res.resultR}R.`],
         stop: [`Стоп: ${name}`, `Ціна дійшла до стопа ${sig.stop}. Результат −1R.`],
         timeout: [`Закрито за часом: ${name}`, `Сигнал не дійшов ні до цілі, ні до стопа. Результат ${res.resultR}R.`],
       };
@@ -706,7 +786,38 @@ export class Engine extends DurableObject<Env> {
         await this.signalPush(sig.id, { title, body, url: `/?signal=${sig.id}`, tag: `signal-${sig.id}` }, now);
       }
     }
+    await this.trackShadows(now, scanned, maxHoldMs, feePct);
     return updated;
+  }
+
+  /**
+   * Тіньовий супровід відхилених моделлю кандидатів: ті самі правила, але без подій і сповіщень.
+   * shadow_r зберігається вже після комісій. Потрібен, щоб калібрувати оцінки й бачити, що відсіяв скептик.
+   */
+  private async trackShadows(now: number, scanned: ScanResult, maxHoldMs: number, feePct: number): Promise<void> {
+    const db = this.env.DB;
+    const rows = await db
+      .prepare(
+        `SELECT id, created_at, symbol, side, entry_low, entry_high, stop, tp1, tp2, expires_at FROM signals
+         WHERE status = 'rejected' AND (shadow_status IS NULL OR shadow_status IN ('pending', 'active')) AND created_at >= ?`,
+      )
+      .bind(new Date(now - 4 * 24 * HOUR).toISOString())
+      .all<SignalRow>();
+    const update = db.prepare("UPDATE signals SET shadow_status = ?, shadow_r = ? WHERE id = ?");
+    const statements: D1PreparedStatement[] = [];
+    for (const sig of rows.results) {
+      const candles = scanned.candles.get(sig.symbol)?.["15m"];
+      if (!candles) continue;
+      const res = replay(
+        { side: sig.side, entryLow: sig.entry_low, entryHigh: sig.entry_high, stop: sig.stop, tp1: sig.tp1, tp2: sig.tp2, createdAt: Date.parse(sig.created_at), expiresAt: Date.parse(sig.expires_at) },
+        candles,
+        now,
+        maxHoldMs,
+      );
+      const shadowR = res.resultR === null ? null : Number((res.resultR - feeR(entryMid(sig.entry_low, sig.entry_high), sig.stop, res.exits, feePct)).toFixed(3));
+      statements.push(update.bind(res.status, shadowR, sig.id));
+    }
+    if (statements.length) await db.batch(statements);
   }
 
   /** Детектори → фільтр → аналітик → скептик → публікація. */
@@ -906,6 +1017,173 @@ export class Engine extends DurableObject<Env> {
     await this.env.DB.prepare("INSERT INTO signal_events (signal_id, ts, type, price) VALUES (?, ?, 'push', NULL)")
       .bind(signalId, new Date(now).toISOString())
       .run();
+  }
+
+  // ── Тижневий розбір ──────────────────────────────────────────────────────
+
+  /**
+   * Спершу забирає готові пакети, потім, якщо настала неділя, рахує статистику й відправляє пакет Opus.
+   * Якщо стеля витрат не дозволяє або пакет не вдався, звіт виходить зі статистикою без розбору моделі.
+   */
+  private async runWeekly(now: number, force = false): Promise<"collected" | "submitted" | "saved" | "exists" | "pending" | "not_due"> {
+    const db = this.env.DB;
+    const pending = await db
+      .prepare("SELECT id, report_date, created_at, input FROM llm_batches WHERE status = 'pending' AND pipeline = 'weekly_review'")
+      .all<{ id: string; report_date: string; created_at: string; input: string }>();
+    for (const b of pending.results) await this.collectWeekly(b, now);
+
+    const timezone = await this.setting("timezone", "Europe/Kyiv");
+    const due = force ? { date: localTime(now, timezone).date } : dueWeekly(now, timezone, await this.setting("weekly_review_time", "12:00"));
+    if (!due) return "not_due";
+    if (await this.reportExists("weekly", due.date)) return "exists";
+    const busy = await db.prepare("SELECT 1 AS x FROM llm_batches WHERE report_date = ? AND status = 'pending'").bind(due.date).first();
+    if (busy) return "pending";
+
+    const started = Date.now();
+    const [week, allTime] = await Promise.all([
+      loadStats(db, { from: new Date(now - 7 * 24 * HOUR).toISOString(), now }),
+      loadStats(db, { from: null, now }),
+    ]);
+    const stats = { week, allTime };
+
+    const spent = await db.prepare("SELECT COALESCE(SUM(cost_usd), 0) AS spent FROM llm_calls WHERE ts >= ?").bind(monthStart(now)).first<{ spent: number }>();
+    const decision = decideModel("weekly_review", spent?.spent ?? 0, await this.setting("llm_budget_usd", 25));
+    if (!decision.allowed) {
+      await this.saveWeekly(due.date, stats, null, "стеля витрат вичерпана: розбір моделі пропущено", started);
+      return "saved";
+    }
+    const playbook = await this.playbook();
+    const notes = await db
+      .prepare("SELECT ts, action, note FROM journal WHERE ts >= ? AND note IS NOT NULL ORDER BY id DESC LIMIT 20")
+      .bind(new Date(now - 7 * 24 * HOUR).toISOString())
+      .all<{ ts: string; action: string | null; note: string }>();
+    const settings = Object.fromEntries(
+      await Promise.all(
+        ["min_rr", "skeptic_threshold", "max_active_signals", "signal_ttl_hours", "signal_max_hold_hours", "fee_pct_per_side"].map(async (k) => [k, await this.setting<unknown>(k, null)] as const),
+      ),
+    );
+    const input = weeklyInput({ week, allTime, playbook: { version: playbook.version, rules: playbook.rules as Record<string, string> }, settings, notes: notes.results.map((n) => ({ ...n, note: n.note.slice(0, 300) })) });
+    try {
+      const id = await this.batchTransport().submit(`weekly-${due.date}`, {
+        model: decision.model,
+        system: WEEKLY_SYSTEM,
+        user: JSON.stringify(input),
+        schema: WEEKLY_SCHEMA,
+        maxTokens: 16000,
+        effort: "high",
+      });
+      await db
+        .prepare("INSERT INTO llm_batches (id, pipeline, report_date, created_at, status, input) VALUES (?, 'weekly_review', ?, ?, 'pending', ?)")
+        .bind(id, due.date, new Date(now).toISOString(), JSON.stringify(stats))
+        .run();
+      return "submitted";
+    } catch (e) {
+      await this.saveWeekly(due.date, stats, null, `пакет не відправлено: ${String(e)}`, started);
+      return "saved";
+    }
+  }
+
+  /** Тижневий розбір поза розкладом: за сьогоднішньою місцевою датою. Результат пакета забере наступний запуск. */
+  async weeklyNow(): Promise<{ status: string } | null> {
+    if (this.running) return null;
+    this.running = true;
+    try {
+      return { status: await this.runWeekly(Date.now(), true) };
+    } catch (e) {
+      return { status: "error", error: String(e) } as { status: string };
+    } finally {
+      this.running = false;
+    }
+  }
+
+  private async collectWeekly(b: { id: string; report_date: string; created_at: string; input: string }, now: number): Promise<void> {
+    const db = this.env.DB;
+    const stats = JSON.parse(b.input) as { week: Awaited<ReturnType<typeof loadStats>>; allTime: Awaited<ReturnType<typeof loadStats>> };
+    const finish = async (status: "done" | "error", error: string | null) =>
+      db.prepare("UPDATE llm_batches SET status = ?, ended_at = ?, error = ? WHERE id = ?").bind(status, new Date(now).toISOString(), error, b.id).run();
+    const transport = this.batchTransport();
+    const state = await transport.status(b.id);
+    if (!state.ended) {
+      // Пакет живе до 24 годин; після цього звіт виходить без розбору.
+      if (now - Date.parse(b.created_at) > 26 * HOUR) {
+        await finish("error", "пакет не завершився за 26 годин");
+        await this.saveWeekly(b.report_date, stats, null, "розбір моделі не встиг", now);
+      }
+      return;
+    }
+    const outcome = await transport.result(b.id);
+    if (!outcome.ok) {
+      await finish("error", outcome.error);
+      await this.saveWeekly(b.report_date, stats, null, `розбір моделі не вдався: ${outcome.error}`, now);
+      return;
+    }
+    const res = outcome.response;
+    const cost = costUsd(res.model, res.usage) * BATCH_DISCOUNT;
+    await db
+      .prepare("INSERT INTO llm_calls (ts, pipeline, model, tokens_in, tokens_out, cost_usd, latency_ms) VALUES (?, 'weekly_review', ?, ?, ?, ?, ?)")
+      .bind(new Date(now).toISOString(), res.model, res.usage.inputTokens, res.usage.outputTokens, cost, now - Date.parse(b.created_at))
+      .run();
+    let review: WeeklyReview | null = null;
+    let note: string | null = null;
+    try {
+      review = sanitizeWeekly(JSON.parse(res.text));
+    } catch (e) {
+      note = `розбір моделі непридатний: ${String(e)}`;
+    }
+    await finish(review ? "done" : "error", note);
+    await this.saveWeekly(b.report_date, stats, review, note, now, { model: res.model, cost });
+  }
+
+  private async saveWeekly(
+    date: string,
+    stats: { week: Awaited<ReturnType<typeof loadStats>>; allTime: Awaited<ReturnType<typeof loadStats>> },
+    review: WeeklyReview | null,
+    note: string | null,
+    started: number,
+    llm: { model: string; cost: number } | null = null,
+  ): Promise<void> {
+    if (await this.reportExists("weekly", date)) return;
+    const body = weeklyBody(stats.week, stats.allTime, review, note);
+    const row = await this.env.DB.prepare("INSERT INTO reports (kind, date, body, model, cost_usd, created_at) VALUES ('weekly', ?, ?, ?, ?, ?) RETURNING id")
+      .bind(date, JSON.stringify(body), llm?.model ?? null, llm?.cost ?? null, new Date().toISOString())
+      .first<{ id: number }>();
+    await this.logRun("weekly_review", started, { id: row!.id, date, review: review !== null, note }, null);
+    await this.push({ title: "Тижневий розбір готовий", body: body.content.headline, url: `/?report=${row!.id}`, tag: `report-${row!.id}` });
+  }
+
+  // ── Прибирання ───────────────────────────────────────────────────────────
+
+  /**
+   * Раз на добу видаляє старі знімки (крім тих, на які посилаються сигнали), новини і журнал запусків.
+   * Видаляє порціями, щоб не впертися в ліміти D1.
+   */
+  private async cleanup(now: number): Promise<void> {
+    const db = this.env.DB;
+    const last = await db.prepare("SELECT started_at FROM runs WHERE kind = 'cleanup' ORDER BY id DESC LIMIT 1").first<{ started_at: string }>();
+    if (last && now - Date.parse(last.started_at) < 20 * HOUR) return;
+    const started = Date.now();
+    const days = await this.setting("retention_days", 30);
+    const cutoff = new Date(now - days * 24 * HOUR).toISOString();
+    const runsCutoff = new Date(now - Math.max(days, 90) * 24 * HOUR).toISOString();
+    const [snapshots, news, runs] = await db.batch<never>([
+      db
+        .prepare(
+          `DELETE FROM snapshots WHERE id IN (
+             SELECT s.id FROM snapshots s JOIN runs r ON r.id = s.run_id
+             WHERE r.started_at < ? AND s.id NOT IN (SELECT snapshot_id FROM signals WHERE snapshot_id IS NOT NULL)
+             LIMIT 20000)`,
+        )
+        .bind(cutoff),
+      db.prepare("DELETE FROM news WHERE id IN (SELECT id FROM news WHERE ts < ? LIMIT 20000)").bind(cutoff),
+      db
+        .prepare(
+          `DELETE FROM runs WHERE id IN (
+             SELECT id FROM runs WHERE started_at < ? AND kind IN ('scan', 'news', 'signals', 'probe')
+               AND id NOT IN (SELECT run_id FROM snapshots) LIMIT 20000)`,
+        )
+        .bind(runsCutoff),
+    ]);
+    await this.logRun("cleanup", started, { retentionDays: days, snapshots: snapshots!.meta.changes, news: news!.meta.changes, runs: runs!.meta.changes }, null);
   }
 
   // ── Сповіщення ───────────────────────────────────────────────────────────

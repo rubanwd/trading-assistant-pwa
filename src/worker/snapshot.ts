@@ -33,7 +33,7 @@ export interface Snapshot {
   /** Рівні за розворотними точками 1h і 4h. */
   levels: { "1h": SnapshotLevels; "4h": SnapshotLevels };
   funding: { rate: number; markPrice: number; nextFundingAt: string } | null;
-  openInterest: { valueUsd: number; contracts: number; change24hPct: number | null; at: string } | null;
+  openInterest: { valueUsd: number | null; contracts: number; change24hPct: number | null; at: string } | null;
   regime: SymbolRegime;
 }
 
@@ -112,7 +112,7 @@ function openInterestFeatures(points: OpenInterestPoint[] | null): Snapshot["ope
   const base = points.find((p) => p.ts >= target);
   const has24h = base !== undefined && base.ts - target <= 30 * 60_000 && base !== cur;
   return {
-    valueUsd: Math.round(cur.valueUsd),
+    valueUsd: cur.valueUsd === null || !Number.isFinite(cur.valueUsd) ? null : Math.round(cur.valueUsd),
     contracts: round(cur.contracts)!,
     change24hPct: has24h ? round(pct(cur.contracts, base.contracts)) : null,
     at: new Date(cur.ts).toISOString(),

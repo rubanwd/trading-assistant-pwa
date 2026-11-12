@@ -34,8 +34,8 @@ export interface OpenInterestPoint {
   ts: number;
   /** Відкритий інтерес у контрактах (базова монета). */
   contracts: number;
-  /** Відкритий інтерес у USDT. */
-  valueUsd: number;
+  /** Відкритий інтерес у USDT; null, якщо біржа його не дає. */
+  valueUsd: number | null;
 }
 
 /**

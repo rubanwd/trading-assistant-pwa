@@ -9,8 +9,13 @@ export const secondary = { ...button, border: `1px solid ${c.line}`, background:
 
 export const KIND: Record<string, string> = { morning: "Ранковий", evening: "Вечірній", weekly: "Тижневий" };
 
+/** Service worker позначає відповідь із кешу заголовком x-cached-at; застосунок показує, що дані офлайн. */
+export const OFFLINE_EVENT = "offline-data";
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, init);
+  const cachedAt = res.headers.get("x-cached-at");
+  window.dispatchEvent(new CustomEvent(OFFLINE_EVENT, { detail: cachedAt }));
   if (!res.ok) {
     const body = (await res.json().catch(() => null)) as { error?: string } | null;
     throw new Error(body?.error ?? `HTTP ${res.status}`);
@@ -20,3 +25,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const time = (iso: string) => new Date(iso).toLocaleTimeString("uk-UA", { hour: "2-digit", minute: "2-digit" });
 export const day = (iso: string) => new Date(iso).toLocaleDateString("uk-UA", { day: "numeric", month: "long" });
+
+export const coin = (s: string) => s.replace(/USDT$/, "");
+export const signed = (v: number, digits = 2) => `${v > 0 ? "+" : v < 0 ? "−" : ""}${Math.abs(v).toFixed(digits)}`;
+export const pct = (v: number | null | undefined) => (v === null || v === undefined ? "—" : `${Math.round(v * 100)}%`);

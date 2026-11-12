@@ -33,3 +33,14 @@ export function riskReward(entry: number, stop: number, target: number): number 
 
 /** Середина зони входу: опорна ціна для R:R і результату в R. */
 export const entryMid = (entryLow: number, entryHigh: number) => (entryLow + entryHigh) / 2;
+
+/**
+ * Комісії в R: вхід і кожен вихід платять feePctPerSide від обсягу.
+ * Для позиції з ризиком 1R на одиницю: (entry + Σ exit × share) × fee / |entry − stop|.
+ */
+export function feeR(entry: number, stop: number, exits: { price: number; share: number }[], feePctPerSide: number): number {
+  const risk = Math.abs(entry - stop);
+  if (risk === 0 || !exits.length || !(feePctPerSide > 0)) return 0;
+  const turnover = entry + exits.reduce((sum, e) => sum + e.price * e.share, 0);
+  return Number(((turnover * feePctPerSide) / 100 / risk).toFixed(3));
+}

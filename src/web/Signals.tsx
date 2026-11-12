@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { entryMid, positionSize } from "../shared/risk";
-import { api, c, card, day, dim, h2, p, primary, secondary, time } from "./ui";
+import { SignalChart } from "./Chart";
+import { fmtPrice, useLivePrice } from "./live";
+import { api, c, card, day, dim, h2, p, primary, secondary, signed, time } from "./ui";
 
 export interface SignalCard {
   id: number;
@@ -19,8 +21,14 @@ export interface SignalCard {
   status: string;
   expires_at: string;
   result_r: number | null;
+  fee_r: number | null;
+  shadow_status: string | null;
+  shadow_r: number | null;
   action?: "taken" | "skipped" | null;
+  tp1_hit?: number;
 }
+
+interface Similar { from: number; to: number; n: number; hits: number }
 
 interface SignalFull extends SignalCard {
   reasoning: {
@@ -31,6 +39,7 @@ interface SignalFull extends SignalCard {
   events: { ts: string; type: string; price: number | null }[];
   journal: { id: number; ts: string; action: string; note: string | null }[];
   risk: { depositUsd: number | null; riskPct: number };
+  similar: { analyst: Similar | null; skeptic: Similar | null };
 }
 
 export const SETUP: Record<string, string> = {
@@ -42,10 +51,12 @@ const STATUS: Record<string, string> = {
   pending: "чекає входу", active: "активний", tp1: "ціль", tp2: "ціль 2", stopped: "стоп", expired: "прострочений", rejected: "відхилений",
 };
 const EVENT: Record<string, string> = {
-  entry: "Вхід", tp1: "Ціль", stop: "Стоп", expired: "Прострочено без входу", missed: "Ціна дійшла до цілі без входу", timeout: "Закрито за часом",
+  entry: "Вхід", tp1: "Ціль 1", tp2: "Ціль 2", breakeven: "Беззбиток", stop: "Стоп", expired: "Прострочено без входу", missed: "Ціна дійшла до цілі без входу", timeout: "Закрито за часом",
 };
 const pct = (v: number | null) => (v === null ? "—" : `${Math.round(v * 100)}%`);
 const coin = (s: string) => s.replace(/USDT$/, "");
+/** Результат після комісій. */
+const netR = (s: SignalCard) => (s.result_r === null ? null : s.result_r - (s.fee_r ?? 0));
 
 function left(iso: string): string {
   const min = Math.round((Date.parse(iso) - Date.now()) / 60_000);
@@ -72,8 +83,9 @@ function Head({ s }: { s: SignalCard }) {
           {coin(s.symbol)} <span style={{ color: s.side === "long" ? c.blue : c.orange }}>{s.side === "long" ? "лонг" : "шорт"}</span>
         </span>
         <span style={{ fontSize: 13, color }}>
-          {STATUS[s.status] ?? s.status}
-          {s.result_r !== null && ` · ${s.result_r > 0 ? "+" : ""}${s.result_r}R`}
+          {s.status === "active" && s.tp1_hit ? "ціль 1 взято" : STATUS[s.status] ?? s.status}
+          {netR(s) !== null && ` · ${signed(netR(s)!)}R`}
+          {s.status === "rejected" && s.shadow_r !== null && ` · якби брали ${signed(s.shadow_r)}R`}
         </span>
       </div>
       <span style={dim}>
@@ -168,6 +180,24 @@ function SignalView({ id, onBack }: { id: number; onBack: () => void }) {
 
   if (error) return <p style={{ ...p, color: c.orange }}>Не вдалося відкрити сигнал: {error}</p>;
   if (!s) return <p style={dim}>Завантажую…</p>;
+  return <SignalDetails s={s} busy={busy} journal={journal} onBack={onBack} />;
+}
+
+function SimilarHint({ who, v }: { who: string; v: Similar | null }) {
+  if (!v) return null;
+  const range = `${Math.round(v.from * 100)}–${Math.round(v.to * 100)}%`;
+  return (
+    <p style={dim}>
+      {v.n === 0
+        ? `Сигналів з оцінкою ${who} ${range} з відомим результатом ще немає.`
+        : `З оцінкою ${who} ${range} ціль досягалась ${v.hits} з ${v.n} разів (${Math.round((v.hits / v.n) * 100)}%).`}
+    </p>
+  );
+}
+
+function SignalDetails({ s, busy, journal, onBack }: { s: SignalFull; busy: boolean; journal: (a: "taken" | "skipped") => void; onBack: () => void }) {
+  const open = s.status === "pending" || s.status === "active";
+  const live = useLivePrice(open ? s.symbol : null);
   const r = s.reasoning;
   const decision = s.journal[0]?.action;
   return (
@@ -175,7 +205,12 @@ function SignalView({ id, onBack }: { id: number; onBack: () => void }) {
       <button type="button" style={{ ...secondary, alignSelf: "flex-start" }} onClick={onBack}>← Усі сигнали</button>
       <section style={card}>
         <Head s={s} />
+        {live !== null && <Row label="Ціна зараз" value={fmtPrice(live)} />}
+        <SignalChart symbol={s.symbol} live={live} levels={{ entryLow: s.entry_low, entryHigh: s.entry_high, stop: s.stop, tp1: s.tp1, tp2: s.tp2, createdAt: Date.parse(s.created_at) }} />
         <Levels s={s} />
+        {s.fee_r !== null && s.result_r !== null && <Row label="Без комісій / комісії" value={`${signed(s.result_r)}R / ${s.fee_r.toFixed(3)}R`} />}
+        <SimilarHint who="аналітика" v={s.similar.analyst} />
+        <SimilarHint who="скептика" v={s.similar.skeptic} />
       </section>
       {s.status !== "rejected" && (
         <div style={{ display: "flex", gap: 8 }}>
@@ -209,7 +244,9 @@ function SignalView({ id, onBack }: { id: number; onBack: () => void }) {
           ))}
         </section>
       )}
-      <p style={dim}>Результат в R рахується від середини зони входу, без комісій. Це аналіз, а не фінансова порада.</p>
+      <p style={dim}>
+        Результат в R рахується від середини зони входу і вже після комісій.{s.tp2 !== null && " На першій цілі фіксується половина позиції, стоп решти переходить у беззбиток."} Це аналіз, а не фінансова порада.
+      </p>
     </>
   );
 }
