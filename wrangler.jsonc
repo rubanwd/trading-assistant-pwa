@@ -23,5 +23,13 @@
       "migrations_dir": "migrations"
     }
   ],
+  "vars": {
+    // Публічний ключ VAPID з `npx @pushforge/builder vapid`; приватний іде в секрет VAPID_PRIVATE_KEY.
+    "VAPID_PUBLIC_KEY": "",
+    // Контакт для сервісів push: mailto:… або https://…
+    "VAPID_SUBJECT": "",
+    // Адреса застосунку для посилань у Telegram, наприклад https://assistant.example.com
+    "APP_ORIGIN": ""
+  },
   "observability": { "enabled": true }
 }

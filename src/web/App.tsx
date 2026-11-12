@@ -1,35 +1,43 @@
 import { useCallback, useEffect, useState } from "react";
+import { Push } from "./Push";
+import { Reports, type ReportCard } from "./Reports";
+import { api, c, card, dim, h2, KIND, p, primary, secondary, time } from "./ui";
 
 interface Target { name: string; ok: boolean; status: number | null; ms: number; note?: string }
+interface ScanDetail {
+  market: { mood: "risk_on" | "risk_off" | "mixed"; btcTrend: "up" | "down" | "range" | null; breadth: number | null };
+  symbols: number;
+  snapshots: number;
+}
 interface Status {
-  lastRun: { kind: string; started_at: string; status: string; detail: Target[] | null; error: string | null } | null;
+  lastRun: { kind: string; started_at: string; status: string; detail: Target[] | ScanDetail | null; error: string | null } | null;
+  lastReport: ReportCard | null;
+  spend: { monthUsd: number; budgetUsd: number | null };
 }
 
-const c = { bg: "#0E1116", card: "#171B22", line: "#262C36", ink: "#E8EBF0", dim: "#9AA3B2", blue: "#5B9DFF", orange: "#FF9F4A" };
-const card = { background: c.card, border: `1px solid ${c.line}`, borderRadius: 14, padding: 16 } as const;
+const MOOD = { risk_on: "ризик-он", risk_off: "ризик-оф", mixed: "змішаний" } as const;
+const TREND = { up: "вгору", down: "вниз", range: "боковик" } as const;
+type Tab = "today" | "reports";
 
-export function App() {
+function Today({ onOpenReport }: { onOpenReport: (id: number) => void }) {
   const [status, setStatus] = useState<Status | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
     try {
-      const res = await fetch("/api/status");
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setStatus(await res.json());
+      setStatus(await api<Status>("/api/status"));
       setError(null);
     } catch (e) {
       setError(String(e));
     }
   }, []);
-
   useEffect(() => { void load(); }, [load]);
 
-  const probe = async () => {
+  const post = async (path: string) => {
     setBusy(true);
     try {
-      await fetch("/api/probe", { method: "POST" });
+      await fetch(path, { method: "POST" });
       await load();
     } finally {
       setBusy(false);
@@ -37,31 +45,90 @@ export function App() {
   };
 
   const run = status?.lastRun;
-  const time = run ? new Date(run.started_at).toLocaleTimeString("uk-UA", { hour: "2-digit", minute: "2-digit" }) : null;
+  const targets = Array.isArray(run?.detail) ? run.detail : null;
+  const scan = run?.detail && !Array.isArray(run.detail) ? run.detail : null;
+  const report = status?.lastReport;
 
   return (
-    <main style={{ minHeight: "100dvh", background: c.bg, color: c.ink, fontFamily: "Inter, system-ui, sans-serif", padding: "24px 20px", boxSizing: "border-box", display: "flex", flexDirection: "column", gap: 12 }}>
-      <h1 style={{ margin: 0, fontSize: 28, fontWeight: 600 }}>Сьогодні</h1>
-      <section style={{ ...card, display: "flex", flexDirection: "column", gap: 8 }}>
-        <h2 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>Пульс системи</h2>
-        {error && <p style={{ margin: 0, color: c.orange, fontSize: 14 }}>Немає зв'язку з API: {error}</p>}
-        {!error && !run && <p style={{ margin: 0, color: c.dim, fontSize: 14 }}>Запусків ще не було.</p>}
+    <>
+      {report ? (
+        <button type="button" onClick={() => onOpenReport(report.id)} style={{ ...card, color: c.ink, textAlign: "left", font: "inherit", cursor: "pointer" }}>
+          <span style={dim}>{KIND[report.kind] ?? report.kind} звіт · {time(report.created_at)}</span>
+          <span style={{ ...p, fontWeight: 600 }}>{report.headline}</span>
+          {report.theses.map((t) => <span key={t} style={p}>• {t}</span>)}
+        </button>
+      ) : (
+        <section style={card}>
+          <h2 style={h2}>Звіт</h2>
+          <p style={dim}>Звітів ще немає. Перший з'явиться о 07:30 або 20:30 за Києвом.</p>
+        </section>
+      )}
+      <section style={card}>
+        <h2 style={h2}>Пульс системи</h2>
+        {error && <p style={{ ...p, color: c.orange }}>Немає зв'язку з API: {error}</p>}
+        {!error && !run && <p style={dim}>Запусків ще не було.</p>}
         {run && (
-          <p style={{ margin: 0, fontSize: 14, color: run.status === "ok" ? c.ink : c.orange }}>
-            Останній запуск о {time}: {run.status === "ok" ? "успішно" : `помилка, ${run.error}`}
+          <p style={{ ...p, color: run.status === "ok" ? c.ink : c.orange }}>
+            Останній запуск о {time(run.started_at)}: {run.status === "ok" ? "успішно" : `помилка, ${run.error}`}
           </p>
         )}
-        {run?.detail?.map((t) => (
+        {scan && (
+          <p style={dim}>
+            Скан: {scan.snapshots} із {scan.symbols} монет · ринок {MOOD[scan.market.mood]}
+            {scan.market.btcTrend && ` · BTC 4h ${TREND[scan.market.btcTrend]}`}
+            {scan.market.breadth !== null && ` · вище EMA200: ${Math.round(scan.market.breadth * 100)}%`}
+          </p>
+        )}
+        {targets?.map((t) => (
           <div key={t.name} style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: c.dim }}>
             <span>{t.name}</span>
             <span style={{ color: t.ok ? c.blue : c.orange }}>{t.ok ? "доступний" : "недоступний"} · {t.status ?? "—"} · {t.ms} мс</span>
           </div>
         ))}
-        <button type="button" onClick={probe} disabled={busy} style={{ minHeight: 48, borderRadius: 12, border: 0, background: c.blue, color: c.bg, font: "600 15px Inter, system-ui, sans-serif", marginTop: 4 }}>
-          {busy ? "Перевіряю…" : "Перевірити джерела з ЄС"}
+        {status && (
+          <p style={dim}>
+            Витрати на моделі цього місяця: ${status.spend.monthUsd.toFixed(2)}
+            {status.spend.budgetUsd !== null && ` із $${status.spend.budgetUsd}`}
+          </p>
+        )}
+        <button type="button" onClick={() => post("/api/probe")} disabled={busy} style={{ ...primary, marginTop: 4 }}>
+          {busy ? "Працюю…" : "Перевірити джерела з ЄС"}
         </button>
+        <button type="button" onClick={() => post("/api/scan")} disabled={busy} style={secondary}>Запустити скан</button>
       </section>
-      <p style={{ margin: 0, fontSize: 13, color: c.dim, lineHeight: 1.4 }}>Етап «Каркас»: сигналів і звітів ще немає.</p>
-    </main>
+      <Push />
+      <p style={dim}>Етап «Звіти»: скан раз на 30 хв, звіти о 07:30 і 20:30. Сигналів ще немає.</p>
+    </>
+  );
+}
+
+export function App() {
+  // Сповіщення відкриває застосунок з ?report=<id>.
+  const initial = Number(new URLSearchParams(location.search).get("report")) || null;
+  const [tab, setTab] = useState<Tab>(initial ? "reports" : "today");
+  const [reportId, setReportId] = useState<number | null>(initial);
+
+  const openReport = (id: number | null) => {
+    setReportId(id);
+    setTab("reports");
+    history.replaceState(null, "", id ? `/?report=${id}` : "/");
+    window.scrollTo(0, 0);
+  };
+
+  return (
+    <div style={{ minHeight: "100dvh", background: c.bg, color: c.ink, fontFamily: "Inter, system-ui, sans-serif", display: "flex", flexDirection: "column" }}>
+      <main style={{ flex: 1, padding: "24px 20px 16px", boxSizing: "border-box", display: "flex", flexDirection: "column", gap: 12, width: "100%", maxWidth: 640, margin: "0 auto" }}>
+        <h1 style={{ margin: 0, fontSize: 28, fontWeight: 600 }}>{tab === "today" ? "Сьогодні" : "Звіти"}</h1>
+        {tab === "today" ? <Today onOpenReport={openReport} /> : <Reports openId={reportId} onOpen={openReport} />}
+      </main>
+      <nav style={{ position: "sticky", bottom: 0, display: "flex", background: c.card, borderTop: `1px solid ${c.line}`, paddingBottom: "env(safe-area-inset-bottom)" }}>
+        {(["today", "reports"] as const).map((t) => (
+          <button key={t} type="button" aria-current={tab === t ? "page" : undefined} onClick={() => { setTab(t); if (t === "today") history.replaceState(null, "", "/"); }}
+            style={{ flex: 1, minHeight: 56, border: 0, background: "transparent", color: tab === t ? c.blue : c.dim, font: "600 14px Inter, system-ui, sans-serif" }}>
+            {t === "today" ? "Сьогодні" : "Звіти"}
+          </button>
+        ))}
+      </nav>
+    </div>
   );
 }
