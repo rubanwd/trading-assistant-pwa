@@ -89,6 +89,62 @@ app.post("/api/reports/run", async (c) => {
   return "error" in res ? c.json(res, 409) : c.json(res);
 });
 
+const SIGNAL_COLUMNS =
+  "id, created_at, symbol, side, setup, entry_low, entry_high, stop, tp1, tp2, rr, p_analyst, p_skeptic, status, expires_at, result_r, resolved_at";
+
+/** Сигнали: open (чекають входу або активні), closed (із результатом), rejected (відхилені моделлю). */
+app.get("/api/signals", async (c) => {
+  const where: Record<string, string> = {
+    open: "status IN ('pending', 'active')",
+    closed: "status IN ('tp1', 'tp2', 'stopped', 'expired')",
+    rejected: "status = 'rejected'",
+  };
+  const scope = c.req.query("scope") ?? "open";
+  if (!where[scope]) return c.json({ error: "scope must be open, closed or rejected" }, 400);
+  const rows = await c.env.DB.prepare(
+    `SELECT ${SIGNAL_COLUMNS}, (SELECT action FROM journal WHERE signal_id = signals.id ORDER BY id DESC LIMIT 1) AS action
+     FROM signals WHERE ${where[scope]} ORDER BY created_at DESC LIMIT 50`,
+  ).all();
+  return c.json({ signals: rows.results });
+});
+
+/** Сигнал повністю: аргументи аналітика і скептика, події, журнал, дані для калькулятора позиції. */
+app.get("/api/signals/:id{[0-9]+}", async (c) => {
+  const id = Number(c.req.param("id"));
+  const db = c.env.DB;
+  const row = await db.prepare(`SELECT ${SIGNAL_COLUMNS}, reasoning, playbook_version FROM signals WHERE id = ?`).bind(id).first<Record<string, unknown> & { reasoning: string | null }>();
+  if (!row) return c.json({ error: "not found" }, 404);
+  const [events, journal, settings] = await Promise.all([
+    db.prepare("SELECT ts, type, price FROM signal_events WHERE signal_id = ? AND type != 'push' ORDER BY id").bind(id).all(),
+    db.prepare("SELECT id, ts, action, note, entry, exit, size FROM journal WHERE signal_id = ? ORDER BY id DESC").bind(id).all(),
+    db.prepare("SELECT key, value FROM settings WHERE key IN ('deposit_usd', 'risk_per_trade_pct')").all<{ key: string; value: string }>(),
+  ]);
+  const setting = (key: string) => {
+    const v = settings.results.find((r) => r.key === key)?.value;
+    return v === undefined ? null : (JSON.parse(v) as number | null);
+  };
+  return c.json({
+    ...row,
+    reasoning: row.reasoning ? JSON.parse(row.reasoning) : null,
+    events: events.results,
+    journal: journal.results,
+    risk: { depositUsd: setting("deposit_usd"), riskPct: setting("risk_per_trade_pct") ?? 1 },
+  });
+});
+
+/** Журнал: «взяв» або «пропустив», за бажанням нотатка і фактичні ціни. */
+app.post("/api/signals/:id{[0-9]+}/journal", async (c) => {
+  const id = Number(c.req.param("id"));
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}) as Record<string, unknown>);
+  if (body.action !== "taken" && body.action !== "skipped") return c.json({ error: "action must be taken or skipped" }, 400);
+  const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null);
+  if (!(await c.env.DB.prepare("SELECT 1 AS x FROM signals WHERE id = ?").bind(id).first())) return c.json({ error: "not found" }, 404);
+  await c.env.DB.prepare("INSERT INTO journal (ts, signal_id, action, note, entry, exit, size) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    .bind(new Date().toISOString(), id, body.action, typeof body.note === "string" ? body.note.slice(0, 1000) : null, num(body.entry), num(body.exit), num(body.size))
+    .run();
+  return c.json({ ok: true });
+});
+
 /** Публічний ключ VAPID для підписки в браузері. */
 app.get("/api/push/key", (c) => c.json({ key: c.env.VAPID_PUBLIC_KEY ?? null }));
 

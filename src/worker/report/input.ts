@@ -21,6 +21,24 @@ const prices = (l: SnapshotLevels) => ({
   resistance: l.resistance.map((x) => ({ price: x.price, touches: x.touches })),
 });
 
+/** Стиснутий знімок монети для моделі: ознаки трьох таймфреймів, рівні, фандинг, відкритий інтерес. */
+export function compactSymbol(s: Snapshot) {
+  return {
+    symbol: s.symbol,
+    price: s.price,
+    trend_4h: s.regime.trend,
+    trend_1d: s.regime.higherTrend,
+    volatility_1h: s.regime.volatility,
+    "1h": tf(s.tf["1h"]),
+    "4h": tf(s.tf["4h"]),
+    "1d": tf(s.tf["1d"]),
+    levels_1h: prices(s.levels["1h"]),
+    levels_4h: prices(s.levels["4h"]),
+    funding_rate_pct: s.funding ? Number((s.funding.rate * 100).toFixed(4)) : null,
+    open_interest_change_24h_pct: s.openInterest?.change24hPct ?? null,
+  };
+}
+
 export interface NewsField {
   category: string;
   impact: string;
@@ -66,20 +84,7 @@ export function reportInput(a: ReportInputArgs) {
       market_cap_change_24h_pct: a.context.marketCapChange24hPct,
       fear_greed_0_100: a.context.fearGreed,
     },
-    symbols: a.snapshots.map((s) => ({
-      symbol: s.symbol,
-      price: s.price,
-      trend_4h: s.regime.trend,
-      trend_1d: s.regime.higherTrend,
-      volatility_1h: s.regime.volatility,
-      "1h": tf(s.tf["1h"]),
-      "4h": tf(s.tf["4h"]),
-      "1d": tf(s.tf["1d"]),
-      levels_1h: prices(s.levels["1h"]),
-      levels_4h: prices(s.levels["4h"]),
-      funding_rate_pct: s.funding ? Number((s.funding.rate * 100).toFixed(4)) : null,
-      open_interest_change_24h_pct: s.openInterest?.change24hPct ?? null,
-    })),
+    symbols: a.snapshots.map(compactSymbol),
     news_last_12h: a.news,
     open_signals: a.openSignals,
     previous_forecasts: a.priorForecasts,
