@@ -9,7 +9,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.worker.json && tsc --noEmit -p tsconfig.web.json",
     "deploy": "vite build && wrangler deploy",
     "db:migrate:local": "wrangler d1 migrations apply trading-assistant --local",
-    "db:migrate": "wrangler d1 migrations apply trading-assistant --remote"
+    "db:migrate": "wrangler d1 migrations apply trading-assistant --remote",
+    "deploy:ci": "wrangler d1 migrations apply trading-assistant --remote && wrangler deploy"
   },
   "dependencies": {
     "@pushforge/builder": "^2.0.5",

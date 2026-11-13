@@ -89,6 +89,19 @@ npm test               # тести індикаторів, скану, нови
 
 Необов'язково: `npx wrangler secret put COINGECKO_API_KEY` (план Demo) для домінації BTC у звітах.
 
+## Деплой без ноутбука (з телефона)
+
+Усе робиться в панелі Cloudflare; збирає й деплоїть Cloudflare з GitHub (Workers Builds).
+
+1. **D1**: Storage & Databases → D1 → Create, назва `trading-assistant`, розташування Western Europe. ID бази впиши в `database_id` у `wrangler.jsonc` (це не секрет).
+2. **Підключення репозиторію**: Workers & Pages → Create → Import a repository → цей репозиторій. Назва Worker `trading-assistant-pwa` (як `name` у `wrangler.jsonc`), команда збірки `npm run build`, команда деплою `npm run deploy:ci` (міграції бази, потім деплой).
+3. **Права токена збірки**: My Profile → API Tokens → токен Workers Builds → Edit → додати Account · D1 · Edit. Без цього міграції не застосуються. Потім Retry build.
+4. **Секрети й змінні**: Worker → Settings → Variables and Secrets. Секрети: `OPENROUTER_API_KEY`, `VAPID_PRIVATE_KEY`, за бажанням `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`. Змінні (Text): `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD`, `APP_ORIGIN`, `VAPID_PUBLIC_KEY`, `VAPID_SUBJECT`. Завдяки `keep_vars` деплой їх не затирає.
+5. **Вхід**: Worker → Access → Protect this Worker behind Access → All traffic, політика з твоїм email. AUD береться з застосунку в Zero Trust → Access → Applications.
+6. **Ключі VAPID** генерує сам застосунок: картка «Сповіщення» на екрані «Сьогодні» → «Згенерувати ключі VAPID». Приватний ключ не проходить через сервер.
+
+Далі кожне злиття в `main` збирається й деплоїться саме, разом із новими міграціями.
+
 ## Перший деплой
 
 1. `npx wrangler login`
