@@ -23,17 +23,13 @@
       "migrations_dir": "migrations"
     }
   ],
-  "vars": {
-    // Cloudflare Access: домен команди (наприклад, myteam.cloudflareaccess.com) і тег AUD застосунку.
-    // Без них API відповідає 401 на всі запити, крім /api/health.
-    "ACCESS_TEAM_DOMAIN": "",
-    "ACCESS_AUD": "",
-    // Публічний ключ VAPID з `npx @pushforge/builder vapid`; приватний іде в секрет VAPID_PRIVATE_KEY.
-    "VAPID_PUBLIC_KEY": "",
-    // Контакт для сервісів push: mailto:… або https://…
-    "VAPID_SUBJECT": "",
-    // Адреса застосунку для посилань у Telegram, наприклад https://assistant.example.com
-    "APP_ORIGIN": ""
-  },
+  // Змінні задаються в панелі Cloudflare (Worker → Settings → Variables and Secrets) і не затираються деплоєм:
+  //   ACCESS_TEAM_DOMAIN  домен команди Access, наприклад myteam.cloudflareaccess.com
+  //   ACCESS_AUD          тег AUD застосунку Access; без цих двох API відповідає 401
+  //   APP_ORIGIN          адреса застосунку для посилань у Telegram
+  //   VAPID_PUBLIC_KEY    публічний ключ Web Push; застосунок уміє згенерувати пару ключів сам
+  //   VAPID_SUBJECT       контакт для сервісів push: mailto:…
+  // Секрети: OPENROUTER_API_KEY, VAPID_PRIVATE_KEY, за бажанням TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, COINGECKO_API_KEY.
+  "keep_vars": true,
   "observability": { "enabled": true }
 }
