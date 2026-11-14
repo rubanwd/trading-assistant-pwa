@@ -4,9 +4,51 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#0E1116" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+    <meta name="apple-mobile-web-app-title" content="Асистент" />
     <link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials" />
     <link rel="apple-touch-icon" href="/icon.svg" />
     <title>Асистент трейдера</title>
+    <style>
+      /* Базові стилі: без них у body білий відступ, а довгий текст розпирає сторінку на телефоні. */
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        background: #0e1116;
+        color: #e8ebf0;
+        -webkit-text-size-adjust: 100%;
+        text-size-adjust: 100%;
+      }
+      body {
+        overflow-x: hidden;
+        overflow-wrap: anywhere;
+        -webkit-tap-highlight-color: transparent;
+      }
+      #root {
+        min-height: 100dvh;
+      }
+      button,
+      input,
+      select,
+      textarea {
+        font: inherit;
+        max-width: 100%;
+      }
+      button {
+        touch-action: manipulation;
+      }
+      code {
+        white-space: pre-wrap;
+      }
+    </style>
   </head>
   <body>
     <div id="root"></div>

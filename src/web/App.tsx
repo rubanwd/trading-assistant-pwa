@@ -6,6 +6,7 @@ import { AiSettings } from "./Ai";
 import { Settings } from "./Settings";
 import { OpenSignals, Signals } from "./Signals";
 import { Stats } from "./Stats";
+import { errorSummary } from "../shared/errors";
 import { api, c, card, dim, h2, KIND, OFFLINE_EVENT, p, primary, secondary, time } from "./ui";
 
 interface Target { name: string; ok: boolean; status: number | null; ms: number; note?: string }
@@ -110,8 +111,14 @@ function Today({ onOpenReport, onOpenSignal }: { onOpenReport: (id: number) => v
         {!error && !run && <p style={dim}>Запусків ще не було.</p>}
         {run && (
           <p style={{ ...p, color: run.status === "ok" ? c.ink : c.orange }}>
-            Останній запуск о {time(run.started_at)}: {run.status === "ok" ? "успішно" : `помилка, ${run.error}`}
+            Останній запуск о {time(run.started_at)}: {run.status === "ok" ? "успішно" : `помилка. ${errorSummary(run.error)}`}
           </p>
+        )}
+        {run?.status !== "ok" && run?.error && (
+          <details style={{ fontSize: 12, color: c.dim }}>
+            <summary style={{ cursor: "pointer", minHeight: 32, display: "flex", alignItems: "center" }}>Деталі помилки</summary>
+            <p style={{ ...dim, fontSize: 12, marginTop: 6 }}>{run.error}</p>
+          </details>
         )}
         {scan && (
           <p style={dim}>
@@ -163,7 +170,20 @@ export function App() {
 
   return (
     <div style={{ minHeight: "100dvh", background: c.bg, color: c.ink, fontFamily: "Inter, system-ui, sans-serif", display: "flex", flexDirection: "column" }}>
-      <main style={{ flex: 1, padding: "24px 20px 16px", boxSizing: "border-box", display: "flex", flexDirection: "column", gap: 12, width: "100%", maxWidth: 640, margin: "0 auto" }}>
+      <main
+        style={{
+          flex: 1,
+          padding: "max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) 16px max(16px, env(safe-area-inset-left))",
+          boxSizing: "border-box",
+          display: "flex",
+          flexDirection: "column",
+          gap: 12,
+          width: "100%",
+          minWidth: 0,
+          maxWidth: 640,
+          margin: "0 auto",
+        }}
+      >
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
           <h1 style={{ margin: 0, fontSize: 28, fontWeight: 600 }}>{TABS[tab]}</h1>
           {tab === "today" && (
