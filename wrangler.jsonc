@@ -18,8 +18,7 @@
     {
       "binding": "DB",
       "database_name": "trading-assistant",
-      // Заміни після `wrangler d1 create trading-assistant`
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "94a23689-2a6c-482a-8cec-db11d4e5abd9",
       "migrations_dir": "migrations"
     }
   ],
