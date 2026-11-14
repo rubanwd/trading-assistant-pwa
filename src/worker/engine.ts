@@ -29,7 +29,8 @@ import { parseSubscription, sendPush, type PushMessage, type PushOutcome, type S
 import type { MarketRegime } from "./regime";
 import { reportInput, type NewsField, type PriorForecast } from "./report/input";
 import { reportSchema, reportSystem, sanitizeReport, type ReportContent } from "./report/schema";
-import { scan, type ScanResult } from "./scan";
+import { CANDLE_LIMIT, CHUNK_SIZE, marketFromSnapshots, scanChunk, type ChunkResult } from "./scan";
+import { CachedMarket, SqlCandleStorage } from "./market/cache";
 import { entryMid, feeR, positionSize } from "../shared/risk";
 import { detect } from "./signals/detectors";
 import { candidateKey, minutesToMacro, reject, type Rejection } from "./signals/filter";
@@ -64,16 +65,21 @@ export interface ProbeResult {
   targets: ProbeTarget[];
 }
 
-export interface ScanSummary {
-  runId: number;
-  at: string;
-  source: string;
-  market: MarketRegime;
-  /** Скільки монет у списку і скільки знімків записано. */
-  symbols: number;
-  snapshots: number;
-  errors: { symbol: string | null; message: string }[];
+/** Стан циклу між кроками. Лежить у сховищі Durable Object, тож переживає перезапуск рушія. */
+interface PipelineState {
+  startedAt: number;
+  /** Список монет на момент планування: усі кроки скану працюють з тим самим списком. */
+  symbols: string[];
+  /** Черга кроків: scan:N, scan:done, news, signals, review:N, forecasts, reports, weekly, cleanup. */
+  steps: string[];
+  log: { step: string; ms: number; requests: number; error?: string }[];
+  scan?: { runId: number; market: MarketRegime };
+  candidates?: Candidate[];
+  signals?: SignalsSummary;
 }
+
+const PIPELINE_KEY = "pipeline";
+const PIPELINE_STALE_MS = 25 * 60_000;
 
 export interface ReportSummary {
   id: number;
@@ -141,44 +147,132 @@ const REPORT_TITLE: Record<ReportKind, string> = { morning: "Ранковий з
  * виходять тільки звідси: об'єкт закріплено в юрисдикції eu.
  */
 export class Engine extends DurableObject<Env> {
-  private running = false;
-  /** Останній скан цього екземпляра: свічки потрібні детекторам і супроводу сигналів. */
-  private lastScan: { runId: number; at: number; result: ScanResult } | null = null;
+  /** Лічильник зовнішніх запитів поточного кроку: безкоштовний план Workers дозволяє 50 за один запуск. */
+  private requests = 0;
+  /** Усі запити назовні йдуть через цю обгортку, щоб їх рахувати. */
+  private readonly http = (input: string, init?: RequestInit): Promise<Response> => {
+    this.requests++;
+    return fetch(input, init);
+  };
 
-  /** Викликається з Cron Trigger раз на 30 хв. Збій одного кроку не зупиняє наступні. */
-  async tick(): Promise<{ ran: string[] }> {
-    if (this.running) return { ran: [] };
-    this.running = true;
-    const ran: string[] = [];
-    const step = async (name: string, fn: () => Promise<unknown>) => {
-      try {
-        await fn();
-        ran.push(name);
-      } catch (e) {
-        console.error(`крок ${name}:`, e);
-      }
-    };
+  // ── Цикл кроками ─────────────────────────────────────────────────────────
+
+  /**
+   * Викликається з Cron Trigger раз на 30 хв. Лише планує цикл: самі кроки виконує будильник (alarm),
+   * по одному на запуск. Кожен запуск має власні ліміти (50 запитів, 10 мс процесора на безкоштовному плані),
+   * тож цикл не впирається в них, хоч би скільки монет було в списку.
+   */
+  async tick(): Promise<{ queued: boolean; steps?: string[] }> {
+    return this.startPipeline(Date.now());
+  }
+
+  private async pipelineState(): Promise<PipelineState | undefined> {
+    return this.ctx.storage.get<PipelineState>(PIPELINE_KEY);
+  }
+
+  /** Чи триває цикл. Завислий понад 25 хв вважається мертвим і не заважає новому. */
+  private async busy(): Promise<boolean> {
+    const state = await this.pipelineState();
+    return !!state && Date.now() - state.startedAt < PIPELINE_STALE_MS;
+  }
+
+  private async startPipeline(now: number): Promise<{ queued: boolean; steps?: string[] }> {
+    if (await this.busy()) return { queued: false };
+    this.settingsCache = null;
+    const symbols = await this.watchlist();
+    const steps = [
+      ...Array.from({ length: Math.ceil(symbols.length / CHUNK_SIZE) }, (_, i) => `scan:${i}`),
+      "scan:done",
+      "news",
+      "signals",
+      "forecasts",
+      "reports",
+      "weekly",
+      "cleanup",
+    ];
+    await this.ctx.storage.put<PipelineState>(PIPELINE_KEY, { startedAt: now, symbols, steps, log: [] });
+    await this.ctx.storage.setAlarm(Date.now());
+    return { queued: true, steps };
+  }
+
+  /** Один крок циклу на один запуск будильника. Збій кроку записується й не зупиняє наступні. */
+  async alarm(): Promise<void> {
+    const state = await this.pipelineState();
+    if (!state) return;
+    const step = state.steps.shift();
+    if (!step) return this.finishPipeline(state);
+    // Крок знімається з черги до виконання: якщо запуск упаде посередині, цикл не застрягне на ньому.
+    await this.ctx.storage.put(PIPELINE_KEY, state);
+    this.settingsCache = null;
+    this.requests = 0;
+    const t0 = Date.now();
+    let error: string | undefined;
     try {
-      const now = Date.now();
-      await step("scan", () => this.runScan());
-      await step("news", () => this.runNews(now));
-      await step("signals", () => this.runSignals());
-      await step("forecasts", () => this.resolveForecasts(now));
-      for (const due of await this.dueReports(now)) {
-        await step(`${due.kind}_report`, () => this.runReport(due.kind, due.date));
-      }
-      await step("weekly", () => this.runWeekly(now));
-      await step("cleanup", () => this.cleanup(now));
-      return { ran };
-    } finally {
-      this.running = false;
+      await this.runStep(step, state);
+    } catch (e) {
+      error = String(e).slice(0, 500);
+      console.error(`крок ${step}:`, e);
     }
+    state.log.push({ step, ms: Date.now() - t0, requests: this.requests, ...(error ? { error } : {}) });
+    if (!state.steps.length) return this.finishPipeline(state);
+    await this.ctx.storage.put(PIPELINE_KEY, state);
+    await this.ctx.storage.setAlarm(Date.now());
+  }
+
+  private async runStep(step: string, state: PipelineState): Promise<void> {
+    const now = Date.now();
+    const [name, arg] = step.split(":");
+    switch (name) {
+      case "scan":
+        return arg === "done" ? this.finishScan(state) : this.scanPart(state, Number(arg));
+      case "news":
+        return this.runNews(now);
+      case "signals":
+        return this.runSignals(state, now);
+      case "review":
+        return this.reviewCandidate(state, Number(arg), now);
+      case "forecasts":
+        return this.resolveForecasts(now);
+      case "reports":
+        for (const due of await this.dueReports(now)) await this.runReport(due.kind, due.date);
+        return;
+      case "weekly":
+        await this.runWeekly(now);
+        return;
+      case "cleanup":
+        return this.cleanup(now);
+    }
+  }
+
+  /** Підсумок циклу: що зроблено, скільки запитів пішло на кожен крок. */
+  private async finishPipeline(state: PipelineState): Promise<void> {
+    await this.ctx.storage.delete(PIPELINE_KEY);
+    const db = this.env.DB;
+    const failed = state.log.filter((l) => l.error);
+    const statements = [
+      db
+        .prepare("INSERT INTO runs (kind, started_at, status, duration_ms, detail, error) VALUES ('pipeline', ?, ?, ?, ?, ?)")
+        .bind(
+          new Date(state.startedAt).toISOString(),
+          failed.length ? "error" : "ok",
+          Date.now() - state.startedAt,
+          JSON.stringify({ steps: state.log }),
+          failed.length ? failed.map((l) => `${l.step}: ${l.error}`).join("; ").slice(0, 2000) : null,
+        ),
+    ];
+    if (state.signals) {
+      statements.push(
+        db
+          .prepare("INSERT INTO runs (kind, started_at, status, duration_ms, candidates, detail, error) VALUES ('signals', ?, 'ok', ?, ?, ?, NULL)")
+          .bind(new Date(state.startedAt).toISOString(), Date.now() - state.startedAt, state.signals.reviewed, JSON.stringify(state.signals)),
+      );
+    }
+    await db.batch(statements);
   }
 
   /** Ручний запуск звіту з API. null, якщо рушій зайнятий; помилка, якщо звіт за цю дату вже є. */
   async reportNow(kind: ReportKind): Promise<ReportSummary | { error: string } | null> {
-    if (this.running) return null;
-    this.running = true;
+    if (await this.busy()) return null;
     try {
       const now = Date.now();
       const date = localTime(now, await this.setting("timezone", "Europe/Kyiv")).date;
@@ -188,8 +282,6 @@ export class Engine extends DurableObject<Env> {
       return await this.runReport(kind, date);
     } catch (e) {
       return { error: String(e) };
-    } finally {
-      this.running = false;
     }
   }
 
@@ -198,111 +290,120 @@ export class Engine extends DurableObject<Env> {
     return this.push({ title: "Асистент трейдера", body: "Сповіщення працюють.", url: "/", tag: "test" });
   }
 
-  /** Ручний запуск скану з API. Не накладається на запуск за розкладом. */
-  async scanNow(): Promise<ScanSummary | null> {
-    if (this.running) return null;
-    this.running = true;
-    try {
-      const summary = await this.runScan();
-      await this.runSignals().catch((e) => console.error("крок signals:", e));
-      return summary;
-    } finally {
-      this.running = false;
-    }
+  /** Ручний запуск циклу з API. Результат з'являється за хвилину: кроки йдуть через будильник. */
+  async scanNow(): Promise<{ queued: boolean; steps?: string[] }> {
+    return this.startPipeline(Date.now());
   }
 
   private marketCache: { source: string; market: MarketData } | null = null;
+  private candleStorage: SqlCandleStorage | null = null;
 
   /**
    * Джерело ринкових даних за settings.market_source: binance, bybit або auto
    * (Binance, а якщо він відмовляє за локацією, то Bybit до перезапуску рушія).
+   * Свічки йдуть через кеш у сховищі рушія: біржа докачує лише нові.
    */
   private async market(): Promise<MarketData> {
     const source = await this.setting("market_source", "auto");
     if (this.marketCache?.source !== source) {
-      const market =
-        source === "binance" ? new BinanceFutures() : source === "bybit" ? new BybitLinear() : new FailoverMarket(new BinanceFutures(), new BybitLinear());
-      this.marketCache = { source, market };
+      const binance = () => new BinanceFutures(this.http);
+      const bybit = () => new BybitLinear(this.http);
+      const inner = source === "binance" ? binance() : source === "bybit" ? bybit() : new FailoverMarket(binance(), bybit());
+      this.candleStorage ??= new SqlCandleStorage(this.ctx.storage.sql);
+      this.marketCache = { source, market: new CachedMarket(inner, this.candleStorage) };
     }
     return this.marketCache.market;
   }
 
-  /** Скан без моделі: дані з біржі, індикатори, режим ринку, запис знімків у snapshots. */
-  private async runScan(): Promise<ScanSummary> {
-    const started = Date.now();
-    const at = new Date(started).toISOString();
-    const market = await this.market();
-    let symbols: string[] = [];
-    let result: ScanResult = {
-      snapshots: [],
-      candles: new Map(),
-      market: { mood: "mixed", btcTrend: null, breadth: null, counted: 0 },
-      errors: [],
-    };
-    try {
-      symbols = await this.watchlist();
-      result = await scan(market, symbols, started);
-    } catch (e) {
-      result.errors.push({ symbol: null, message: String(e) });
+  /** Частина скану: кілька монет, результат чекає в сховищі рушія на крок scan:done. */
+  private async scanPart(state: PipelineState, index: number): Promise<void> {
+    const symbols = state.symbols.slice(index * CHUNK_SIZE, (index + 1) * CHUNK_SIZE);
+    const part = await scanChunk(await this.market(), symbols, state.startedAt);
+    await this.ctx.storage.put(`scan-part:${index}`, part);
+  }
+
+  /** Збирає частини скану: режим ринку, запис запуску й знімків у базу, денні ціни. */
+  private async finishScan(state: PipelineState): Promise<void> {
+    const db = this.env.DB;
+    const keys = Array.from({ length: Math.ceil(state.symbols.length / CHUNK_SIZE) }, (_, i) => `scan-part:${i}`);
+    const parts = await this.ctx.storage.get<ChunkResult>(keys);
+    const snapshots: Snapshot[] = [];
+    const errors: ChunkResult["errors"] = [];
+    for (const key of keys) {
+      const part = parts.get(key);
+      if (!part) {
+        errors.push({ symbol: null, message: `частина скану ${key.split(":")[1]} не виконалась` });
+        continue;
+      }
+      snapshots.push(...part.snapshots);
+      // Збій фандингу повторюється в кожній частині: лишаємо один запис.
+      for (const e of part.errors) if (e.symbol !== null || !errors.some((x) => x.message === e.message)) errors.push(e);
     }
-    const failed = symbols.length === 0 || result.snapshots.length < symbols.length;
-    const summary = {
-      source: market.name,
-      market: result.market,
-      symbols: symbols.length,
-      snapshots: result.snapshots.length,
-      errors: result.errors,
-    };
-    const run = await this.env.DB.prepare(
-      "INSERT INTO runs (kind, started_at, status, duration_ms, detail, error) VALUES ('scan', ?, ?, ?, ?, ?) RETURNING id",
-    )
+    const market = marketFromSnapshots(snapshots);
+    const source = (await this.market()).name;
+    const failed = state.symbols.length === 0 || snapshots.length < state.symbols.length;
+    const summary = { source, market, symbols: state.symbols.length, snapshots: snapshots.length, errors };
+    const run = await db
+      .prepare("INSERT INTO runs (kind, started_at, status, duration_ms, detail, error) VALUES ('scan', ?, ?, ?, ?, ?) RETURNING id")
       .bind(
-        at,
+        new Date(state.startedAt).toISOString(),
         failed ? "error" : "ok",
-        Date.now() - started,
+        Date.now() - state.startedAt,
         JSON.stringify(summary),
-        failed ? result.errors.map((e) => (e.symbol ? `${e.symbol}: ${e.message}` : e.message)).join("; ").slice(0, 2000) || "порожній список монет" : null,
+        failed ? errors.map((e) => (e.symbol ? `${e.symbol}: ${e.message}` : e.message)).join("; ").slice(0, 2000) || "порожній список монет" : null,
       )
       .first<{ id: number }>();
     const runId = run!.id;
-    if (result.snapshots.length) {
-      const insert = this.env.DB.prepare("INSERT INTO snapshots (run_id, symbol, features) VALUES (?, ?, ?)");
-      await this.env.DB.batch(result.snapshots.map((s) => insert.bind(runId, s.symbol, JSON.stringify(s))));
+    // Кілька знімків одним запитом: менше звернень до бази за запуск (ліміт 100 параметрів на запит).
+    const statements: D1PreparedStatement[] = [];
+    for (let i = 0; i < snapshots.length; i += 30) {
+      const rows = snapshots.slice(i, i + 30);
+      statements.push(
+        db
+          .prepare(`INSERT INTO snapshots (run_id, symbol, features) VALUES ${rows.map(() => "(?, ?, ?)").join(", ")}`)
+          .bind(...rows.flatMap((s) => [runId, s.symbol, JSON.stringify(s)])),
+      );
     }
-    this.lastScan = { runId, at: started, result };
-    await this.recordDailyPrices(result).catch((e) => console.error("денні ціни:", e));
-    return { runId, at, ...summary };
+    if (statements.length) await db.batch(statements);
+    await this.ctx.storage.delete(keys);
+    state.scan = { runId, market };
+    await this.recordDailyPrices(snapshots.map((s) => s.symbol)).catch((e) => console.error("денні ціни:", e));
   }
 
   /**
    * Денні закриття для порівняння з утриманням BTC. Щоразу пишемо останню закриту денну свічку;
-   * якщо таблиця порожня, заповнюємо 120 днів історії.
+   * якщо таблиця порожня, заповнюємо 120 днів історії. Свічки беруться з кешу, біржу не питаємо.
    */
-  private async recordDailyPrices(result: ScanResult): Promise<void> {
+  private async recordDailyPrices(symbols: string[]): Promise<void> {
     const db = this.env.DB;
     const empty = (await db.prepare("SELECT 1 AS x FROM prices_daily LIMIT 1").first()) === null;
-    const insert = db.prepare("INSERT OR IGNORE INTO prices_daily (symbol, date, close) VALUES (?, ?, ?)");
-    const rows = [...result.candles].flatMap(([symbol, c]) =>
-      c["1d"].slice(empty ? -120 : -1).map((d) => insert.bind(symbol, new Date(d.closeTime).toISOString().slice(0, 10), d.close)),
-    );
-    if (rows.length) await db.batch(rows);
+    const market = await this.market();
+    const rows: [string, string, number][] = [];
+    for (const symbol of symbols) {
+      const daily = await market.candles(symbol, "1d", CANDLE_LIMIT);
+      for (const d of daily.slice(empty ? -120 : -1)) rows.push([symbol, new Date(d.closeTime).toISOString().slice(0, 10), d.close]);
+    }
+    const statements: D1PreparedStatement[] = [];
+    for (let i = 0; i < rows.length; i += 30) {
+      const part = rows.slice(i, i + 30);
+      statements.push(
+        db.prepare(`INSERT OR IGNORE INTO prices_daily (symbol, date, close) VALUES ${part.map(() => "(?, ?, ?)").join(", ")}`).bind(...part.flat()),
+      );
+    }
+    if (statements.length) await db.batch(statements);
   }
 
   private async watchlist(): Promise<string[]> {
-    const row = await this.env.DB.prepare("SELECT value FROM settings WHERE key = 'watchlist'").first<{ value: string }>();
-    const list: unknown = row ? JSON.parse(row.value) : [];
+    const list = await this.setting<unknown>("watchlist", []);
     if (!Array.isArray(list)) throw new Error("settings.watchlist має бути масивом");
     return list.filter((s): s is string => typeof s === "string" && /^[A-Z0-9]{2,20}$/.test(s));
   }
 
-  /** Свічки для графіка в застосунку: зі скану в пам'яті, якщо він свіжий, інакше з біржі. */
+  /** Свічки для графіка в застосунку: з кешу рушія, біржа докачує лише нові. */
   async candles(symbol: string, timeframe: "15m" | "1h" | "4h", limit: number): Promise<Candle[]> {
     if (!/^[A-Z0-9]{2,20}USDT$/.test(symbol)) throw new Error("невідомий символ");
     const n = Math.min(Math.max(Math.trunc(limit) || 96, 10), 300);
-    const scanned = this.lastScan;
-    const cached = scanned && Date.now() - scanned.at < 35 * 60_000 ? scanned.result.candles.get(symbol)?.[timeframe] : undefined;
-    const candles = cached ?? (await (await this.market()).candles(symbol, timeframe, n));
-    return candles.slice(-n);
+    return (await (await this.market()).candles(symbol, timeframe, n)).slice(-n);
   }
 
   private accessKeysCache: { domain: string; keys: AccessJwk[]; at: number } | null = null;
@@ -312,7 +413,7 @@ export class Engine extends DurableObject<Env> {
     if (!isTeamDomain(teamDomain)) throw new Error("ACCESS_TEAM_DOMAIN має бути <команда>.cloudflareaccess.com");
     const cached = this.accessKeysCache;
     if (cached && cached.domain === teamDomain && Date.now() - cached.at < 10 * 60_000) return cached.keys;
-    const res = await fetch(`https://${teamDomain}/cdn-cgi/access/certs`, { signal: AbortSignal.timeout(10_000) });
+    const res = await this.http(`https://${teamDomain}/cdn-cgi/access/certs`, { signal: AbortSignal.timeout(10_000) });
     if (!res.ok) throw new Error(`ключі Access: HTTP ${res.status}`);
     const keys = ((await res.json()) as { keys?: AccessJwk[] }).keys ?? [];
     this.accessKeysCache = { domain: teamDomain, keys, at: Date.now() };
@@ -348,7 +449,7 @@ export class Engine extends DurableObject<Env> {
   private async check(name: string, url: string): Promise<ProbeTarget> {
     const t0 = Date.now();
     try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+      const res = await this.http(url, { signal: AbortSignal.timeout(10_000) });
       await res.body?.cancel();
       return {
         name,
@@ -367,7 +468,7 @@ export class Engine extends DurableObject<Env> {
     const t0 = Date.now();
     const key = this.env.OPENROUTER_API_KEY;
     try {
-      const res = await fetch(key ? `${OPENROUTER}/key` : `${OPENROUTER}/models`, {
+      const res = await this.http(key ? `${OPENROUTER}/key` : `${OPENROUTER}/models`, {
         headers: key ? { authorization: `Bearer ${key}` } : {},
         signal: AbortSignal.timeout(10_000),
       });
@@ -386,14 +487,30 @@ export class Engine extends DurableObject<Env> {
 
   // ── Налаштування ─────────────────────────────────────────────────────────
 
-  private async setting<T>(key: string, fallback: T): Promise<T> {
-    const row = await this.env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(key).first<{ value: string }>();
-    if (!row) return fallback;
-    try {
-      return JSON.parse(row.value) as T;
-    } catch {
-      return fallback;
+  private settingsCache: { at: number; values: Map<string, unknown> } | null = null;
+
+  /**
+   * Усі налаштування одним запитом і кеш на кілька секунд: на безкоштовному плані за один запуск
+   * можна не більше 50 звернень до бази. Кожен крок циклу починає зі свіжого читання.
+   */
+  private async settingsMap(): Promise<Map<string, unknown>> {
+    if (this.settingsCache && Date.now() - this.settingsCache.at < 5_000) return this.settingsCache.values;
+    const rows = await this.env.DB.prepare("SELECT key, value FROM settings").all<{ key: string; value: string }>();
+    const values = new Map<string, unknown>();
+    for (const r of rows.results) {
+      try {
+        values.set(r.key, JSON.parse(r.value));
+      } catch {
+        // Пошкоджене значення: візьметься значення за замовчуванням.
+      }
     }
+    this.settingsCache = { at: Date.now(), values };
+    return values;
+  }
+
+  private async setting<T>(key: string, fallback: T): Promise<T> {
+    const value = (await this.settingsMap()).get(key);
+    return value === undefined ? fallback : (value as T);
   }
 
   private async logRun(kind: string, started: number, detail: unknown, error: string | null): Promise<void> {
@@ -409,22 +526,11 @@ export class Engine extends DurableObject<Env> {
   /** Підміняється в тестах; у роботі це OpenRouter. */
   protected transport(): Transport {
     if (!this.env.OPENROUTER_API_KEY) throw new LlmError("OPENROUTER_API_KEY не задано");
-    return openRouterTransport(this.env.OPENROUTER_API_KEY, this.env.APP_ORIGIN || undefined);
+    return openRouterTransport(this.env.OPENROUTER_API_KEY, this.env.APP_ORIGIN || undefined, this.http);
   }
 
   private async aiConfig(): Promise<AiConfig> {
-    const rows = await this.env.DB.prepare("SELECT key, value FROM settings WHERE key IN (?, ?, ?, ?)")
-      .bind(AI_KEYS.agents, AI_KEYS.budgetUsd, AI_KEYS.budgetFallbackModel, AI_KEYS.dataCollection)
-      .all<{ key: string; value: string }>();
-    const values: Record<string, unknown> = {};
-    for (const r of rows.results) {
-      try {
-        values[r.key] = JSON.parse(r.value);
-      } catch {
-        // Пошкоджене значення: візьметься значення за замовчуванням.
-      }
-    }
-    return aiFromSettings(values);
+    return aiFromSettings(Object.fromEntries(await this.settingsMap()));
   }
 
   private async spentThisMonth(): Promise<number> {
@@ -476,11 +582,15 @@ export class Engine extends DurableObject<Env> {
 
   /** Каталог моделей OpenRouter із підтримкою JSON-схеми. Кеш на 6 годин. */
   async models(): Promise<ModelInfo[]> {
+    // Стиснутий каталог живе й у сховищі рушія: великий файл OpenRouter розбирається не частіше ніж раз на 6 годин,
+    // навіть якщо рушій перезапускався (безкоштовний план дає 10 мс процесора на запуск).
+    this.modelsCache ??= (await this.ctx.storage.get<{ at: number; models: ModelInfo[] }>("models")) ?? null;
     if (this.modelsCache && Date.now() - this.modelsCache.at < 6 * HOUR) return this.modelsCache.models;
-    const res = await fetch(`${OPENROUTER}/models`, { signal: AbortSignal.timeout(15_000) });
+    const res = await this.http(`${OPENROUTER}/models`, { signal: AbortSignal.timeout(15_000) });
     if (!res.ok) throw new Error(`каталог моделей OpenRouter: HTTP ${res.status}`);
     const models = compactModels(((await res.json()) as { data?: Parameters<typeof compactModels>[0] }).data ?? []);
     this.modelsCache = { at: Date.now(), models };
+    await this.ctx.storage.put("models", this.modelsCache);
     return models;
   }
 
@@ -488,7 +598,7 @@ export class Engine extends DurableObject<Env> {
   async keyInfo(): Promise<KeyInfo | null> {
     const key = this.env.OPENROUTER_API_KEY;
     if (!key) return null;
-    const res = await fetch(`${OPENROUTER}/key`, { headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(10_000) });
+    const res = await this.http(`${OPENROUTER}/key`, { headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(10_000) });
     if (!res.ok) throw new Error(res.status === 401 ? "OpenRouter не прийняв ключ" : `OpenRouter: HTTP ${res.status}`);
     return parseKeyInfo(await res.json());
   }
@@ -536,7 +646,7 @@ export class Engine extends DurableObject<Env> {
     await Promise.all(
       feeds.map(async (feed) => {
         try {
-          const res = await fetch(feed.url, {
+          const res = await this.http(feed.url, {
             headers: { accept: "application/rss+xml, application/atom+xml, application/xml, text/xml" },
             signal: AbortSignal.timeout(10_000),
           });
@@ -682,7 +792,7 @@ export class Engine extends DurableObject<Env> {
     const market = (JSON.parse(scanRun.detail ?? "{}") as { market: MarketRegime }).market;
 
     // 2. Фон ринку. Збій джерела не зупиняє звіт.
-    const { context, errors: warnings } = await marketContext((input, init) => fetch(input, init), this.env.COINGECKO_API_KEY);
+    const { context, errors: warnings } = await marketContext(this.http, this.env.COINGECKO_API_KEY);
 
     // 3. Новини за 12 годин: до 8 найважливіших, лише поля сортувальника.
     const newsRows = await db
@@ -773,30 +883,25 @@ export class Engine extends DurableObject<Env> {
 
   // ── Сигнали ──────────────────────────────────────────────────────────────
 
-  /** Супровід відкритих сигналів, потім пошук нових сетапів на свіжій свічці 1h. */
-  private async runSignals(): Promise<SignalsSummary> {
-    const started = Date.now();
-    const scanned = this.lastScan;
+  /**
+   * Супровід відкритих сигналів, потім пошук нових сетапів на свіжій свічці 1h.
+   * Кандидати, що пройшли фільтр, стають окремими кроками review: так виклики моделей
+   * не збираються в один запуск і не впираються в його ліміти.
+   */
+  private async runSignals(state: PipelineState, now: number): Promise<void> {
     const summary: SignalsSummary = { updated: 0, detection: false, detected: 0, filtered: {}, reviewed: 0, published: 0, rejected: 0, notes: [] };
-    if (!scanned || started - scanned.at > 10 * 60_000) throw new Error("немає свіжого скану для сигналів");
-    let error: string | null = null;
-    try {
-      summary.updated = await this.trackSignals(started, scanned.result);
-      await this.findSignals(started, scanned, summary);
-    } catch (e) {
-      error = String(e);
+    state.signals = summary;
+    summary.updated = await this.trackSignals(now);
+    if (!state.scan) {
+      summary.notes.push("скан не вдався: нові сетапи не шукались");
+      return;
     }
-    await this.env.DB.prepare(
-      "INSERT INTO runs (kind, started_at, status, duration_ms, candidates, detail, error) VALUES ('signals', ?, ?, ?, ?, ?, ?)",
-    )
-      .bind(new Date(started).toISOString(), error ? "error" : "ok", Date.now() - started, summary.reviewed, JSON.stringify(summary), error)
-      .run();
-    if (error) throw new Error(error);
-    return summary;
+    state.candidates = await this.findCandidates(now, state.scan, summary);
+    state.steps.unshift(...state.candidates.map((_, i) => `review:${i}`));
   }
 
   /** Вхід, ціль, стоп або прострочення для кожного відкритого сигналу. Повертає кількість змін. */
-  private async trackSignals(now: number, scanned: ScanResult): Promise<number> {
+  private async trackSignals(now: number): Promise<number> {
     const db = this.env.DB;
     const open = await db
       .prepare("SELECT id, created_at, symbol, side, setup, entry_low, entry_high, stop, tp1, tp2, rr, status, expires_at FROM signals WHERE status IN ('pending', 'active') ORDER BY id")
@@ -804,9 +909,10 @@ export class Engine extends DurableObject<Env> {
     const maxHoldMs = (await this.setting("signal_max_hold_hours", 48)) * HOUR;
     const feePct = await this.setting("fee_pct_per_side", 0.05);
     let updated = 0;
+    const market = await this.market();
     for (const sig of open.results) {
-      // Монету могли прибрати зі списку: тоді свічки беремо окремим запитом.
-      const candles = scanned.candles.get(sig.symbol)?.["15m"] ?? (await (await this.market()).candles(sig.symbol, "15m", 498));
+      // Свічки з кешу: якщо монета в списку, скан їх щойно оновив, і біржу не питаємо.
+      const candles = await market.candles(sig.symbol, "15m", CANDLE_LIMIT);
       const res = replay(
         {
           side: sig.side,
@@ -859,7 +965,7 @@ export class Engine extends DurableObject<Env> {
         await this.signalPush(sig.id, { title, body, url: `/?signal=${sig.id}`, tag: `signal-${sig.id}` }, now);
       }
     }
-    await this.trackShadows(now, scanned, maxHoldMs, feePct);
+    await this.trackShadows(now, maxHoldMs, feePct);
     return updated;
   }
 
@@ -867,7 +973,7 @@ export class Engine extends DurableObject<Env> {
    * Тіньовий супровід відхилених моделлю кандидатів: ті самі правила, але без подій і сповіщень.
    * shadow_r зберігається вже після комісій. Потрібен, щоб калібрувати оцінки й бачити, що відсіяв скептик.
    */
-  private async trackShadows(now: number, scanned: ScanResult, maxHoldMs: number, feePct: number): Promise<void> {
+  private async trackShadows(now: number, maxHoldMs: number, feePct: number): Promise<void> {
     const db = this.env.DB;
     const rows = await db
       .prepare(
@@ -878,9 +984,12 @@ export class Engine extends DurableObject<Env> {
       .all<SignalRow>();
     const update = db.prepare("UPDATE signals SET shadow_status = ?, shadow_r = ? WHERE id = ?");
     const statements: D1PreparedStatement[] = [];
+    const market = await this.market();
+    const watched = new Set(await this.watchlist());
     for (const sig of rows.results) {
-      const candles = scanned.candles.get(sig.symbol)?.["15m"];
-      if (!candles) continue;
+      // Тінь ведемо лише для монет зі списку: їхні свічки вже в кеші, зайвих запитів до біржі немає.
+      if (!watched.has(sig.symbol)) continue;
+      const candles = await market.candles(sig.symbol, "15m", CANDLE_LIMIT);
       const res = replay(
         { side: sig.side, entryLow: sig.entry_low, entryHigh: sig.entry_high, stop: sig.stop, tp1: sig.tp1, tp2: sig.tp2, createdAt: Date.parse(sig.created_at), expiresAt: Date.parse(sig.expires_at) },
         candles,
@@ -893,144 +1002,157 @@ export class Engine extends DurableObject<Env> {
     if (statements.length) await db.batch(statements);
   }
 
-  /** Детектори → фільтр → аналітик → скептик → публікація. */
-  private async findSignals(
-    now: number,
-    scanned: { runId: number; result: ScanResult },
-    summary: SignalsSummary,
-  ): Promise<void> {
+  /**
+   * Детектори → фільтр. Повертає кандидатів для моделі; самі виклики аналітика і скептика
+   * йдуть окремими кроками review, по одному кандидату на запуск.
+   */
+  private async findCandidates(now: number, scan: { runId: number; market: MarketRegime }, summary: SignalsSummary): Promise<Candidate[]> {
     const db = this.env.DB;
-    const { snapshots, candles, market } = scanned.result;
+    const rows = await db.prepare("SELECT features FROM snapshots WHERE run_id = ?").bind(scan.runId).all<{ features: string }>();
+    const snapshots = rows.results.map((r) => JSON.parse(r.features) as Snapshot);
     // Сетапи шукаємо лише на свічці 1h, що закрилась щойно: о пів на годину вона вже застаріла.
     const fresh = snapshots.filter((s) => now - Date.parse(s.tf["1h"].closedAt) <= 20 * 60_000);
     summary.detection = fresh.length > 0;
-    if (!fresh.length) return;
+    if (!fresh.length) return [];
 
-    const [minRr, maxActive, blackout, macro, threshold, ttl, cooldown, perScan] = await Promise.all([
+    const [minRr, maxActive, blackout, macro, cooldown, perScan] = await Promise.all([
       this.setting("min_rr", 2),
       this.setting("max_active_signals", 3),
       this.setting("macro_blackout_hours", 2),
       this.setting<unknown>("macro_events", []),
-      this.setting("skeptic_threshold", 0.6),
-      this.setting("signal_ttl_hours", 12),
       this.setting("signal_cooldown_hours", 6),
       this.setting("max_candidates_per_scan", 3),
     ]);
-    const open = await db.prepare("SELECT symbol FROM signals WHERE status IN ('pending', 'active')").all<{ symbol: string }>();
-    const recent = await db
-      .prepare("SELECT symbol, setup, side FROM signals WHERE created_at >= ?")
-      .bind(new Date(now - cooldown * HOUR).toISOString())
-      .all<Pick<Candidate, "symbol" | "setup" | "side">>();
+    const [open, recent] = await Promise.all([
+      db.prepare("SELECT symbol FROM signals WHERE status IN ('pending', 'active')").all<{ symbol: string }>(),
+      db
+        .prepare("SELECT symbol, setup, side FROM signals WHERE created_at >= ?")
+        .bind(new Date(now - cooldown * HOUR).toISOString())
+        .all<Pick<Candidate, "symbol" | "setup" | "side">>(),
+    ]);
     const openSymbols = new Set(open.results.map((r) => r.symbol));
-    let openCount = open.results.length;
+    const recentKeys = new Set(recent.results.map(candidateKey));
     const toMacro = minutesToMacro(macro, now);
-    const tally = (reason: Rejection) => (summary.filtered[reason] = (summary.filtered[reason] ?? 0) + 1);
+    const market = await this.market();
 
     const passed: Candidate[] = [];
     for (const snap of fresh) {
-      const c = candles.get(snap.symbol);
-      if (!c) continue;
-      for (const candidate of detect(snap.symbol, c["1h"], c["4h"])) {
+      // Свічки з кешу: скан щойно їх оновив, біржу не питаємо.
+      const [h1, h4] = await Promise.all([market.candles(snap.symbol, "1h", CANDLE_LIMIT), market.candles(snap.symbol, "4h", CANDLE_LIMIT)]);
+      for (const candidate of detect(snap.symbol, h1, h4)) {
         summary.detected++;
         const reason = reject(candidate, {
           minRr,
           regime: snap.regime,
-          mood: market.mood,
+          mood: scan.market.mood,
           openSymbols,
-          recent: new Set(recent.results.map(candidateKey)),
+          recent: recentKeys,
           minutesToMacro: toMacro,
           macroBlackoutHours: blackout,
-          openCount,
+          openCount: open.results.length,
           maxActive,
         });
-        if (reason) tally(reason);
+        if (reason) summary.filtered[reason] = (summary.filtered[reason] ?? 0) + 1;
         else passed.push(candidate);
       }
     }
-    if (!passed.length) return;
-
     // Найкращий за R:R кандидат на монету; до моделі йде обмежена кількість за скан.
     passed.sort((a, b) => b.rr - a.rr);
-    const queue = passed.filter((c, i) => passed.findIndex((x) => x.symbol === c.symbol) === i).slice(0, perScan);
-    const playbook = await this.playbook();
-    const btc = snapshots.find((s) => s.symbol === "BTCUSDT") ?? null;
-    const newsRows = await db
-      .prepare("SELECT ts, category, impact, sentiment, symbols, relevance FROM news WHERE ts >= ? AND relevance >= 0.4 ORDER BY relevance DESC, ts DESC LIMIT 30")
-      .bind(new Date(now - 12 * HOUR).toISOString())
-      .all<{ ts: string; category: string; impact: string; sentiment: string; symbols: string; relevance: number }>();
-    const news: NewsField[] = newsRows.results.map((n) => ({
-      category: n.category,
-      impact: n.impact,
-      sentiment: n.sentiment,
-      symbols: JSON.parse(n.symbols || "[]") as string[],
-      relevance: n.relevance,
-      age_hours: Math.round(((now - Date.parse(n.ts)) / HOUR) * 10) / 10,
-    }));
+    return passed.filter((c, i) => passed.findIndex((x) => x.symbol === c.symbol) === i).slice(0, perScan);
+  }
 
-    for (const candidate of queue) {
-      if (openCount >= maxActive) {
-        tally("max_active");
-        continue;
+  /** Аналітик → скептик → публікація для одного кандидата. Окремий крок циклу. */
+  private async reviewCandidate(state: PipelineState, index: number, now: number): Promise<void> {
+    const candidate = state.candidates?.[index];
+    const summary = state.signals;
+    const scan = state.scan;
+    if (!candidate || !summary || !scan) return;
+    const db = this.env.DB;
+    const [maxActive, macro, threshold, ttl] = await Promise.all([
+      this.setting("max_active_signals", 3),
+      this.setting<unknown>("macro_events", []),
+      this.setting("skeptic_threshold", 0.6),
+      this.setting("signal_ttl_hours", 12),
+    ]);
+    // Попередні кроки могли вже опублікувати сигнали: ліміт перевіряється заново.
+    const open = await db.prepare("SELECT symbol FROM signals WHERE status IN ('pending', 'active')").all<{ symbol: string }>();
+    if (open.results.length >= maxActive || open.results.some((r) => r.symbol === candidate.symbol)) {
+      const reason: Rejection = open.results.length >= maxActive ? "max_active" : "duplicate";
+      summary.filtered[reason] = (summary.filtered[reason] ?? 0) + 1;
+      return;
+    }
+    try {
+      const snaps = await db
+        .prepare("SELECT id, symbol, features FROM snapshots WHERE run_id = ? AND symbol IN (?, 'BTCUSDT')")
+        .bind(scan.runId, candidate.symbol)
+        .all<{ id: number; symbol: string; features: string }>();
+      const own = snaps.results.find((r) => r.symbol === candidate.symbol);
+      if (!own) throw new Error("немає знімка монети");
+      const btcRow = snaps.results.find((r) => r.symbol === "BTCUSDT");
+      const playbook = await this.playbook();
+      const newsRows = await db
+        .prepare("SELECT ts, category, impact, sentiment, symbols, relevance FROM news WHERE ts >= ? AND relevance >= 0.4 ORDER BY relevance DESC, ts DESC LIMIT 30")
+        .bind(new Date(now - 12 * HOUR).toISOString())
+        .all<{ ts: string; category: string; impact: string; sentiment: string; symbols: string; relevance: number }>();
+      const news: NewsField[] = newsRows.results.map((n) => ({
+        category: n.category,
+        impact: n.impact,
+        sentiment: n.sentiment,
+        symbols: JSON.parse(n.symbols || "[]") as string[],
+        relevance: n.relevance,
+        age_hours: Math.round(((now - Date.parse(n.ts)) / HOUR) * 10) / 10,
+      }));
+      const toMacro = minutesToMacro(macro, now);
+      const user = JSON.stringify(
+        reviewInput({
+          candidate,
+          rule: playbook.rules[candidate.setup] ?? PLAYBOOK_V1[candidate.setup],
+          snapshot: JSON.parse(own.features) as Snapshot,
+          btc: btcRow ? (JSON.parse(btcRow.features) as Snapshot) : null,
+          market: scan.market,
+          news: news.filter((n) => n.symbols.includes(candidate.symbol) || n.symbols.includes("MARKET")).slice(0, 6),
+          minutesToMacro: toMacro,
+        }),
+      );
+      const stopReviews = () => {
+        summary.notes.push("стелю витрат вичерпано: нові сигнали не публікуються");
+        state.steps = state.steps.filter((s) => !s.startsWith("review:"));
+      };
+      const first = await this.llm("analyst", { user, system: ANALYST_SYSTEM, schema: ANALYST_SCHEMA });
+      if (!first) return stopReviews();
+      summary.reviewed++;
+      const analyst = sanitizeAnalyst(first.data);
+      // Скептик працює окремим викликом і не бачить відповіді аналітика.
+      let skeptic: SkepticView | null = null;
+      if (analyst.verdict === "take") {
+        const second = await this.llm("skeptic", { user, system: SKEPTIC_SYSTEM, schema: SKEPTIC_SCHEMA });
+        if (!second) return stopReviews();
+        skeptic = sanitizeSkeptic(second.data);
       }
-      try {
-        const snapshot = snapshots.find((s) => s.symbol === candidate.symbol)!;
-        const user = JSON.stringify(
-          reviewInput({
-            candidate,
-            rule: playbook.rules[candidate.setup] ?? PLAYBOOK_V1[candidate.setup],
-            snapshot,
-            btc,
-            market,
-            news: news.filter((n) => n.symbols.includes(candidate.symbol) || n.symbols.includes("MARKET")).slice(0, 6),
-            minutesToMacro: toMacro,
-          }),
-        );
-        const review = { user };
-        const first = await this.llm("analyst", { ...review, system: ANALYST_SYSTEM, schema: ANALYST_SCHEMA });
-        if (!first) {
-          summary.notes.push("стелю витрат вичерпано: нові сигнали не публікуються");
-          break;
-        }
-        summary.reviewed++;
-        const analyst = sanitizeAnalyst(first.data);
-        // Скептик працює окремим викликом і не бачить відповіді аналітика.
-        let skeptic: SkepticView | null = null;
-        if (analyst.verdict === "take") {
-          const second = await this.llm("skeptic", { ...review, system: SKEPTIC_SYSTEM, schema: SKEPTIC_SCHEMA });
-          if (!second) {
-            summary.notes.push("стелю витрат вичерпано: нові сигнали не публікуються");
-            break;
-          }
-          skeptic = sanitizeSkeptic(second.data);
-        }
-        const decision = decide(analyst, skeptic, threshold);
-        const reasoning: Reasoning = { v: 1, facts: candidate.facts, analyst, skeptic, rejectedBy: decision.publish ? null : decision.by };
-        const createdAt = new Date(now).toISOString();
-        const snapshotRow = await db.prepare("SELECT id FROM snapshots WHERE run_id = ? AND symbol = ?").bind(scanned.runId, candidate.symbol).first<{ id: number }>();
-        const row = await db
-          .prepare(
-            `INSERT INTO signals (created_at, symbol, side, setup, entry_low, entry_high, stop, tp1, tp2, rr, p_analyst, p_skeptic,
-               status, expires_at, resolved_at, reasoning, snapshot_id, playbook_version)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
-          )
-          .bind(
-            createdAt, candidate.symbol, candidate.side, candidate.setup, candidate.entryLow, candidate.entryHigh, candidate.stop,
-            candidate.tp1, candidate.tp2, candidate.rr, analyst.probability, skeptic?.probability ?? null,
-            decision.publish ? "pending" : "rejected", new Date(now + ttl * HOUR).toISOString(), decision.publish ? null : createdAt,
-            JSON.stringify(reasoning), snapshotRow?.id ?? null, playbook.version,
-          )
-          .first<{ id: number }>();
-        if (!decision.publish) {
-          summary.rejected++;
-          continue;
-        }
-        summary.published++;
-        openCount++;
-        openSymbols.add(candidate.symbol);
-        await this.signalPush(row!.id, await this.signalMessage(row!.id, candidate), now);
-      } catch (e) {
-        summary.notes.push(`${candidate.symbol} ${candidate.setup}: ${String(e)}`);
+      const decision = decide(analyst, skeptic, threshold);
+      const reasoning: Reasoning = { v: 1, facts: candidate.facts, analyst, skeptic, rejectedBy: decision.publish ? null : decision.by };
+      const createdAt = new Date(now).toISOString();
+      const row = await db
+        .prepare(
+          `INSERT INTO signals (created_at, symbol, side, setup, entry_low, entry_high, stop, tp1, tp2, rr, p_analyst, p_skeptic,
+             status, expires_at, resolved_at, reasoning, snapshot_id, playbook_version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+        )
+        .bind(
+          createdAt, candidate.symbol, candidate.side, candidate.setup, candidate.entryLow, candidate.entryHigh, candidate.stop,
+          candidate.tp1, candidate.tp2, candidate.rr, analyst.probability, skeptic?.probability ?? null,
+          decision.publish ? "pending" : "rejected", new Date(now + ttl * HOUR).toISOString(), decision.publish ? null : createdAt,
+          JSON.stringify(reasoning), own.id, playbook.version,
+        )
+        .first<{ id: number }>();
+      if (!decision.publish) {
+        summary.rejected++;
+        return;
       }
+      summary.published++;
+      await this.signalPush(row!.id, await this.signalMessage(row!.id, candidate), now);
+    } catch (e) {
+      summary.notes.push(`${candidate.symbol} ${candidate.setup}: ${String(e)}`);
     }
   }
 
@@ -1141,14 +1263,11 @@ export class Engine extends DurableObject<Env> {
 
   /** Тижневий розбір поза розкладом: за сьогоднішньою місцевою датою. */
   async weeklyNow(): Promise<{ status: string; id?: number; error?: string } | null> {
-    if (this.running) return null;
-    this.running = true;
+    if (await this.busy()) return null;
     try {
       return await this.runWeekly(Date.now(), true);
     } catch (e) {
       return { status: "error", error: String(e) };
-    } finally {
-      this.running = false;
     }
   }
 
@@ -1197,7 +1316,7 @@ export class Engine extends DurableObject<Env> {
       db
         .prepare(
           `DELETE FROM runs WHERE id IN (
-             SELECT id FROM runs WHERE started_at < ? AND kind IN ('scan', 'news', 'signals', 'probe')
+             SELECT id FROM runs WHERE started_at < ? AND kind IN ('scan', 'news', 'signals', 'probe', 'pipeline')
                AND id NOT IN (SELECT run_id FROM snapshots) LIMIT 20000)`,
         )
         .bind(runsCutoff),
@@ -1218,7 +1337,7 @@ export class Engine extends DurableObject<Env> {
       }
     });
     const outcome = await sendPush(
-      (input, init) => fetch(input, init),
+      this.http,
       {
         vapidPrivateKey: this.env.VAPID_PRIVATE_KEY,
         vapidSubject: this.env.VAPID_SUBJECT,

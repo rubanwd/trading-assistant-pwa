@@ -6,6 +6,7 @@ import { AiSettings } from "./Ai";
 import { Settings } from "./Settings";
 import { OpenSignals, Signals } from "./Signals";
 import { Stats } from "./Stats";
+import { errorSummary } from "../shared/errors";
 import { api, c, card, dim, h2, KIND, OFFLINE_EVENT, p, primary, secondary, time } from "./ui";
 
 interface Target { name: string; ok: boolean; status: number | null; ms: number; note?: string }
@@ -20,6 +21,7 @@ interface Status {
   lastReport: ReportCard | null;
   spend: { monthUsd: number; budgetUsd: number | null };
   btc: { price: number; at: string } | null;
+  cycle: { at: string; steps: number; maxRequests: number; failed: number } | null;
 }
 
 const MOOD = { risk_on: "ризик-он", risk_off: "ризик-оф", mixed: "змішаний" } as const;
@@ -69,6 +71,27 @@ function Today({ onOpenReport, onOpenSignal }: { onOpenReport: (id: number) => v
     }
   };
 
+  /** Скан іде кроками у фоні: перечитуємо стан кілька разів, поки цикл не завершиться. */
+  const [scanNote, setScanNote] = useState<string | null>(null);
+  const startScan = async () => {
+    setBusy(true);
+    try {
+      const res = await fetch("/api/scan", { method: "POST" });
+      if (res.status === 409) {
+        setScanNote("Цикл уже триває, результат буде за хвилину.");
+        return;
+      }
+      setScanNote("Скан запущено: він іде кроками, результат з'явиться за хвилину.");
+      for (const delay of [8_000, 15_000, 30_000, 45_000]) {
+        await new Promise((r) => setTimeout(r, delay));
+        await load();
+      }
+      setScanNote(null);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const run = status?.lastRun;
   const targets = Array.isArray(run?.detail) ? run.detail : null;
   const scan = run?.detail && !Array.isArray(run.detail) ? run.detail : null;
@@ -110,8 +133,14 @@ function Today({ onOpenReport, onOpenSignal }: { onOpenReport: (id: number) => v
         {!error && !run && <p style={dim}>Запусків ще не було.</p>}
         {run && (
           <p style={{ ...p, color: run.status === "ok" ? c.ink : c.orange }}>
-            Останній запуск о {time(run.started_at)}: {run.status === "ok" ? "успішно" : `помилка, ${run.error}`}
+            Останній запуск о {time(run.started_at)}: {run.status === "ok" ? "успішно" : `помилка. ${errorSummary(run.error)}`}
           </p>
+        )}
+        {run?.status !== "ok" && run?.error && (
+          <details style={{ fontSize: 12, color: c.dim }}>
+            <summary style={{ cursor: "pointer", minHeight: 32, display: "flex", alignItems: "center" }}>Деталі помилки</summary>
+            <p style={{ ...dim, fontSize: 12, marginTop: 6 }}>{run.error}</p>
+          </details>
         )}
         {scan && (
           <p style={dim}>
@@ -133,7 +162,14 @@ function Today({ onOpenReport, onOpenSignal }: { onOpenReport: (id: number) => v
         <button type="button" onClick={() => post("/api/probe")} disabled={busy} style={{ ...primary, marginTop: 4 }}>
           {busy ? "Працюю…" : "Перевірити джерела з ЄС"}
         </button>
-        <button type="button" onClick={() => post("/api/scan")} disabled={busy} style={secondary}>Запустити скан</button>
+        {status?.cycle && (
+          <p style={dim}>
+            Цикл о {time(status.cycle.at)}: {status.cycle.steps} кроків, до {status.cycle.maxRequests} зовнішніх запитів на крок із 50 дозволених
+            {status.cycle.failed > 0 && ` · з помилкою: ${status.cycle.failed}`}
+          </p>
+        )}
+        <button type="button" onClick={startScan} disabled={busy} style={secondary}>Запустити скан</button>
+        {scanNote && <p style={dim}>{scanNote}</p>}
       </section>
       <Push />
       <p style={dim}>Скан раз на 30 хв, звіти о 07:30 і 20:30. Система пропонує, рішення за тобою.</p>
@@ -163,7 +199,20 @@ export function App() {
 
   return (
     <div style={{ minHeight: "100dvh", background: c.bg, color: c.ink, fontFamily: "Inter, system-ui, sans-serif", display: "flex", flexDirection: "column" }}>
-      <main style={{ flex: 1, padding: "24px 20px 16px", boxSizing: "border-box", display: "flex", flexDirection: "column", gap: 12, width: "100%", maxWidth: 640, margin: "0 auto" }}>
+      <main
+        style={{
+          flex: 1,
+          padding: "max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) 16px max(16px, env(safe-area-inset-left))",
+          boxSizing: "border-box",
+          display: "flex",
+          flexDirection: "column",
+          gap: 12,
+          width: "100%",
+          minWidth: 0,
+          maxWidth: 640,
+          margin: "0 auto",
+        }}
+      >
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
           <h1 style={{ margin: 0, fontSize: 28, fontWeight: 600 }}>{TABS[tab]}</h1>
           {tab === "today" && (

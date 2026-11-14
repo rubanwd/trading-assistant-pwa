@@ -12,10 +12,16 @@ const OI_POINTS = 97;
 /** Одночасно опитуємо не більше стількох монет (по 5 запитів на кожну). */
 const CONCURRENCY = 3;
 
+/** Скільки монет обробляє один крок скану: так один запуск рушія вкладається в ліміти безкоштовного плану. */
+export const CHUNK_SIZE = 4;
+
+export interface ChunkResult {
+  snapshots: Snapshot[];
+  errors: { symbol: string | null; message: string }[];
+}
+
 export interface ScanResult {
   snapshots: Snapshot[];
-  /** Свічки, з яких пораховано знімки: потрібні детекторам і супроводу сигналів, у базу не йдуть. */
-  candles: Map<string, Record<Timeframe, Candle[]>>;
   market: MarketRegime;
   /** Монети без знімка та некритичні збої (фандинг, відкритий інтерес). */
   errors: { symbol: string | null; message: string }[];
@@ -35,10 +41,12 @@ async function pool<T, R>(items: T[], size: number, fn: (item: T) => Promise<R>)
   return out;
 }
 
-/** Збирає дані й рахує знімки ознак. Без моделі та без запису в базу. */
-export async function scan(market: MarketData, symbols: string[], now: number): Promise<ScanResult> {
-  const errors: ScanResult["errors"] = [];
-
+/**
+ * Одна частина скану: фандинг, свічки й відкритий інтерес для кількох монет і їхні знімки.
+ * Свічки беруться через кеш, тож після першого запуску на монету йде 2–3 маленькі запити.
+ */
+export async function scanChunk(market: MarketData, symbols: string[], now: number): Promise<ChunkResult> {
+  const errors: ChunkResult["errors"] = [];
   let funding = new Map<string, Funding>();
   try {
     funding = await market.funding();
@@ -46,7 +54,6 @@ export async function scan(market: MarketData, symbols: string[], now: number): 
     errors.push({ symbol: null, message: `фандинг: ${String(e)}` });
   }
 
-  const candlesBySymbol: ScanResult["candles"] = new Map();
   const results = await pool(symbols, CONCURRENCY, async (symbol): Promise<Snapshot | null> => {
     // Збій відкритого інтересу некритичний; пишемо його, лише якщо знімок таки вийшов.
     let oiError: string | null = null;
@@ -59,7 +66,6 @@ export async function scan(market: MarketData, symbols: string[], now: number): 
         }),
       ]);
       const candles = Object.fromEntries(TIMEFRAMES.map((tf, i) => [tf, series[i]!])) as Record<Timeframe, Candle[]>;
-      candlesBySymbol.set(symbol, candles);
       const snapshot = buildSnapshot({ symbol, now, candles, funding: funding.get(symbol) ?? null, openInterest });
       if (oiError) errors.push({ symbol, message: oiError });
       return snapshot;
@@ -68,12 +74,29 @@ export async function scan(market: MarketData, symbols: string[], now: number): 
       return null;
     }
   });
+  return { snapshots: results.filter((s): s is Snapshot => s !== null), errors };
+}
 
-  const snapshots = results.filter((s): s is Snapshot => s !== null);
+/** Режим ринку за знімками всіх монет. */
+export function marketFromSnapshots(snapshots: Snapshot[]): MarketRegime {
   const btc = snapshots.find((s) => s.symbol === "BTCUSDT");
-  const market_ = marketRegime(
+  return marketRegime(
     btc?.regime.trend ?? null,
     snapshots.map((s) => (s.tf["4h"].ema200 === null ? null : s.tf["4h"].close > s.tf["4h"].ema200)),
   );
-  return { snapshots, candles: candlesBySymbol, market: market_, errors };
+}
+
+/** Повний скан одним викликом (для тестів і невеликих списків). */
+export async function scan(market: MarketData, symbols: string[], now: number): Promise<ScanResult> {
+  const snapshots: Snapshot[] = [];
+  const errors: ScanResult["errors"] = [];
+  for (let i = 0; i < symbols.length; i += CHUNK_SIZE) {
+    const part = await scanChunk(market, symbols.slice(i, i + CHUNK_SIZE), now);
+    snapshots.push(...part.snapshots);
+    // Збій фандингу повторюється в кожній частині: лишаємо один запис.
+    for (const e of part.errors) if (e.symbol !== null || !errors.some((x) => x.symbol === null)) errors.push(e);
+  }
+  const order = new Map(symbols.map((s, i) => [s, i]));
+  snapshots.sort((a, b) => order.get(a.symbol)! - order.get(b.symbol)!);
+  return { snapshots, market: marketFromSnapshots(snapshots), errors };
 }
