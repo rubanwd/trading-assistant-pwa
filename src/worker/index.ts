@@ -38,14 +38,17 @@ app.get("/api/status", async (c) => {
   const db = c.env.DB;
   const now = new Date();
   const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
-  const [last, report, spent, budget] = await Promise.all([
+  const [last, report, spent, budget, cycle] = await Promise.all([
     db
       .prepare("SELECT kind, started_at, status, duration_ms, detail, error FROM runs WHERE kind IN ('scan', 'probe') ORDER BY id DESC LIMIT 1")
       .first<{ kind: string; started_at: string; status: string; duration_ms: number; detail: string | null; error: string | null }>(),
     db.prepare("SELECT id, kind, date, body, created_at FROM reports ORDER BY created_at DESC LIMIT 1").first<ReportRow>(),
     db.prepare("SELECT COALESCE(SUM(cost_usd), 0) AS usd FROM llm_calls WHERE ts >= ?").bind(monthStart).first<{ usd: number }>(),
     db.prepare("SELECT value FROM settings WHERE key = 'llm_budget_usd'").first<{ value: string }>(),
+    db.prepare("SELECT started_at, detail FROM runs WHERE kind = 'pipeline' ORDER BY id DESC LIMIT 1").first<{ started_at: string; detail: string }>(),
   ]);
+  // Запас до ліміту безкоштовного плану: найбільша кількість зовнішніх запитів за один крок циклу.
+  const steps = cycle ? ((JSON.parse(cycle.detail) as { steps?: { requests: number; error?: string }[] }).steps ?? []) : [];
   const btc = await db
     .prepare(
       "SELECT json_extract(s.features, '$.price') AS price, r.started_at AS at FROM snapshots s JOIN runs r ON r.id = s.run_id WHERE s.symbol = 'BTCUSDT' ORDER BY s.id DESC LIMIT 1",
@@ -56,6 +59,9 @@ app.get("/api/status", async (c) => {
     lastRun: last ? { ...last, detail: last.detail ? JSON.parse(last.detail) : null } : null,
     lastReport: report ? reportCard(report) : null,
     spend: { monthUsd: spent?.usd ?? 0, budgetUsd: budget ? Number(JSON.parse(budget.value)) : null },
+    cycle: cycle
+      ? { at: cycle.started_at, steps: steps.length, maxRequests: Math.max(0, ...steps.map((x) => x.requests)), failed: steps.filter((x) => x.error).length }
+      : null,
   });
 });
 
@@ -380,8 +386,8 @@ app.post("/api/probe", async (c) => c.json(await engineStub(c.env).probe()));
 
 /** Ручний запуск скану. 409, якщо скан уже триває. */
 app.post("/api/scan", async (c) => {
-  const summary = await engineStub(c.env).scanNow();
-  return summary ? c.json(summary) : c.json({ error: "scan already running" }, 409);
+  const res = await engineStub(c.env).scanNow();
+  return res.queued ? c.json(res) : c.json({ error: "scan already running" }, 409);
 });
 
 /** Знімки ознак останнього скану. */

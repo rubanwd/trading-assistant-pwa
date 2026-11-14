@@ -21,6 +21,7 @@ interface Status {
   lastReport: ReportCard | null;
   spend: { monthUsd: number; budgetUsd: number | null };
   btc: { price: number; at: string } | null;
+  cycle: { at: string; steps: number; maxRequests: number; failed: number } | null;
 }
 
 const MOOD = { risk_on: "ризик-он", risk_off: "ризик-оф", mixed: "змішаний" } as const;
@@ -65,6 +66,27 @@ function Today({ onOpenReport, onOpenSignal }: { onOpenReport: (id: number) => v
     try {
       await fetch(path, { method: "POST" });
       await load();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** Скан іде кроками у фоні: перечитуємо стан кілька разів, поки цикл не завершиться. */
+  const [scanNote, setScanNote] = useState<string | null>(null);
+  const startScan = async () => {
+    setBusy(true);
+    try {
+      const res = await fetch("/api/scan", { method: "POST" });
+      if (res.status === 409) {
+        setScanNote("Цикл уже триває, результат буде за хвилину.");
+        return;
+      }
+      setScanNote("Скан запущено: він іде кроками, результат з'явиться за хвилину.");
+      for (const delay of [8_000, 15_000, 30_000, 45_000]) {
+        await new Promise((r) => setTimeout(r, delay));
+        await load();
+      }
+      setScanNote(null);
     } finally {
       setBusy(false);
     }
@@ -140,7 +162,14 @@ function Today({ onOpenReport, onOpenSignal }: { onOpenReport: (id: number) => v
         <button type="button" onClick={() => post("/api/probe")} disabled={busy} style={{ ...primary, marginTop: 4 }}>
           {busy ? "Працюю…" : "Перевірити джерела з ЄС"}
         </button>
-        <button type="button" onClick={() => post("/api/scan")} disabled={busy} style={secondary}>Запустити скан</button>
+        {status?.cycle && (
+          <p style={dim}>
+            Цикл о {time(status.cycle.at)}: {status.cycle.steps} кроків, до {status.cycle.maxRequests} зовнішніх запитів на крок із 50 дозволених
+            {status.cycle.failed > 0 && ` · з помилкою: ${status.cycle.failed}`}
+          </p>
+        )}
+        <button type="button" onClick={startScan} disabled={busy} style={secondary}>Запустити скан</button>
+        {scanNote && <p style={dim}>{scanNote}</p>}
       </section>
       <Push />
       <p style={dim}>Скан раз на 30 хв, звіти о 07:30 і 20:30. Система пропонує, рішення за тобою.</p>
