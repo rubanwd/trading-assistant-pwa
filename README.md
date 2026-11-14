@@ -102,6 +102,8 @@ npm test               # тести індикаторів, скану, нови
 
 Далі кожне злиття в `main` збирається й деплоїться саме, разом із новими міграціями.
 
+Якщо після злиття в **Deployments** не з'являється нова збірка, а в **Settings → Builds** видно «This project is disconnected from your Git account», у застосунку GitHub **Cloudflare Workers and Pages** (github.com/settings/installations → Configure) немає доступу до цього репозиторію: додай його в **Repository access** і збережи.
+
 ## Перший деплой
 
 1. `npx wrangler login`
