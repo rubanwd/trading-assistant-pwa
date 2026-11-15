@@ -1,4 +1,4 @@
-import { entryMid, type Side } from "../../shared/risk";
+import { entryMid, type Fill, type Liquidity, type Side } from "../../shared/risk";
 import type { Candle } from "../market/types";
 import type { SignalStatus } from "./types";
 
@@ -26,11 +26,11 @@ export interface TrackEvent {
   price: number;
 }
 
-export interface Exit {
-  price: number;
-  /** Частка позиції, 0..1. */
-  share: number;
-}
+/**
+ * Вихід із позиції. Цілі виконуються лімітними ордерами (maker);
+ * стоп, беззбиток і закриття за часом — ринковими (taker).
+ */
+export type Exit = Fill;
 
 export interface TrackResult {
   status: SignalStatus;
@@ -38,6 +38,8 @@ export interface TrackResult {
   /** Результат в R від середини зони входу без комісій; null, поки сигнал відкритий або входу не було. */
   resultR: number | null;
   resolvedAt: number | null;
+  /** Вхід для розрахунку комісій: середина зони і тип виконання; null, якщо входу не було. */
+  entry: { price: number; kind: Liquidity } | null;
   /** Виходи з позиції для розрахунку комісій; порожньо, якщо входу не було. */
   exits: Exit[];
 }
@@ -67,17 +69,22 @@ export function replay(s: TrackedSignal, candles: Candle[], now: number, maxHold
   const r = (price: number) => ((price - mid) / risk) * dir;
   const events: TrackEvent[] = [];
   const exits: Exit[] = [];
+  let entry: TrackResult["entry"] = null;
   const done = (status: SignalStatus, at: number): TrackResult => {
     const gross = exits.length ? exits.reduce((sum, e) => sum + r(e.price) * e.share, 0) : null;
-    return { status, events, resultR: gross === null ? null : Number(gross.toFixed(2)), resolvedAt: at, exits };
+    return { status, events, resultR: gross === null ? null : Number(gross.toFixed(2)), resolvedAt: at, entry, exits };
   };
   const above = (c: Candle, level: number) => (long ? c.high >= level : c.low <= level);
   const below = (c: Candle, level: number) => (long ? c.low <= level : c.high >= level);
 
   let enteredAt: number | null = null;
+  let first = true;
   let tp1Hit = false;
   for (const c of candles) {
     if (c.openTime < s.createdAt - START_TOLERANCE_MS) continue;
+    // Лімітний ордер ставиться під час сигналу. Якщо ціна вже за серединою зони, він виконається одразу як taker.
+    const openedPast = first && (long ? c.open <= mid : c.open >= mid);
+    first = false;
 
     if (enteredAt === null) {
       if (c.openTime >= s.expiresAt) break;
@@ -89,10 +96,11 @@ export function replay(s: TrackedSignal, candles: Candle[], now: number, maxHold
         continue;
       }
       enteredAt = c.closeTime;
+      entry = { price: mid, kind: openedPast ? "taker" : "maker" };
       events.push({ type: "entry", ts: c.closeTime, price: mid });
       if (below(c, s.stop)) {
         events.push({ type: "stop", ts: c.closeTime, price: s.stop });
-        exits.push({ price: s.stop, share: 1 });
+        exits.push({ price: s.stop, share: 1, kind: "taker" });
         return done("stopped", c.closeTime);
       }
       continue;
@@ -102,42 +110,42 @@ export function replay(s: TrackedSignal, candles: Candle[], now: number, maxHold
     if (!tp1Hit) {
       if (below(c, s.stop)) {
         events.push({ type: "stop", ts: c.closeTime, price: s.stop });
-        exits.push({ price: s.stop, share: 1 });
+        exits.push({ price: s.stop, share: 1, kind: "taker" });
         return done("stopped", c.closeTime);
       }
       if (above(c, s.tp1)) {
         events.push({ type: "tp1", ts: c.closeTime, price: s.tp1 });
         if (s.tp2 === null) {
-          exits.push({ price: s.tp1, share: 1 });
+          exits.push({ price: s.tp1, share: 1, kind: "maker" });
           return done("tp1", c.closeTime);
         }
-        exits.push({ price: s.tp1, share: TP1_SHARE });
+        exits.push({ price: s.tp1, share: TP1_SHARE, kind: "maker" });
         tp1Hit = true;
         continue;
       }
     } else {
       if (below(c, mid)) {
         events.push({ type: "breakeven", ts: c.closeTime, price: mid });
-        exits.push({ price: mid, share: remaining });
+        exits.push({ price: mid, share: remaining, kind: "taker" });
         return done("tp1", c.closeTime);
       }
       if (above(c, s.tp2!)) {
         events.push({ type: "tp2", ts: c.closeTime, price: s.tp2! });
-        exits.push({ price: s.tp2!, share: remaining });
+        exits.push({ price: s.tp2!, share: remaining, kind: "maker" });
         return done("tp2", c.closeTime);
       }
     }
     if (c.closeTime - enteredAt >= maxHoldMs) {
       events.push({ type: "timeout", ts: c.closeTime, price: c.close });
-      exits.push({ price: c.close, share: remaining });
+      exits.push({ price: c.close, share: remaining, kind: "taker" });
       return done(tp1Hit ? "tp1" : "expired", c.closeTime);
     }
   }
 
-  if (enteredAt !== null) return { status: "active", events, resultR: null, resolvedAt: null, exits: [] };
+  if (enteredAt !== null) return { status: "active", events, resultR: null, resolvedAt: null, entry, exits: [] };
   if (now >= s.expiresAt) {
     events.push({ type: "expired", ts: s.expiresAt, price: mid });
     return done("expired", s.expiresAt);
   }
-  return { status: "pending", events, resultR: null, resolvedAt: null, exits: [] };
+  return { status: "pending", events, resultR: null, resolvedAt: null, entry: null, exits: [] };
 }

@@ -163,7 +163,7 @@ describe("супровід сигналу", () => {
   const run = (rows: [number, number, number][], s = sig(), now = T0 + rows.length * M15) => replay(s, bars(rows), now, HOLD);
 
   it("чекає входу, поки ціна над зоною", () => {
-    expect(run([[103, 102, 102.5]])).toEqual({ status: "pending", events: [], resultR: null, resolvedAt: null, exits: [] });
+    expect(run([[103, 102, 102.5]])).toEqual({ status: "pending", events: [], resultR: null, resolvedAt: null, entry: null, exits: [] });
   });
 
   it("ціна зачепила край зони, але не дійшла до середини: входу немає", () => {
@@ -246,7 +246,7 @@ describe("супровід сигналу", () => {
       expect(r.status).toBe("tp2");
       expect(r.events.map((e) => e.type)).toEqual(["entry", "tp1", "tp2"]);
       expect(r.resultR).toBe(3); // 0.5 × 2 + 0.5 × 4
-      expect(r.exits).toEqual([{ price: 104, share: 0.5 }, { price: 108, share: 0.5 }]);
+      expect(r.exits).toEqual([{ price: 104, share: 0.5, kind: "maker" }, { price: 108, share: 0.5, kind: "maker" }]);
     });
 
     it("після першої цілі стоп у беззбитку: результат лише з першої половини", () => {
@@ -271,12 +271,45 @@ describe("супровід сигналу", () => {
     });
   });
 
-  it("комісії в R", () => {
-    // Вхід 100, стоп 98, вихід 104: обіг 204 × 0.05% = 0.102 на одиницю, ризик 2 → 0.051R.
-    expect(feeR(100, 98, [{ price: 104, share: 1 }], 0.05)).toBe(0.051);
-    expect(feeR(100, 98, [{ price: 104, share: 0.5 }, { price: 108, share: 0.5 }], 0.05)).toBeCloseTo(0.0515, 2); // обіг 206
-    expect(feeR(100, 98, [], 0.05)).toBe(0);
-    expect(feeR(100, 100, [{ price: 104, share: 1 }], 0.05)).toBe(0);
+  it("комісії в R: вхід і цілі за ставкою maker, стоп і ринкові виходи за ставкою taker", () => {
+    const fees = { makerPct: 0.02, takerPct: 0.05 };
+    const maker = { price: 100, kind: "maker" as const };
+    // Вхід 100 і ціль 104 лімітними: (100 + 104) × 0.02% = 0.0408 на одиницю, ризик 2 → 0.020R.
+    expect(feeR(maker, 98, [{ price: 104, share: 1, kind: "maker" }], fees)).toBe(0.02);
+    // Стоп ринковий: 100 × 0.02% + 98 × 0.05% = 0.069 → 0.035R (округлення до тисячних).
+    expect(feeR(maker, 98, [{ price: 98, share: 1, kind: "taker" }], fees)).toBe(0.035);
+    // Половина на цілі, решта в беззбиток: 0.02 + 104 × 0.5 × 0.0002 + 100 × 0.5 × 0.0005 = 0.0558 → 0.028R.
+    expect(feeR(maker, 98, [{ price: 104, share: 0.5, kind: "maker" }, { price: 100, share: 0.5, kind: "taker" }], fees)).toBe(0.028);
+    // Вхід ринковий, коли ціна вже за серединою зони: (100 + 104) × 0.05%.
+    expect(feeR({ price: 100, kind: "taker" }, 98, [{ price: 104, share: 1, kind: "taker" }], fees)).toBe(0.051);
+    expect(feeR(maker, 98, [], fees)).toBe(0);
+    expect(feeR(null, 98, [{ price: 104, share: 1, kind: "maker" }], fees)).toBe(0);
+    expect(feeR({ price: 100, kind: "maker" }, 100, [{ price: 104, share: 1, kind: "maker" }], fees)).toBe(0);
+  });
+
+  it("тип виконання: лімітний вхід і цілі maker, стоп, беззбиток і закриття за часом taker", () => {
+    expect(run([[103, 102, 102.5], [102, 99.8, 101], [104.2, 102.5, 104]])).toMatchObject({
+      entry: { price: 100, kind: "maker" },
+      exits: [{ price: 104, share: 1, kind: "maker" }],
+    });
+    expect(run([[102, 99.8, 101], [101, 97.9, 98.2]]).exits).toEqual([{ price: 98, share: 1, kind: "taker" }]);
+    const s2 = sig({ tp2: 108 });
+    expect(run([[102, 99.8, 101], [104.2, 101, 104], [103, 99.8, 100.2]], s2).exits).toEqual([
+      { price: 104, share: 0.5, kind: "maker" },
+      { price: 100, share: 0.5, kind: "taker" },
+    ]);
+    const timeout = replay(sig(), bars([[102, 99.8, 101], [102, 100.6, 101], [102, 100.6, 101.5]]), T0 + 3 * M15, 2 * M15 - 2);
+    expect(timeout.exits).toEqual([{ price: 101.5, share: 1, kind: "taker" }]);
+  });
+
+  it("ціна вже за серединою зони на момент сигналу: вхід ринковий (taker)", () => {
+    // Перша свічка відкривається на 99.5, нижче середини 100: лімітна купівля на 100 виконається одразу.
+    expect(run([[100.5, 99, 99.5], [104.2, 99.5, 104]]).entry).toEqual({ price: 100, kind: "taker" });
+    // Ціна прийшла до зони пізніше: ордер стояв у стакані, тож maker, навіть якщо свічка відкрилась нижче середини.
+    expect(run([[103, 102, 102.5], [100.5, 99, 99.5]]).entry).toEqual({ price: 100, kind: "maker" });
+    const short = sig({ side: "short", entryLow: 99, entryHigh: 101, stop: 102, tp1: 96 });
+    expect(run([[101, 100, 100.5]], short).entry).toEqual({ price: 100, kind: "taker" });
+    expect(run([[99.5, 98, 99], [100.2, 98, 99]], short).entry).toEqual({ price: 100, kind: "maker" });
   });
 
   it("відтворення детерміноване: повторний прогін дає той самий результат", () => {

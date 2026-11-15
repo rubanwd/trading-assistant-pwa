@@ -37,7 +37,8 @@ const SYMBOL = /^[A-Z0-9]{2,20}USDT$/;
 export const SETTINGS: SettingSpec[] = [
   { key: "deposit_usd", group: "Ризик", label: "Депозит, $", help: "Для розміру позиції в сповіщеннях; порожньо, якщо не потрібно.", kind: "nullable-number", check: nullable(num(1, 100_000_000)) },
   { key: "risk_per_trade_pct", group: "Ризик", label: "Ризик на угоду, % депозиту", kind: "number", check: num(0.1, 5) },
-  { key: "fee_pct_per_side", group: "Ризик", label: "Комісія за угоду, %", help: "Тейкер ф'ючерсів Binance: 0.05%. Вхід і вихід платять окремо.", kind: "number", check: num(0, 0.5) },
+  { key: "fee_maker_pct", group: "Ризик", label: "Комісія maker, %", help: "Лімітні ордери: вхід у зоні й цілі. Ф'ючерси Binance, VIP 0: 0.02%.", kind: "number", check: num(0, 0.5) },
+  { key: "fee_taker_pct", group: "Ризик", label: "Комісія taker, %", help: "Ринкові ордери: стоп, беззбиток, закриття за часом і вхід, якщо ціна вже за серединою зони. Ф'ючерси Binance, VIP 0: 0.05%.", kind: "number", check: num(0, 0.5) },
   { key: "min_rr", group: "Сигнали", label: "Мінімальний R:R", kind: "number", check: num(1, 10) },
   { key: "skeptic_threshold", group: "Сигнали", label: "Поріг скептика", help: "Частка від 0.5 до 0.95: 0.6 означає 60%.", kind: "number", check: num(0.5, 0.95) },
   { key: "max_active_signals", group: "Сигнали", label: "Відкритих сигналів не більше", kind: "number", check: num(1, 10, true) },

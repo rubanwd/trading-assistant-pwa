@@ -1,4 +1,4 @@
-import { entryMid, feeR } from "../shared/risk";
+import { feeR, type Liquidity } from "../shared/risk";
 import type { Candle } from "../worker/market/types";
 import { marketRegime, trend, type MarketMood, type SymbolRegime } from "../worker/regime";
 import { CANDLE_LIMIT } from "../worker/scan";
@@ -36,7 +36,9 @@ export interface BacktestConfig {
   maxCandidatesPerScan: number;
   ttlHours: number;
   maxHoldHours: number;
-  feePctPerSide: number;
+  /** Комісії, % від обсягу: лімітні ордери (вхід, цілі) і ринкові (стоп, беззбиток, закриття за часом). */
+  makerPct: number;
+  takerPct: number;
 }
 
 /** Стартові налаштування, як у міграціях. */
@@ -47,7 +49,8 @@ export const DEFAULT_CONFIG: Omit<BacktestConfig, "from" | "to"> = {
   maxCandidatesPerScan: 3,
   ttlHours: 12,
   maxHoldHours: 48,
-  feePctPerSide: 0.05,
+  makerPct: 0.02,
+  takerPct: 0.05,
 };
 
 export interface Trade extends Candidate {
@@ -55,6 +58,8 @@ export interface Trade extends Candidate {
   mood: MarketMood;
   regime: SymbolRegime;
   status: SignalStatus;
+  /** Як виконався вхід; null, якщо входу не було. */
+  entryKind: Liquidity | null;
   /** Результат без комісій, R; null, якщо входу не було або позиція ще відкрита на кінець даних. */
   resultR: number | null;
   feeR: number;
@@ -137,7 +142,7 @@ function resolve(c: Candidate, createdAt: number, m15: Candle[], cfg: BacktestCo
     dataEnd,
     cfg.maxHoldHours * HOUR,
   );
-  const fee = res.resolvedAt === null ? 0 : feeR(entryMid(c.entryLow, c.entryHigh), c.stop, res.exits, cfg.feePctPerSide);
+  const fee = res.resolvedAt === null ? 0 : feeR(res.entry, c.stop, res.exits, { makerPct: cfg.makerPct, takerPct: cfg.takerPct });
   return { res, fee };
 }
 
@@ -215,6 +220,7 @@ export function backtest(symbols: SymbolCandles[], cfg: BacktestConfig): Backtes
         mood,
         regime,
         status: res.status,
+        entryKind: res.entry?.kind ?? null,
         resultR: res.resultR,
         feeR: fee,
         netR: res.resultR === null ? null : Number((res.resultR - fee).toFixed(3)),

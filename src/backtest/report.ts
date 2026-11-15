@@ -161,11 +161,11 @@ export function formatReport(r: Report, meta: { from: string; to: string; symbol
 /** Угоди в CSV для власного аналізу. */
 export function tradesCsv(trades: Trade[]): string {
   const iso = (v: number | null) => (v === null ? "" : new Date(v).toISOString());
-  const head = "created_at,symbol,side,setup,entry_low,entry_high,stop,tp1,tp2,rr,mood,trend_4h,trend_1d,status,result_r,fee_r,net_r,resolved_at";
+  const head = "created_at,symbol,side,setup,entry_low,entry_high,stop,tp1,tp2,rr,mood,trend_4h,trend_1d,status,entry_kind,result_r,fee_r,net_r,resolved_at";
   const rows = trades.map((t) =>
     [
       iso(t.createdAt), t.symbol, t.side, t.setup, t.entryLow, t.entryHigh, t.stop, t.tp1, t.tp2 ?? "", t.rr,
-      t.mood, t.regime.trend ?? "", t.regime.higherTrend ?? "", t.status, t.resultR ?? "", t.feeR, t.netR ?? "", iso(t.resolvedAt),
+      t.mood, t.regime.trend ?? "", t.regime.higherTrend ?? "", t.status, t.entryKind ?? "", t.resultR ?? "", t.feeR, t.netR ?? "", iso(t.resolvedAt),
     ].join(","),
   );
   return [head, ...rows].join("\n") + "\n";

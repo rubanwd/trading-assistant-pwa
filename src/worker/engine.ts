@@ -31,7 +31,7 @@ import { reportInput, type NewsField, type PriorForecast } from "./report/input"
 import { reportSchema, reportSystem, sanitizeReport, type ReportContent } from "./report/schema";
 import { CANDLE_LIMIT, CHUNK_SIZE, marketFromSnapshots, scanChunk, type ChunkResult } from "./scan";
 import { CachedMarket, SqlCandleStorage } from "./market/cache";
-import { entryMid, feeR, positionSize } from "../shared/risk";
+import { entryMid, feeR, positionSize, type Fees } from "../shared/risk";
 import { detect } from "./signals/detectors";
 import { candidateKey, minutesToMacro, reject, type Rejection } from "./signals/filter";
 import {
@@ -907,7 +907,7 @@ export class Engine extends DurableObject<Env> {
       .prepare("SELECT id, created_at, symbol, side, setup, entry_low, entry_high, stop, tp1, tp2, rr, status, expires_at FROM signals WHERE status IN ('pending', 'active') ORDER BY id")
       .all<SignalRow>();
     const maxHoldMs = (await this.setting("signal_max_hold_hours", 48)) * HOUR;
-    const feePct = await this.setting("fee_pct_per_side", 0.05);
+    const fees: Fees = { makerPct: await this.setting("fee_maker_pct", 0.02), takerPct: await this.setting("fee_taker_pct", 0.05) };
     let updated = 0;
     const market = await this.market();
     for (const sig of open.results) {
@@ -941,7 +941,7 @@ export class Engine extends DurableObject<Env> {
           .bind(
             res.status,
             res.resultR,
-            res.resolvedAt === null ? null : feeR(entryMid(sig.entry_low, sig.entry_high), sig.stop, res.exits, feePct),
+            res.resolvedAt === null ? null : feeR(res.entry, sig.stop, res.exits, fees),
             res.resolvedAt === null ? null : new Date(res.resolvedAt).toISOString(),
             sig.id,
           ),
@@ -965,7 +965,7 @@ export class Engine extends DurableObject<Env> {
         await this.signalPush(sig.id, { title, body, url: `/?signal=${sig.id}`, tag: `signal-${sig.id}` }, now);
       }
     }
-    await this.trackShadows(now, maxHoldMs, feePct);
+    await this.trackShadows(now, maxHoldMs, fees);
     return updated;
   }
 
@@ -973,7 +973,7 @@ export class Engine extends DurableObject<Env> {
    * Тіньовий супровід відхилених моделлю кандидатів: ті самі правила, але без подій і сповіщень.
    * shadow_r зберігається вже після комісій. Потрібен, щоб калібрувати оцінки й бачити, що відсіяв скептик.
    */
-  private async trackShadows(now: number, maxHoldMs: number, feePct: number): Promise<void> {
+  private async trackShadows(now: number, maxHoldMs: number, fees: Fees): Promise<void> {
     const db = this.env.DB;
     const rows = await db
       .prepare(
@@ -996,7 +996,7 @@ export class Engine extends DurableObject<Env> {
         now,
         maxHoldMs,
       );
-      const shadowR = res.resultR === null ? null : Number((res.resultR - feeR(entryMid(sig.entry_low, sig.entry_high), sig.stop, res.exits, feePct)).toFixed(3));
+      const shadowR = res.resultR === null ? null : Number((res.resultR - feeR(res.entry, sig.stop, res.exits, fees)).toFixed(3));
       statements.push(update.bind(res.status, shadowR, sig.id));
     }
     if (statements.length) await db.batch(statements);
@@ -1241,7 +1241,7 @@ export class Engine extends DurableObject<Env> {
       .all<{ ts: string; action: string | null; note: string }>();
     const settings = Object.fromEntries(
       await Promise.all(
-        ["min_rr", "skeptic_threshold", "max_active_signals", "signal_ttl_hours", "signal_max_hold_hours", "fee_pct_per_side"].map(async (k) => [k, await this.setting<unknown>(k, null)] as const),
+        ["min_rr", "skeptic_threshold", "max_active_signals", "signal_ttl_hours", "signal_max_hold_hours", "fee_maker_pct", "fee_taker_pct"].map(async (k) => [k, await this.setting<unknown>(k, null)] as const),
       ),
     );
     const input = weeklyInput({ week, allTime, playbook: { version: playbook.version, rules: playbook.rules as Record<string, string> }, settings, notes: notes.results.map((n) => ({ ...n, note: n.note.slice(0, 300) })) });

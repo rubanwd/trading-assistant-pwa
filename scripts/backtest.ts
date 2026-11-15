@@ -36,7 +36,8 @@ const HELP = `Бектест коду без моделі.
   --per-scan N          кандидатів за скан (${DEFAULT_CONFIG.maxCandidatesPerScan})
   --ttl N               сигнал чекає входу, год (${DEFAULT_CONFIG.ttlHours})
   --max-hold N          найдовше тримати позицію, год (${DEFAULT_CONFIG.maxHoldHours})
-  --fee N               комісія за угоду, % (${DEFAULT_CONFIG.feePctPerSide})
+  --maker N             комісія maker, %: вхід і цілі (${DEFAULT_CONFIG.makerPct})
+  --taker N             комісія taker, %: стоп, беззбиток, закриття за часом (${DEFAULT_CONFIG.takerPct})
   --out DIR             куди писати звіт (.backtest/out/<from>_<to>)
 `;
 
@@ -96,7 +97,7 @@ async function main() {
       from: { type: "string" }, to: { type: "string" }, symbols: { type: "string" },
       "min-rr": { type: "string" }, "max-active": { type: "string" }, cooldown: { type: "string" },
       "per-scan": { type: "string" }, ttl: { type: "string" }, "max-hold": { type: "string" },
-      fee: { type: "string" }, out: { type: "string" }, help: { type: "boolean", short: "h" },
+      maker: { type: "string" }, taker: { type: "string" }, out: { type: "string" }, help: { type: "boolean", short: "h" },
     },
   });
   if (values.help) return console.log(HELP);
@@ -145,7 +146,8 @@ async function main() {
     maxCandidatesPerScan: num(values["per-scan"], DEFAULT_CONFIG.maxCandidatesPerScan),
     ttlHours: num(values.ttl, DEFAULT_CONFIG.ttlHours),
     maxHoldHours: num(values["max-hold"], DEFAULT_CONFIG.maxHoldHours),
-    feePctPerSide: num(values.fee, DEFAULT_CONFIG.feePctPerSide),
+    makerPct: num(values.maker, DEFAULT_CONFIG.makerPct),
+    takerPct: num(values.taker, DEFAULT_CONFIG.takerPct),
   };
   process.stderr.write(`Симуляція: ${data.length} монет, ${from} — ${to}\n`);
   const t0 = Date.now();
