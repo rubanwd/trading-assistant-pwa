@@ -148,7 +148,24 @@ function resolve(c: Candidate, createdAt: number, m15: Candle[], cfg: BacktestCo
   return { res, fee };
 }
 
-export function backtest(symbols: SymbolCandles[], cfg: BacktestConfig): BacktestResult {
+/** Що бачив скан, коли знайшов кандидата: для дослідження сетапів поза лімітами фільтра. */
+export interface ScanContext {
+  t: number;
+  mood: MarketMood;
+  regime: SymbolRegime;
+  h1: Candle[];
+  h4: Candle[];
+  d1: Candle[];
+  m15: Candle[];
+  /** Причина відсіву фільтром або null, якщо кандидат пройшов фільтр. */
+  rejection: Rejection | null;
+}
+
+export function backtest(
+  symbols: SymbolCandles[],
+  cfg: BacktestConfig,
+  onCandidate?: (c: Candidate, ctx: ScanContext) => void,
+): BacktestResult {
   const states: SymbolState[] = symbols.map((data) => ({
     data,
     h1: new Cursor(data["1h"]),
@@ -187,7 +204,8 @@ export function backtest(symbols: SymbolCandles[], cfg: BacktestConfig): Backtes
       const h1 = s.h1.window(t);
       // Скан бачить лише свічку 1h, що закрилась щойно; монети без свіжих даних пропускаються.
       if (!h1.length || t - h1[h1.length - 1]!.closeTime > 20 * 60_000) continue;
-      for (const c of detect(s.data.symbol, h1, s.h4.window(t))) {
+      const h4 = s.h4.window(t);
+      for (const c of detect(s.data.symbol, h1, h4)) {
         funnel.detected++;
         const reason = reject(c, {
           minRr: cfg.minRr,
@@ -201,6 +219,7 @@ export function backtest(symbols: SymbolCandles[], cfg: BacktestConfig): Backtes
           openCount: open.length,
           maxActive: cfg.maxActive,
         });
+        onCandidate?.(c, { t, mood, regime: s.regime, h1, h4, d1: s.d1.window(t), m15: s.data["15m"], rejection: reason });
         if (reason) funnel.filtered[reason] = (funnel.filtered[reason] ?? 0) + 1;
         else passed.push({ ...c, regime: s.regime });
       }

@@ -5,23 +5,13 @@
  * Свічки завантажуються з публічного архіву data.binance.vision і кешуються в .backtest/cache.
  * Звіт друкується в консоль і пишеться в .backtest/out (report.txt, report.json, trades.csv).
  */
-import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { archiveUrl, mergeCandles, months, parseKlines, shiftMonth, unzipFirst } from "../src/backtest/data";
+import { shiftMonth } from "../src/backtest/data";
+import { loadSymbols, ROOT, WATCHLIST } from "../src/backtest/load";
 import { buildReport, formatReport, tradesCsv } from "../src/backtest/report";
-import { backtest, DEFAULT_CONFIG, type SymbolCandles } from "../src/backtest/simulate";
-import type { Candle, Timeframe } from "../src/worker/market/types";
-
-/** Стартовий список монет, як у міграції 0001. */
-const WATCHLIST = [
-  "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "AVAXUSDT",
-  "LINKUSDT", "SUIUSDT", "TONUSDT", "DOTUSDT", "LTCUSDT", "NEARUSDT", "APTUSDT",
-];
-
-/** Скільки місяців історії до початку потрібно, щоб набрати 498 свічок для індикаторів. */
-const WARMUP: Record<Timeframe, number> = { "15m": 0, "1h": 1, "4h": 3, "1d": 17 };
+import { backtest, DEFAULT_CONFIG } from "../src/backtest/simulate";
 
 const HELP = `Бектест коду без моделі.
 
@@ -41,49 +31,6 @@ const HELP = `Бектест коду без моделі.
   --taker N             комісія taker, %: стоп, беззбиток, закриття за часом (${DEFAULT_CONFIG.takerPct})
   --out DIR             куди писати звіт (.backtest/out/<from>_<to>)
 `;
-
-const ROOT = ".backtest";
-
-async function fetchMonth(symbol: string, tf: Timeframe, month: string, latest: string): Promise<Candle[]> {
-  const dir = join(ROOT, "cache", symbol, tf);
-  const file = join(dir, `${month}.csv`);
-  const missing = `${file}.missing`;
-  if (existsSync(file)) return parseKlines(await readFile(file, "utf8"));
-  if (existsSync(missing)) return [];
-  for (let attempt = 1; ; attempt++) {
-    try {
-      const res = await fetch(archiveUrl(symbol, tf, month), { signal: AbortSignal.timeout(60_000) });
-      await mkdir(dir, { recursive: true });
-      if (res.status === 404) {
-        await res.body?.cancel();
-        // Монети ще не було на біржі. Останній місяць архів міг ще не опублікувати: його не запам'ятовуємо.
-        if (month !== latest) await writeFile(missing, "");
-        return [];
-      }
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const csv = new TextDecoder().decode(unzipFirst(new Uint8Array(await res.arrayBuffer())));
-      await writeFile(file, csv);
-      return parseKlines(csv);
-    } catch (e) {
-      if (attempt >= 4) throw new Error(`${symbol} ${tf} ${month}: ${String(e)}`);
-      await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
-    }
-  }
-}
-
-async function pool<T>(tasks: (() => Promise<T>)[], size: number): Promise<T[]> {
-  const out = new Array<T>(tasks.length);
-  let next = 0;
-  await Promise.all(
-    Array.from({ length: size }, async () => {
-      while (next < tasks.length) {
-        const i = next++;
-        out[i] = await tasks[i]!();
-      }
-    }),
-  );
-  return out;
-}
 
 const num = (v: string | undefined, fallback: number) => {
   if (v === undefined) return fallback;
@@ -109,32 +56,7 @@ async function main() {
   if (!/^\d{4}-\d{2}$/.test(from) || !/^\d{4}-\d{2}$/.test(to) || from > to) throw new Error("--from і --to у форматі YYYY-MM, from не пізніше to");
   const symbols = values.symbols ? values.symbols.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean) : WATCHLIST;
 
-  const tfs: Timeframe[] = ["15m", "1h", "4h", "1d"];
-  const jobs = symbols.flatMap((symbol) =>
-    tfs.flatMap((tf) => months(shiftMonth(from, -WARMUP[tf]), to).map((month) => ({ symbol, tf, month }))),
-  );
-  let done = 0;
-  process.stderr.write(`Завантаження свічок: ${jobs.length} місячних файлів (кеш у ${ROOT}/cache)\n`);
-  const parts = await pool(
-    jobs.map((j) => async () => {
-      const candles = await fetchMonth(j.symbol, j.tf, j.month, to);
-      if (++done % 50 === 0 || done === jobs.length) process.stderr.write(`  ${done}/${jobs.length}\n`);
-      return { ...j, candles };
-    }),
-    8,
-  );
-
-  const data: SymbolCandles[] = [];
-  for (const symbol of symbols) {
-    const series = Object.fromEntries(
-      tfs.map((tf) => [tf, mergeCandles(parts.filter((p) => p.symbol === symbol && p.tf === tf).map((p) => p.candles))]),
-    ) as Record<Timeframe, Candle[]>;
-    if (!series["1h"].length) {
-      process.stderr.write(`  ${symbol}: немає даних за період, пропускаю\n`);
-      continue;
-    }
-    data.push({ symbol, ...series });
-  }
+  const data = await loadSymbols(symbols, from, to, (line) => process.stderr.write(line + "\n"));
 
   const start = Date.parse(`${from}-01T00:00:00Z`);
   const end = Date.parse(`${shiftMonth(to, 1)}-01T00:00:00Z`) - 3_600_000;
