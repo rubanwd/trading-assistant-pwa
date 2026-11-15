@@ -2,12 +2,14 @@ import { describe, expect, it } from "vitest";
 import { entryMid, feeR, positionSize, riskReward } from "../src/shared/risk";
 import { DEFAULT_AI } from "../src/shared/ai";
 import { decideModel } from "../src/worker/llm";
-import { detect } from "../src/worker/signals/detectors";
+import { atr, last } from "../src/worker/indicators";
+import { detect, STOP_ATR } from "../src/worker/signals/detectors";
 import { candidateKey, minutesToMacro, reject, type FilterContext } from "../src/worker/signals/filter";
-import { ANALYST_SCHEMA, decide, sanitizeAnalyst, sanitizeSkeptic, SKEPTIC_SCHEMA } from "../src/worker/signals/review";
-import { replay, type TrackedSignal } from "../src/worker/signals/track";
+import { ANALYST_SCHEMA, decide, PLAYBOOK_DEFAULT, reviewInput, sanitizeAnalyst, sanitizeSkeptic, SKEPTIC_SCHEMA } from "../src/worker/signals/review";
+import { exitLevel, replay, type TrackedSignal } from "../src/worker/signals/track";
 import type { Candidate } from "../src/worker/signals/types";
-import { breakoutSeries, flip, ohlc, path, pullbackSeries, sweepSeries, uptrend } from "./fixtures";
+import { buildSnapshot } from "../src/worker/snapshot";
+import { flip, ohlc, path, trendBreakoutSeries } from "./fixtures";
 
 describe("ризик", () => {
   it("розмір позиції від ризику на угоду", () => {
@@ -29,73 +31,56 @@ describe("ризик", () => {
   });
 });
 
-describe("детектори", () => {
-  const one = (rows: [number, number, number, number][]) => {
-    const c = ohlc(rows);
-    return detect("BTCUSDT", c, c);
-  };
+describe("детектор трендового пробою", () => {
+  const H4 = 4 * 3_600_000;
+  const one = (rows: [number, number, number, number][]) => detect("BTCUSDT", ohlc(rows, 1_800_000_000_000, H4));
 
-  it("відкат у тренді: лонг зі стопом за мінімумом відкату", () => {
-    const [s, ...rest] = one(pullbackSeries());
+  it("лонг: вхід за закриттям пробою, стоп на 2 ATR нижче, цілі немає", () => {
+    const rows = trendBreakoutSeries();
+    const [s, ...rest] = one(rows);
     expect(rest).toEqual([]);
-    expect(s).toMatchObject({ side: "long", setup: "trend_pullback" });
-    expect(s!.stop).toBeLessThan(s!.entryLow);
-    expect(s!.entryLow).toBeLessThan(s!.entryHigh);
-    expect(s!.tp1).toBeGreaterThan(s!.entryHigh);
-    expect(s!.rr).toBeCloseTo(riskReward(entryMid(s!.entryLow, s!.entryHigh), s!.stop, s!.tp1), 1);
-    expect(s!.facts.pullback_depth_atr).toBeGreaterThanOrEqual(1.5);
+    const close = rows[rows.length - 1]![3];
+    const a = last(atr(ohlc(rows, 1_800_000_000_000, H4), 14))!;
+    expect(s).toMatchObject({ symbol: "BTCUSDT", side: "long", setup: "trend_breakout", entry: close });
+    expect(s!.stop).toBeCloseTo(close - STOP_ATR * a, 3);
+    expect(s!.facts.breakout_atr).toBeGreaterThan(0);
+    expect(s!.facts.ema200_distance_atr).toBeGreaterThan(0);
+    expect(Object.keys(s!)).not.toContain("tp1");
   });
 
   it("шорт є точним дзеркалом лонга", () => {
-    const long = one(pullbackSeries())[0]!;
-    const short = one(flip(pullbackSeries(), 250))[0]!;
-    expect(short).toMatchObject({ side: "short", setup: "trend_pullback", rr: long.rr });
-    expect(short.entryLow).toBeCloseTo(250 - long.entryHigh, 2);
-    expect(short.entryHigh).toBeCloseTo(250 - long.entryLow, 2);
-    expect(short.stop).toBeCloseTo(250 - long.stop, 2);
-    expect(short.tp1).toBeCloseTo(250 - long.tp1, 2);
-    expect(short.stop).toBeGreaterThan(short.entryHigh);
-    expect(short.facts.rsi14_1h).toBeCloseTo(100 - long.facts.rsi14_1h!, 1);
+    const long = one(trendBreakoutSeries())[0]!;
+    const short = one(flip(trendBreakoutSeries(), 400))[0]!;
+    expect(short).toMatchObject({ side: "short", setup: "trend_breakout" });
+    expect(short.entry).toBeCloseTo(400 - long.entry, 6);
+    expect(short.stop).toBeCloseTo(400 - long.stop, 2);
+    expect(short.stop).toBeGreaterThan(short.entry);
+    expect(short.facts).toEqual(long.facts);
   });
 
-  it("пробій із ретестом: вхід від пробитого рівня", () => {
-    const [s] = one(breakoutSeries());
-    expect(s).toMatchObject({ side: "long", setup: "breakout_retest" });
-    expect(s!.entryLow).toBeGreaterThan(109);
-    expect(s!.entryLow).toBeLessThan(110);
-    expect(s!.facts).toMatchObject({ level_touches: 3, candles_since_breakout: 3 });
+  it("без закриття за каналом пробою немає", () => {
+    expect(one(trendBreakoutSeries().slice(0, -1))).toEqual([]);
   });
 
-  it("зняття ліквідності: вхід від проколотого мінімуму, стоп за тінню", () => {
-    const rows = sweepSeries();
-    const [s] = one(rows);
-    const wickLow = rows[rows.length - 1]![2];
-    expect(s).toMatchObject({ side: "long", setup: "liquidity_sweep" });
-    expect(s!.stop).toBeLessThan(wickLow);
-    expect(s!.entryLow).toBeGreaterThan(wickLow);
+  it("лонг лише над EMA200: пробій угору в низхідному тренді не сигнал", () => {
+    const closes: number[] = [];
+    for (let i = 0; i < 230; i++) closes.push(200 - i * 0.2);
+    const base = closes[closes.length - 1]!;
+    for (let i = 0; i < 20; i++) closes.push(base + (i % 2 ? 0.5 : -0.5));
+    closes.push(base + 3);
+    expect(one(path(closes))).toEqual([]);
   });
 
-  it("у рівному тренді без відкату й на короткій історії сетапів немає", () => {
-    expect(one(path(uptrend(120)))).toEqual([]);
-    expect(one(pullbackSeries().slice(-40))).toEqual([]);
-    expect(detect("X", [], [])).toEqual([]);
-  });
-
-  it("без ретесту пробій не сетап", () => {
-    expect(one(breakoutSeries().slice(0, -1)).filter((s) => s.setup === "breakout_retest")).toEqual([]);
+  it("на короткій історії сетапів немає", () => {
+    expect(one(trendBreakoutSeries().slice(-150))).toEqual([]);
+    expect(detect("X", [])).toEqual([]);
   });
 });
 
 describe("фільтр", () => {
-  const c: Candidate = {
-    symbol: "ETHUSDT", side: "long", setup: "trend_pullback",
-    entryLow: 99, entryHigh: 101, stop: 98, tp1: 105, tp2: null, rr: 2.5, facts: {},
-  };
+  const c: Candidate = { symbol: "ETHUSDT", side: "long", setup: "trend_breakout", entry: 100, stop: 96, facts: {} };
   const ctx = (over: Partial<FilterContext> = {}): FilterContext => ({
-    minRr: 2,
-    minStopPct: 0,
-    regime: { trend: "up", higherTrend: "up", volatility: "normal" },
-    mood: "mixed",
+    minStopPct: 1,
     openSymbols: new Set(),
     recent: new Set(),
     minutesToMacro: null,
@@ -107,45 +92,19 @@ describe("фільтр", () => {
 
   it("пропускає чистого кандидата", () => {
     expect(reject(c, ctx())).toBeNull();
-    expect(reject({ ...c, rr: 2 }, ctx())).toBeNull();
-  });
-
-  it("відсіює за R:R", () => {
-    expect(reject({ ...c, rr: 1.99 }, ctx())).toBe("rr");
   });
 
   it("відсіює надто близький стоп", () => {
-    // Середина зони 100, стоп 98: відстань 2%.
-    expect(reject(c, ctx({ minStopPct: 2 }))).toBeNull();
-    expect(reject(c, ctx({ minStopPct: 2.01 }))).toBe("stop");
-    const short = { ...c, side: "short" as const, stop: 101.5 };
-    expect(reject(short, ctx({ minStopPct: 1.6, regime: { trend: "down", higherTrend: "down", volatility: "normal" } }))).toBe("stop");
-    expect(reject({ ...c, rr: 1.5 }, ctx({ minStopPct: 5 }))).toBe("rr");
-  });
-
-  it("відкат лише за трендом 4h і не проти 1d", () => {
-    expect(reject(c, ctx({ regime: { trend: "range", higherTrend: "up", volatility: "normal" } }))).toBe("regime");
-    expect(reject(c, ctx({ regime: { trend: "up", higherTrend: "down", volatility: "normal" } }))).toBe("regime");
-    expect(reject({ ...c, side: "short" }, ctx())).toBe("regime");
-    expect(reject({ ...c, side: "short" }, ctx({ regime: { trend: "down", higherTrend: "range", volatility: "normal" } }))).toBeNull();
-  });
-
-  it("пробій і зняття ліквідності дозволені в боковику, але не проти тренду 4h", () => {
-    const range = { trend: "range", higherTrend: "down", volatility: "normal" } as const;
-    expect(reject({ ...c, setup: "breakout_retest" }, ctx({ regime: range }))).toBeNull();
-    expect(reject({ ...c, setup: "liquidity_sweep" }, ctx({ regime: { ...range, trend: "down" } }))).toBe("regime");
-    expect(reject({ ...c, setup: "liquidity_sweep" }, ctx({ regime: { ...range, trend: null } }))).toBe("regime");
-  });
-
-  it("не йде проти настрою ринку", () => {
-    expect(reject(c, ctx({ mood: "risk_off" }))).toBe("market");
-    expect(reject(c, ctx({ mood: "risk_on" }))).toBeNull();
+    // Вхід 100, стоп 96: відстань 4%.
+    expect(reject(c, ctx({ minStopPct: 4 }))).toBeNull();
+    expect(reject(c, ctx({ minStopPct: 4.01 }))).toBe("stop");
+    expect(reject({ ...c, side: "short", stop: 101.5 }, ctx({ minStopPct: 1.6 }))).toBe("stop");
   });
 
   it("дубль по монеті, охолодження, макроподія, ліміт активних", () => {
     expect(reject(c, ctx({ openSymbols: new Set(["ETHUSDT"]) }))).toBe("duplicate");
     expect(reject(c, ctx({ recent: new Set([candidateKey(c)]) }))).toBe("cooldown");
-    expect(reject(c, ctx({ recent: new Set(["ETHUSDT|trend_pullback|short"]) }))).toBeNull();
+    expect(reject(c, ctx({ recent: new Set(["ETHUSDT|trend_breakout|short"]) }))).toBeNull();
     expect(reject(c, ctx({ minutesToMacro: 120 }))).toBe("macro");
     expect(reject(c, ctx({ minutesToMacro: 121 }))).toBeNull();
     expect(reject(c, ctx({ openCount: 3 }))).toBe("max_active");
@@ -161,171 +120,112 @@ describe("фільтр", () => {
 });
 
 describe("супровід сигналу", () => {
-  const M15 = 900_000;
-  const T0 = 1_800_000_000_000;
-  const HOLD = 48 * 3_600_000;
-  const sig = (over: Partial<TrackedSignal> = {}): TrackedSignal => ({
-    side: "long", entryLow: 99, entryHigh: 101, stop: 98, tp1: 104, tp2: null, createdAt: T0, expiresAt: T0 + 12 * 3_600_000, ...over,
-  });
-  /** Свічки 15m від T0: [high, low, close]. */
-  const bars = (rows: [number, number, number][]) =>
-    rows.map(([high, low, close], i) => ({ openTime: T0 + i * M15, closeTime: T0 + (i + 1) * M15 - 1, open: close, high, low, close, volume: 1 }));
-  const run = (rows: [number, number, number][], s = sig(), now = T0 + rows.length * M15) => replay(s, bars(rows), now, HOLD);
+  const H1 = 3_600_000;
+  const H4 = 4 * H1;
+  const T0 = 1_800_000_000_000 - (1_800_000_000_000 % H4);
+  const HOLD = 14 * 24 * H1;
+  /** Свічки [high, low, close] з кроком step, перша відкривається в first. */
+  const bars = (step: number, first: number, rows: [number, number, number][]) =>
+    rows.map(([high, low, close], i) => ({ openTime: first + i * step, closeTime: first + (i + 1) * step - 1, open: close, high, low, close, volume: 1 }));
+  /** Десять свічок 4h до сигналу: мінімуми 99, максимуми 101. */
+  const before4h = bars(H4, T0 - 10 * H4, Array.from({ length: 10 }, (): [number, number, number] => [101, 99, 100]));
+  const long: TrackedSignal = { side: "long", entry: 100, stop: 96, createdAt: T0 };
+  const short: TrackedSignal = { side: "short", entry: 100, stop: 104, createdAt: T0 };
+  const run = (s: TrackedSignal, h1: [number, number, number][], h4: [number, number, number][] = [], hold = HOLD) =>
+    replay(s, bars(H1, T0, h1), [...before4h, ...bars(H4, T0, h4)], hold);
 
-  it("чекає входу, поки ціна над зоною", () => {
-    expect(run([[103, 102, 102.5]])).toEqual({ status: "pending", events: [], resultR: null, resolvedAt: null, entry: null, exits: [] });
-  });
-
-  it("ціна зачепила край зони, але не дійшла до середини: входу немає", () => {
-    const r = run([[103, 100.5, 101], [103, 100.1, 102.5]]);
-    expect(r.status).toBe("pending");
-    expect(r.events).toEqual([]);
-  });
-
-  it("ціна зачепила край зони і пішла до цілі: сигнал пропущено, а не взято", () => {
-    const r = run([[102, 100.5, 101], [104.2, 101, 104]]);
-    expect(r).toMatchObject({ status: "expired", resultR: null, exits: [] });
-    expect(r.events.map((e) => e.type)).toEqual(["missed"]);
-    const short = sig({ side: "short", entryLow: 99, entryHigh: 101, stop: 102, tp1: 96 });
-    expect(run([[99.5, 98, 99], [99, 95.9, 96.5]], short).events.map((e) => e.type)).toEqual(["missed"]);
+  it("вхід за ринком у момент сигналу; поки немає ні стопа, ні виходу, позиція відкрита", () => {
+    const r = run(long, [[101, 99.5, 100.5], [102, 100, 101.5]]);
+    expect(r).toMatchObject({ status: "active", resultR: null, resolvedAt: null, hit: null, exits: [] });
+    expect(r.entry).toEqual({ price: 100, kind: "taker" });
+    expect(r.events).toEqual([{ type: "entry", ts: T0, price: 100 }]);
   });
 
-  it("вхід за середину зони: ціна події входу дорівнює середині", () => {
-    expect(run([[102, 100, 101]]).events).toEqual([{ type: "entry", ts: T0 + M15 - 1, price: 100 }]);
+  it("стоп: −1R, подія для моделі не відбулась", () => {
+    const r = run(long, [[101, 99.5, 100.5], [100.5, 95.9, 96.5]]);
+    expect(r).toMatchObject({ status: "stopped", resultR: -1, hit: 0, resolvedAt: T0 + 2 * H1 - 1 });
+    expect(r.exits).toEqual([{ price: 96, share: 1, kind: "taker" }]);
+    expect(r.events.map((e) => e.type)).toEqual(["entry", "stop"]);
   });
 
-  it("вхід, потім ціль: результат дорівнює R:R від середини зони", () => {
-    const r = run([[103, 102, 102.5], [102, 99.8, 101], [103, 100.8, 102.8], [104.2, 102.5, 104]]);
-    expect(r.status).toBe("tp1");
-    expect(r.events.map((e) => e.type)).toEqual(["entry", "tp1"]);
-    expect(r.resultR).toBe(2); // (104 − 100) / (100 − 98)
-    expect(r.resolvedAt).toBe(T0 + 4 * M15 - 1);
+  it("свічка, що зачепила і стоп, і +1R, рахується як стоп", () => {
+    expect(run(long, [[104.5, 95.5, 100]])).toMatchObject({ status: "stopped", hit: 0 });
   });
 
-  it("вхід, потім стоп: −1R", () => {
-    const r = run([[102, 99.8, 101], [101, 97.9, 98.2]]);
-    expect(r).toMatchObject({ status: "stopped", resultR: -1 });
+  it("вихід за каналом: закриття 4h нижче мінімуму 10 попередніх свічок; +1R до того зараховано", () => {
+    const h1: [number, number, number][] = [
+      [101, 99.6, 100.8], [104.5, 100.5, 104], [104.2, 102, 103], [103.5, 102.5, 103], // перша свічка 4h: +1R пройдено
+      [103, 100, 100.5], [100.8, 98.8, 99.2], [99.5, 98.5, 98.7], [99, 98.3, 98.5], // друга: закриття 98.5 < мінімуму каналу 99
+    ];
+    const h4: [number, number, number][] = [[104.5, 99.6, 103], [103, 98.3, 98.5]];
+    const r = run(long, h1, h4);
+    expect(r).toMatchObject({ status: "exited", hit: 1, resultR: -0.38, resolvedAt: T0 + 8 * H1 - 1 });
+    expect(r.exits).toEqual([{ price: 98.5, share: 1, kind: "taker" }]);
+    expect(r.events.map((e) => e.type)).toEqual(["entry", "exit"]);
   });
 
-  it("свічка, що зачепила і стоп, і ціль, рахується як стоп", () => {
-    expect(run([[102, 99.8, 101], [104.5, 97.5, 100]])).toMatchObject({ status: "stopped", resultR: -1 });
+  it("закриття 4h над мінімумом каналу позицію не закриває, навіть якщо тінь нижче", () => {
+    // Мінімум каналу 99: закриття 98.9 закриває позицію, закриття 99.2 при тіні до 98.5 — ні.
+    const h1: [number, number, number][] = [[101, 99.6, 100.8], [101, 98.5, 100], [100.5, 99.5, 100], [100.5, 98.8, 98.9]];
+    expect(run(long, h1, [[101, 98.5, 98.9]]).status).toBe("exited");
+    const h1b: [number, number, number][] = [[101, 99.6, 100.8], [101, 98.5, 100], [100.5, 99.5, 100], [100.5, 99.1, 99.2]];
+    expect(run(long, h1b, [[101, 98.5, 99.2]]).status).toBe("active");
   });
 
-  it("у свічці входу ціль не зараховується, а стоп зараховується", () => {
-    expect(run([[104.5, 99.8, 104]]).status).toBe("active");
-    expect(run([[102, 97.5, 98]]).events.map((e) => e.type)).toEqual(["entry", "stop"]);
-  });
-
-  it("ціна дійшла до цілі без входу: сигнал пропущено", () => {
-    const r = run([[103, 102, 102.5], [104.1, 102.2, 104]]);
-    expect(r).toMatchObject({ status: "expired", resultR: null });
-    expect(r.events.map((e) => e.type)).toEqual(["missed"]);
-  });
-
-  it("без входу до кінця терміну сигнал прострочено", () => {
-    const s = sig({ expiresAt: T0 + 2 * M15 });
-    const r = run([[103, 102, 102.5], [103, 102, 102.5], [102, 100, 100.5]], s);
-    expect(r).toMatchObject({ status: "expired", resultR: null, resolvedAt: T0 + 2 * M15 });
-    expect(r.events.map((e) => e.type)).toEqual(["expired"]);
-  });
-
-  it("активний сигнал закривається за часом із фактичним результатом", () => {
-    const r = replay(sig(), bars([[102, 99.8, 101], [102, 100.6, 101], [102, 100.6, 101.5]]), T0 + 3 * M15, 2 * M15 - 2);
-    expect(r).toMatchObject({ status: "expired", resultR: 0.75 }); // (101.5 − 100) / 2
+  it("закриття за часом із фактичним результатом", () => {
+    const r = run(long, [[101, 99.5, 100.5], [102, 100, 102]], [], 2 * H1 - 1);
+    expect(r).toMatchObject({ status: "exited", resultR: 0.5, hit: 0 });
     expect(r.events.map((e) => e.type)).toEqual(["entry", "timeout"]);
   });
 
-  it("шорт дзеркальний", () => {
-    const s = sig({ side: "short", entryLow: 99, entryHigh: 101, stop: 102, tp1: 96 });
-    expect(run([[98, 97, 97.5]], s).status).toBe("pending");
-    expect(run([[100.2, 98, 99], [99, 95.9, 96.5]], s)).toMatchObject({ status: "tp1", resultR: 2 });
-    expect(run([[100.2, 98, 99], [102.1, 99, 101]], s)).toMatchObject({ status: "stopped", resultR: -1 });
+  it("шорт дзеркальний: стоп угорі, вихід за максимумом каналу", () => {
+    expect(run(short, [[104.1, 99, 103]])).toMatchObject({ status: "stopped", resultR: -1 });
+    const h1: [number, number, number][] = [[100.4, 95.5, 96], [97, 96, 96.5], [99, 96.5, 98], [101.5, 98, 101.2]];
+    expect(run(short, h1, [[101.5, 95.5, 101.2]])).toMatchObject({ status: "exited", hit: 1, resultR: -0.3 });
   });
 
-  it("свічки до створення сигналу не враховуються", () => {
-    const s = sig({ createdAt: T0 + 2 * M15 });
-    expect(run([[102, 97, 98], [102, 97, 98], [103, 102, 102.5]], s).status).toBe("pending");
+  it("свічки, що закрились до сигналу, не враховуються", () => {
+    const early = bars(H1, T0 - 2 * H1, [[101, 90, 95], [101, 90, 95]]);
+    const r = replay(long, [...early, ...bars(H1, T0, [[101, 99.5, 100.5]])], before4h, HOLD);
+    expect(r.status).toBe("active");
   });
 
-  describe("друга ціль", () => {
-    const s2 = sig({ tp2: 108 });
-    const entered: [number, number, number][] = [[102, 99.8, 101], [104.2, 101, 104]];
-
-    it("половина на першій цілі, решта на другій", () => {
-      const r = run([...entered, [106, 103, 105], [108.5, 105, 108]], s2);
-      expect(r.status).toBe("tp2");
-      expect(r.events.map((e) => e.type)).toEqual(["entry", "tp1", "tp2"]);
-      expect(r.resultR).toBe(3); // 0.5 × 2 + 0.5 × 4
-      expect(r.exits).toEqual([{ price: 104, share: 0.5, kind: "maker" }, { price: 108, share: 0.5, kind: "maker" }]);
-    });
-
-    it("після першої цілі стоп у беззбитку: результат лише з першої половини", () => {
-      const r = run([...entered, [103, 99.8, 100.2]], s2);
-      expect(r).toMatchObject({ status: "tp1", resultR: 1 });
-      expect(r.events.map((e) => e.type)).toEqual(["entry", "tp1", "breakeven"]);
-    });
-
-    it("поки перша ціль не взята, сигнал активний; після неї теж, доки не закриється решта", () => {
-      expect(run(entered, s2).status).toBe("active");
-      expect(run(entered, s2).events.map((e) => e.type)).toEqual(["entry", "tp1"]);
-    });
-
-    it("у свічці першої цілі друга не рахується, а свічка з беззбитком і другою ціллю дає беззбиток", () => {
-      expect(run([[102, 99.8, 101], [108.5, 101, 108]], s2).status).toBe("active");
-      expect(run([...entered, [108.5, 99.5, 104]], s2).status).toBe("tp1");
-    });
-
-    it("закриття за часом після першої цілі", () => {
-      const r = replay(s2, bars([...entered, [105, 103, 104], [105, 103, 102]]), T0 + 4 * M15, 3 * M15 - 2);
-      expect(r).toMatchObject({ status: "tp1", resultR: 1.5 }); // 0.5 × 2 + 0.5 × (102 − 100) / 2
-    });
+  it("відтворення детерміноване", () => {
+    const h1: [number, number, number][] = [[101, 99.5, 100.5], [104.5, 100, 104], [90, 80, 85]];
+    expect(run(long, h1)).toEqual(run(long, h1));
+    expect(run(long, h1)).toMatchObject({ status: "stopped", hit: 1 });
   });
 
-  it("комісії в R: вхід і цілі за ставкою maker, стоп і ринкові виходи за ставкою taker", () => {
+  it("поточний рівень виходу за каналом", () => {
+    expect(exitLevel("long", before4h)).toBe(99);
+    expect(exitLevel("short", before4h)).toBe(101);
+    expect(exitLevel("long", before4h.slice(0, 5))).toBeNull();
+  });
+
+  it("комісії в R: усі виконання ринкові", () => {
     const fees = { makerPct: 0.02, takerPct: 0.05 };
-    const maker = { price: 100, kind: "maker" as const };
-    // Вхід 100 і ціль 104 лімітними: (100 + 104) × 0.02% = 0.0408 на одиницю, ризик 2 → 0.020R.
-    expect(feeR(maker, 98, [{ price: 104, share: 1, kind: "maker" }], fees)).toBe(0.02);
-    // Стоп ринковий: 100 × 0.02% + 98 × 0.05% = 0.069 → 0.035R (округлення до тисячних).
-    expect(feeR(maker, 98, [{ price: 98, share: 1, kind: "taker" }], fees)).toBe(0.035);
-    // Половина на цілі, решта в беззбиток: 0.02 + 104 × 0.5 × 0.0002 + 100 × 0.5 × 0.0005 = 0.0558 → 0.028R.
-    expect(feeR(maker, 98, [{ price: 104, share: 0.5, kind: "maker" }, { price: 100, share: 0.5, kind: "taker" }], fees)).toBe(0.028);
-    // Вхід ринковий, коли ціна вже за серединою зони: (100 + 104) × 0.05%.
-    expect(feeR({ price: 100, kind: "taker" }, 98, [{ price: 104, share: 1, kind: "taker" }], fees)).toBe(0.051);
-    expect(feeR(maker, 98, [], fees)).toBe(0);
-    expect(feeR(null, 98, [{ price: 104, share: 1, kind: "maker" }], fees)).toBe(0);
-    expect(feeR({ price: 100, kind: "maker" }, 100, [{ price: 104, share: 1, kind: "maker" }], fees)).toBe(0);
+    const taker = { price: 100, kind: "taker" as const };
+    // (100 + 108) × 0.05% = 0.104 на одиницю, ризик 4 → 0.026R.
+    expect(feeR(taker, 96, [{ price: 108, share: 1, kind: "taker" }], fees)).toBe(0.026);
+    expect(feeR({ price: 100, kind: "maker" }, 96, [{ price: 108, share: 1, kind: "maker" }], fees)).toBe(0.01);
+    expect(feeR(taker, 96, [], fees)).toBe(0);
+    expect(feeR(null, 96, [{ price: 108, share: 1, kind: "taker" }], fees)).toBe(0);
+    expect(feeR(taker, 100, [{ price: 108, share: 1, kind: "taker" }], fees)).toBe(0);
   });
+});
 
-  it("тип виконання: лімітний вхід і цілі maker, стоп, беззбиток і закриття за часом taker", () => {
-    expect(run([[103, 102, 102.5], [102, 99.8, 101], [104.2, 102.5, 104]])).toMatchObject({
-      entry: { price: 100, kind: "maker" },
-      exits: [{ price: 104, share: 1, kind: "maker" }],
+describe("вхід для моделі", () => {
+  it("кандидат без цілі: вхід, стоп, рівень +1R і правило виходу", () => {
+    const candidate: Candidate = { symbol: "ETHUSDT", side: "short", setup: "trend_breakout", entry: 2000, stop: 2100, facts: { breakout_atr: 0.4 } };
+    const c = ohlc(trendBreakoutSeries());
+    const snapshot = buildSnapshot({ symbol: "ETHUSDT", now: 1_800_000_000_000, candles: { "15m": c, "1h": c, "4h": c, "1d": c }, funding: null, openInterest: null });
+    const input = reviewInput({
+      candidate, rule: PLAYBOOK_DEFAULT.trend_breakout, snapshot, btc: null, news: [], minutesToMacro: null,
+      market: { mood: "mixed", btcTrend: "range", breadth: 0.5, counted: 15 },
     });
-    expect(run([[102, 99.8, 101], [101, 97.9, 98.2]]).exits).toEqual([{ price: 98, share: 1, kind: "taker" }]);
-    const s2 = sig({ tp2: 108 });
-    expect(run([[102, 99.8, 101], [104.2, 101, 104], [103, 99.8, 100.2]], s2).exits).toEqual([
-      { price: 104, share: 0.5, kind: "maker" },
-      { price: 100, share: 0.5, kind: "taker" },
-    ]);
-    const timeout = replay(sig(), bars([[102, 99.8, 101], [102, 100.6, 101], [102, 100.6, 101.5]]), T0 + 3 * M15, 2 * M15 - 2);
-    expect(timeout.exits).toEqual([{ price: 101.5, share: 1, kind: "taker" }]);
-  });
-
-  it("ціна вже за серединою зони на момент сигналу: вхід ринковий (taker)", () => {
-    // Перша свічка відкривається на 99.5, нижче середини 100: лімітна купівля на 100 виконається одразу.
-    expect(run([[100.5, 99, 99.5], [104.2, 99.5, 104]]).entry).toEqual({ price: 100, kind: "taker" });
-    // Ціна прийшла до зони пізніше: ордер стояв у стакані, тож maker, навіть якщо свічка відкрилась нижче середини.
-    expect(run([[103, 102, 102.5], [100.5, 99, 99.5]]).entry).toEqual({ price: 100, kind: "maker" });
-    const short = sig({ side: "short", entryLow: 99, entryHigh: 101, stop: 102, tp1: 96 });
-    expect(run([[101, 100, 100.5]], short).entry).toEqual({ price: 100, kind: "taker" });
-    expect(run([[99.5, 98, 99], [100.2, 98, 99]], short).entry).toEqual({ price: 100, kind: "maker" });
-  });
-
-  it("відтворення детерміноване: повторний прогін дає той самий результат", () => {
-    const rows: [number, number, number][] = [[102, 99.8, 101], [103, 100.8, 102.8], [104.2, 102.5, 104], [90, 80, 85]];
-    expect(run(rows)).toEqual(run(rows));
-    expect(run(rows).status).toBe("tp1");
+    expect(input.candidate).toMatchObject({ entry: 2000, stop: 2100, one_r_level: 1900, stop_distance_pct: 5, measurements: { breakout_atr: 0.4 } });
+    expect(input.candidate.exit_rule).toContain("максимумом 10");
+    expect(Object.keys(input.candidate)).not.toContain("target_1");
   });
 });
 

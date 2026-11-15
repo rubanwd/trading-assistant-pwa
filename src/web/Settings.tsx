@@ -1,5 +1,6 @@
 import { useEffect, useState, type CSSProperties } from "react";
 import { SETUP } from "./Signals";
+import { SETUP_KEYS } from "../shared/settings";
 import { api, c, card, day, dim, h2, p, primary, secondary } from "./ui";
 
 interface Spec {
@@ -230,7 +231,7 @@ function PlaybookEditor() {
   if (!pb) return note ? <p style={dim}>{note}</p> : null;
 
   const locked = pb.nextAllowedAt !== null && Date.parse(pb.nextAllowedAt) > Date.now();
-  const changed = Object.keys(SETUP).some((k) => (draft[k] ?? "") !== (pb.active.rules[k] ?? ""));
+  const changed = SETUP_KEYS.some((k) => (draft[k] ?? "") !== (pb.active.rules[k] ?? ""));
   const save = async () => {
     setBusy(true);
     setNote(null);
@@ -255,7 +256,7 @@ function PlaybookEditor() {
         {pb.nextAllowedAt && (locked ? ` Наступну версію можна ввімкнути з ${day(pb.nextAllowedAt)}.` : " Нову версію вже можна ввімкнути.")}
       </p>
       <p style={dim}>Детектори й рівні рахує код: тут змінюються критерії оцінки, а не те, як знаходяться сетапи.</p>
-      {Object.entries(SETUP).map(([k, name]) => (
+      {SETUP_KEYS.map((k) => [k, SETUP[k] ?? k] as const).map(([k, name]) => (
         <label key={k} style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 14 }}>
           {name}
           <textarea value={draft[k] ?? ""} onChange={(e) => setDraft({ ...draft, [k]: e.target.value })} style={{ ...area, minHeight: 140 }} disabled={locked} />

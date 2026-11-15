@@ -20,15 +20,14 @@ const HELP = `Бектест коду без моделі.
   --from YYYY-MM        перший місяць (типово 12 місяців тому)
   --to YYYY-MM          останній місяць (типово попередній повний місяць)
   --symbols A,B         монети (типово стартовий список із 15)
-  --min-rr N            мінімальний R:R (${DEFAULT_CONFIG.minRr})
   --min-stop N          стоп не ближче, % від входу (${DEFAULT_CONFIG.minStopPct})
   --max-active N        відкритих сигналів не більше (${DEFAULT_CONFIG.maxActive})
   --cooldown N          пауза для того самого сетапу по монеті, год (${DEFAULT_CONFIG.cooldownHours})
   --per-scan N          кандидатів за скан (${DEFAULT_CONFIG.maxCandidatesPerScan})
-  --ttl N               сигнал чекає входу, год (${DEFAULT_CONFIG.ttlHours})
   --max-hold N          найдовше тримати позицію, год (${DEFAULT_CONFIG.maxHoldHours})
-  --maker N             комісія maker, %: вхід і цілі (${DEFAULT_CONFIG.makerPct})
-  --taker N             комісія taker, %: стоп, беззбиток, закриття за часом (${DEFAULT_CONFIG.takerPct})
+  --maker N             комісія maker, % (${DEFAULT_CONFIG.makerPct})
+  --taker N             комісія taker, %: вхід за ринком, стоп, вихід за каналом (${DEFAULT_CONFIG.takerPct})
+  --slippage N          проковзування на кожному виконанні, % (${DEFAULT_CONFIG.slippagePct})
   --out DIR             куди писати звіт (.backtest/out/<from>_<to>)
 `;
 
@@ -43,8 +42,8 @@ async function main() {
   const { values } = parseArgs({
     options: {
       from: { type: "string" }, to: { type: "string" }, symbols: { type: "string" },
-      "min-rr": { type: "string" }, "min-stop": { type: "string" }, "max-active": { type: "string" }, cooldown: { type: "string" },
-      "per-scan": { type: "string" }, ttl: { type: "string" }, "max-hold": { type: "string" },
+      slippage: { type: "string" }, "min-stop": { type: "string" }, "max-active": { type: "string" }, cooldown: { type: "string" },
+      "per-scan": { type: "string" }, "max-hold": { type: "string" },
       maker: { type: "string" }, taker: { type: "string" }, out: { type: "string" }, help: { type: "boolean", short: "h" },
     },
   });
@@ -63,15 +62,14 @@ async function main() {
   const config = {
     from: start,
     to: end,
-    minRr: num(values["min-rr"], DEFAULT_CONFIG.minRr),
     minStopPct: num(values["min-stop"], DEFAULT_CONFIG.minStopPct),
     maxActive: num(values["max-active"], DEFAULT_CONFIG.maxActive),
     cooldownHours: num(values.cooldown, DEFAULT_CONFIG.cooldownHours),
     maxCandidatesPerScan: num(values["per-scan"], DEFAULT_CONFIG.maxCandidatesPerScan),
-    ttlHours: num(values.ttl, DEFAULT_CONFIG.ttlHours),
     maxHoldHours: num(values["max-hold"], DEFAULT_CONFIG.maxHoldHours),
     makerPct: num(values.maker, DEFAULT_CONFIG.makerPct),
     takerPct: num(values.taker, DEFAULT_CONFIG.takerPct),
+    slippagePct: num(values.slippage, DEFAULT_CONFIG.slippagePct),
   };
   process.stderr.write(`Симуляція: ${data.length} монет, ${from} — ${to}\n`);
   const t0 = Date.now();

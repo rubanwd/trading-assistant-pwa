@@ -20,7 +20,16 @@ export interface Summary {
 }
 
 export interface Report {
-  overall: Summary & { signals: number; noEntry: number; stillOpen: number; grossTotalR: number };
+  overall: Summary & {
+    signals: number;
+    stillOpen: number;
+    grossTotalR: number;
+    avgSlipR: number | null;
+    /** Частка закритих угод, де ціна пройшла +1R: база для ймовірності моделі. */
+    hitRate: number | null;
+    /** Медіана тривалості закритих угод, год. */
+    medianHoldHours: number | null;
+  };
   outcomes: Record<string, number>;
   bySetup: Record<string, Summary>;
   bySide: Record<string, Summary>;
@@ -95,22 +104,28 @@ function by(trades: Trade[], key: (t: Trade) => string): Record<string, Summary>
   return Object.fromEntries([...groups.keys()].sort().map((k) => [k, summarize(groups.get(k)!)]));
 }
 
+const median = (v: number[]) => {
+  const x = [...v].sort((a, b) => a - b);
+  return round(x.length % 2 ? x[(x.length - 1) / 2]! : (x[x.length / 2 - 1]! + x[x.length / 2]!) / 2, 1);
+};
+
 export function buildReport(result: BacktestResult): Report {
   const { trades } = result;
+  const done = trades.filter(closed);
   const outcomes: Record<string, number> = {};
   for (const t of trades) {
-    const missed = t.events.some((e) => e.type === "missed");
-    const timeout = t.events.some((e) => e.type === "timeout");
-    const k = missed ? "missed" : timeout ? "timeout" : t.status === "expired" && t.resultR === null ? "no_entry" : t.status;
+    const k = t.events.length > 1 ? t.events[t.events.length - 1]!.type : t.status;
     outcomes[k] = (outcomes[k] ?? 0) + 1;
   }
   return {
     overall: {
       ...summarize(trades),
       signals: trades.length,
-      noEntry: trades.filter((t) => t.resolvedAt !== null && t.resultR === null).length,
       stillOpen: trades.filter((t) => t.resolvedAt === null).length,
       grossTotalR: round(trades.filter(closed).reduce((s, t) => s + t.resultR, 0)),
+      avgSlipR: done.length ? round(done.reduce((s, t) => s + t.slipR, 0) / done.length, 3) : null,
+      hitRate: done.length ? round(done.filter((t) => t.hit === 1).length / done.length, 3) : null,
+      medianHoldHours: done.length ? median(done.map((t) => (t.resolvedAt - t.createdAt) / 3_600_000)) : null,
     },
     outcomes,
     bySetup: by(trades, (t) => t.setup),
@@ -145,9 +160,10 @@ export function formatReport(r: Report, meta: { from: string; to: string; symbol
     `Бектест коду без моделі: ${meta.from} — ${meta.to}, монет ${meta.symbols}`,
     `\nВоронка: сканів ${f.scans}, знайдено сетапів ${f.detected}, відсіяно фільтром (${filtered || "нічого"}), ` +
       `понад ліміт за скан ${f.capped}, опубліковано ${f.published}`,
-    `Сигналів ${o.signals}: з входом і закриті ${o.trades}, без входу ${o.noEntry}, відкриті на кінець даних ${o.stillOpen}`,
-    `Результати: ${Object.entries(r.outcomes).map(([k, v]) => `${k} ${v}`).join(", ")}`,
-    `\nУсього після комісій: ${fmt(o.totalR, 1)}R (до комісій ${fmt(o.grossTotalR, 1)}R, комісії в середньому ${fmt(o.avgFeeR, 3)}R на угоду)`,
+    `Сигналів ${o.signals}: закриті ${o.trades}, відкриті на кінець даних ${o.stillOpen}`,
+    `Як закрились: ${Object.entries(r.outcomes).map(([k, v]) => `${k} ${v}`).join(", ")}; медіана тривалості ${fmt(o.medianHoldHours, 0)} год`,
+    `Ціна пройшла +1R до закриття в ${pct(o.hitRate)} угод`,
+    `\nУсього після комісій${o.avgSlipR ? " і проковзування" : ""}: ${fmt(o.totalR, 1)}R (до комісій ${fmt(o.grossTotalR, 1)}R, комісії в середньому ${fmt(o.avgFeeR, 3)}R на угоду${o.avgSlipR ? `, проковзування ${fmt(o.avgSlipR, 3)}R` : ""})`,
     `Виграшних ${pct(o.winRate)}, середній ${fmt(o.avgR, 3)}R, 95% ДІ ${o.avgRCi ? `${fmt(o.avgRCi[0])}…${fmt(o.avgRCi[1])}` : "—"}, ` +
       `profit factor ${fmt(o.profitFactor)}, найбільша просадка ${fmt(o.maxDrawdownR, 1)}R`,
     table("За сетапами", r.bySetup),
@@ -161,11 +177,12 @@ export function formatReport(r: Report, meta: { from: string; to: string; symbol
 /** Угоди в CSV для власного аналізу. */
 export function tradesCsv(trades: Trade[]): string {
   const iso = (v: number | null) => (v === null ? "" : new Date(v).toISOString());
-  const head = "created_at,symbol,side,setup,entry_low,entry_high,stop,tp1,tp2,rr,mood,trend_4h,trend_1d,status,entry_kind,result_r,fee_r,net_r,resolved_at";
+  const head = "created_at,symbol,side,setup,entry,stop,mood,trend_4h,trend_1d,status,exit,result_r,fee_r,slip_r,net_r,hit,resolved_at";
   const rows = trades.map((t) =>
     [
-      iso(t.createdAt), t.symbol, t.side, t.setup, t.entryLow, t.entryHigh, t.stop, t.tp1, t.tp2 ?? "", t.rr,
-      t.mood, t.regime.trend ?? "", t.regime.higherTrend ?? "", t.status, t.entryKind ?? "", t.resultR ?? "", t.feeR, t.netR ?? "", iso(t.resolvedAt),
+      iso(t.createdAt), t.symbol, t.side, t.setup, t.entry, t.stop,
+      t.mood, t.regime.trend ?? "", t.regime.higherTrend ?? "", t.status, t.events.length > 1 ? t.events[t.events.length - 1]!.type : "",
+      t.resultR ?? "", t.feeR, t.slipR, t.netR ?? "", t.hit ?? "", iso(t.resolvedAt),
     ].join(","),
   );
   return [head, ...rows].join("\n") + "\n";

@@ -123,7 +123,7 @@ export function StatsView({ stats }: { stats: Stats }) {
 
       <section style={card}>
         <h2 style={h2}>Воронка</h2>
-        <Row label="Сканів зі свіжою свічкою 1h" value={String(stats.funnel.scans)} />
+        <Row label="Сканів зі свіжою свічкою 4h" value={String(stats.funnel.scans)} />
         <Row label="Знайдено сетапів" value={String(stats.funnel.detected)} />
         {Object.entries(stats.funnel.filtered)
           .sort((a, b) => b[1] - a[1])

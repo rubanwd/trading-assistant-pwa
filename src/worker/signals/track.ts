@@ -1,24 +1,22 @@
-import { entryMid, type Fill, type Liquidity, type Side } from "../../shared/risk";
+import type { Fill, Liquidity, Side } from "../../shared/risk";
 import type { Candle } from "../market/types";
-import type { SignalStatus } from "./types";
+import { EXIT_BARS } from "./detectors";
 
-/** Супровід сигналу. Стан щоразу відтворюється зі свічок 15m від моменту створення, тож курсор не потрібен. */
+/**
+ * Супровід сигналу. Стан щоразу відтворюється зі свічок від моменту створення, тож курсор не потрібен.
+ * Свічки 1h: кеш тримає 500 штук, тобто ~20 днів, а трендова позиція може жити тижнями.
+ */
 
 export interface TrackedSignal {
   side: Side;
-  entryLow: number;
-  entryHigh: number;
+  /** Ціна входу за ринком у момент сигналу. */
+  entry: number;
   stop: number;
-  tp1: number;
-  /** Друга ціль: якщо є, на першій фіксується половина, стоп переходить у беззбиток. */
-  tp2: number | null;
   /** мс UTC */
   createdAt: number;
-  /** До цього часу сигнал чекає входу. */
-  expiresAt: number;
 }
 
-export type EventType = "entry" | "tp1" | "tp2" | "stop" | "breakeven" | "expired" | "missed" | "timeout";
+export type EventType = "entry" | "stop" | "exit" | "timeout";
 
 export interface TrackEvent {
   type: EventType;
@@ -26,126 +24,72 @@ export interface TrackEvent {
   price: number;
 }
 
-/**
- * Вихід із позиції. Цілі виконуються лімітними ордерами (maker);
- * стоп, беззбиток і закриття за часом — ринковими (taker).
- */
+/** Вихід із позиції. Усі виходи ринкові (taker): стоп, закриття за каналом, закриття за часом. */
 export type Exit = Fill;
 
 export interface TrackResult {
-  status: SignalStatus;
+  status: "active" | "stopped" | "exited";
   events: TrackEvent[];
-  /** Результат в R від середини зони входу без комісій; null, поки сигнал відкритий або входу не було. */
+  /** Результат в R від ціни входу без комісій; null, поки позиція відкрита. */
   resultR: number | null;
   resolvedAt: number | null;
-  /** Вхід для розрахунку комісій: середина зони і тип виконання; null, якщо входу не було. */
-  entry: { price: number; kind: Liquidity } | null;
-  /** Виходи з позиції для розрахунку комісій; порожньо, якщо входу не було. */
+  /**
+   * Подія, яку оцінює модель: до закриття позиції ціна хоча б раз пройшла у бік угоди на відстань стопа (+1R).
+   * 1 — пройшла, 0 — позиція закрилась без цього, null — ще невідомо.
+   */
+  hit: 0 | 1 | null;
+  entry: { price: number; kind: Liquidity };
   exits: Exit[];
 }
 
-/** Частка позиції, яка фіксується на першій цілі, коли є друга. */
-export const TP1_SHARE = 0.5;
-
-/** Свічка, що відкрилась не раніше ніж за хвилину до створення сигналу, вже належить йому. */
-const START_TOLERANCE_MS = 60_000;
-
 /**
  * Правила:
- * - вхід лімітним ордером на середині зони: лише коли ціна дійшла до середини, а не просто зачепила край.
- *   Інакше в статистику потрапляли б угоди, яких реальний ордер не взяв би, а результат рахується саме від середини;
- * - якщо ціна дійшла до першої цілі без входу, сигнал «пішов без нас»;
- * - у свічці входу може спрацювати стоп, але не ціль: порядок усередині свічки невідомий;
- * - якщо свічка зачепила і стоп, і ціль, рахуємо стоп;
- * - без другої цілі вся позиція закривається на першій; з другою на першій фіксується половина,
- *   стоп решти переходить у беззбиток (середина зони), і в тій самій свічці далі нічого не рахується;
- * - без входу до expiresAt сигнал прострочено; активний довше maxHoldMs закривається за ціною закриття.
+ * - вхід за ринком у момент сигналу за ціною entry (taker);
+ * - у кожній свічці 1h спершу перевіряється стоп: порядок усередині свічки невідомий, тож стоп має перевагу;
+ * - коли закривається свічка 4h, позиція закривається за її ціною закриття, якщо та нижча за мінімум
+ *   EXIT_BARS попередніх свічок 4h (для шорта вища за максимум);
+ * - позиція, відкрита довше maxHoldMs, закривається за ціною закриття свічки 1h.
  */
-export function replay(s: TrackedSignal, candles: Candle[], now: number, maxHoldMs: number): TrackResult {
+export function replay(s: TrackedSignal, h1: Candle[], h4: Candle[], maxHoldMs: number): TrackResult {
   const long = s.side === "long";
   const dir = long ? 1 : -1;
-  const mid = entryMid(s.entryLow, s.entryHigh);
-  const risk = Math.abs(mid - s.stop);
-  const r = (price: number) => ((price - mid) / risk) * dir;
-  const events: TrackEvent[] = [];
-  const exits: Exit[] = [];
-  let entry: TrackResult["entry"] = null;
-  const done = (status: SignalStatus, at: number): TrackResult => {
-    const gross = exits.length ? exits.reduce((sum, e) => sum + r(e.price) * e.share, 0) : null;
-    return { status, events, resultR: gross === null ? null : Number(gross.toFixed(2)), resolvedAt: at, entry, exits };
+  const risk = Math.abs(s.entry - s.stop);
+  const r = (price: number) => (risk === 0 ? 0 : ((price - s.entry) / risk) * dir);
+  const entry = { price: s.entry, kind: "taker" as const };
+  const events: TrackEvent[] = [{ type: "entry", ts: s.createdAt, price: s.entry }];
+  let hit: 0 | 1 | null = null;
+  const close = (status: "stopped" | "exited", type: EventType, at: number, price: number): TrackResult => {
+    events.push({ type, ts: at, price });
+    return { status, events, resultR: Number(r(price).toFixed(2)), resolvedAt: at, hit: hit ?? 0, entry, exits: [{ price, share: 1, kind: "taker" }] };
   };
-  const above = (c: Candle, level: number) => (long ? c.high >= level : c.low <= level);
-  const below = (c: Candle, level: number) => (long ? c.low <= level : c.high >= level);
+  const h4Index = new Map(h4.map((c, i) => [c.closeTime, i]));
+  const oneR = s.entry + dir * risk;
 
-  let enteredAt: number | null = null;
-  let first = true;
-  let tp1Hit = false;
-  for (const c of candles) {
-    if (c.openTime < s.createdAt - START_TOLERANCE_MS) continue;
-    // Лімітний ордер ставиться під час сигналу. Якщо ціна вже за серединою зони, він виконається одразу як taker.
-    const openedPast = first && (long ? c.open <= mid : c.open >= mid);
-    first = false;
-
-    if (enteredAt === null) {
-      if (c.openTime >= s.expiresAt) break;
-      if (!below(c, mid)) {
-        if (above(c, s.tp1)) {
-          events.push({ type: "missed", ts: c.closeTime, price: s.tp1 });
-          return done("expired", c.closeTime);
-        }
-        continue;
-      }
-      enteredAt = c.closeTime;
-      entry = { price: mid, kind: openedPast ? "taker" : "maker" };
-      events.push({ type: "entry", ts: c.closeTime, price: mid });
-      if (below(c, s.stop)) {
-        events.push({ type: "stop", ts: c.closeTime, price: s.stop });
-        exits.push({ price: s.stop, share: 1, kind: "taker" });
-        return done("stopped", c.closeTime);
-      }
-      continue;
+  for (const c of h1) {
+    // Свічка, що йшла в момент сигналу, вже належить йому: стоп у ній рахується.
+    if (c.closeTime <= s.createdAt) continue;
+    if (long ? c.low <= s.stop : c.high >= s.stop) {
+      return close("stopped", "stop", c.closeTime, s.stop);
     }
-
-    const remaining = tp1Hit ? 1 - TP1_SHARE : 1;
-    if (!tp1Hit) {
-      if (below(c, s.stop)) {
-        events.push({ type: "stop", ts: c.closeTime, price: s.stop });
-        exits.push({ price: s.stop, share: 1, kind: "taker" });
-        return done("stopped", c.closeTime);
-      }
-      if (above(c, s.tp1)) {
-        events.push({ type: "tp1", ts: c.closeTime, price: s.tp1 });
-        if (s.tp2 === null) {
-          exits.push({ price: s.tp1, share: 1, kind: "maker" });
-          return done("tp1", c.closeTime);
-        }
-        exits.push({ price: s.tp1, share: TP1_SHARE, kind: "maker" });
-        tp1Hit = true;
-        continue;
-      }
-    } else {
-      if (below(c, mid)) {
-        events.push({ type: "breakeven", ts: c.closeTime, price: mid });
-        exits.push({ price: mid, share: remaining, kind: "taker" });
-        return done("tp1", c.closeTime);
-      }
-      if (above(c, s.tp2!)) {
-        events.push({ type: "tp2", ts: c.closeTime, price: s.tp2! });
-        exits.push({ price: s.tp2!, share: remaining, kind: "maker" });
-        return done("tp2", c.closeTime);
-      }
+    if (hit === null && (long ? c.high >= oneR : c.low <= oneR)) hit = 1;
+    const i = h4Index.get(c.closeTime);
+    if (i !== undefined && i >= EXIT_BARS) {
+      const prev = h4.slice(i - EXIT_BARS, i);
+      const bar = h4[i]!;
+      const level = long ? Math.min(...prev.map((x) => x.low)) : Math.max(...prev.map((x) => x.high));
+      if (long ? bar.close < level : bar.close > level) return close("exited", "exit", c.closeTime, bar.close);
     }
-    if (c.closeTime - enteredAt >= maxHoldMs) {
-      events.push({ type: "timeout", ts: c.closeTime, price: c.close });
-      exits.push({ price: c.close, share: remaining, kind: "taker" });
-      return done(tp1Hit ? "tp1" : "expired", c.closeTime);
-    }
+    if (c.closeTime - s.createdAt >= maxHoldMs) return close("exited", "timeout", c.closeTime, c.close);
   }
+  return { status: "active", events, resultR: null, resolvedAt: null, hit, entry, exits: [] };
+}
 
-  if (enteredAt !== null) return { status: "active", events, resultR: null, resolvedAt: null, entry, exits: [] };
-  if (now >= s.expiresAt) {
-    events.push({ type: "expired", ts: s.expiresAt, price: mid });
-    return done("expired", s.expiresAt);
-  }
-  return { status: "pending", events, resultR: null, resolvedAt: null, entry: null, exits: [] };
+/**
+ * Поточний рівень виходу за каналом: мінімум (для шорта максимум) останніх EXIT_BARS закритих свічок 4h.
+ * Позиція закриється, якщо свічка 4h закриється за ним. null, якщо свічок замало.
+ */
+export function exitLevel(side: Side, h4: Candle[]): number | null {
+  if (h4.length < EXIT_BARS) return null;
+  const prev = h4.slice(-EXIT_BARS);
+  return side === "long" ? Math.min(...prev.map((x) => x.low)) : Math.max(...prev.map((x) => x.high));
 }

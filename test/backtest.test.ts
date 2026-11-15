@@ -2,6 +2,7 @@ import { deflateRawSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import { mergeCandles, months, parseKlines, shiftMonth, unzipFirst } from "../src/backtest/data";
 import { bootstrapMeanCi, buildReport, maxDrawdown, summarize } from "../src/backtest/report";
+import { stopDistancePct } from "../src/shared/risk";
 import { backtest, DEFAULT_CONFIG, type SymbolCandles, type Trade } from "../src/backtest/simulate";
 import type { Candle } from "../src/worker/market/types";
 
@@ -52,7 +53,7 @@ const symbol = (name: string, m15: Candle[]): SymbolCandles => ({
   "1d": aggregate(m15, DAY),
 });
 
-const DAYS = 90;
+const DAYS = 120;
 const market = [symbol("BTCUSDT", walk(1, DAYS, 60_000)), symbol("ETHUSDT", walk(7, DAYS, 3_000)), symbol("SOLUSDT", walk(13, DAYS, 150))];
 const cfg = { ...DEFAULT_CONFIG, from: T0 + 40 * DAY, to: T0 + DAYS * DAY - HOUR };
 const result = backtest(market, cfg);
@@ -70,29 +71,43 @@ describe("бектест", () => {
       symbol(s.symbol, s["15m"].filter((c) => c.closeTime < cut)),
     );
     const early = backtest(truncated, { ...cfg, to: cut - HOUR });
-    const key = (t: Trade) => `${t.createdAt}|${t.symbol}|${t.side}|${t.setup}|${t.entryLow}|${t.stop}|${t.tp1}`;
+    const key = (t: Trade) => `${t.createdAt}|${t.symbol}|${t.side}|${t.setup}|${t.entry}|${t.stop}`;
     expect(early.trades.map(key)).toEqual(result.trades.filter((t) => t.createdAt < cut).map(key));
   });
 
   it("тримає ліміт відкритих сигналів і не більше одного на монету", () => {
-    for (const t of result.trades) {
-      const open = result.trades.filter((x) => x.createdAt <= t.createdAt && (x.resolvedAt === null || x.resolvedAt > t.createdAt));
-      expect(open.length).toBeLessThanOrEqual(cfg.maxActive);
-      expect(new Set(open.map((x) => x.symbol)).size).toBe(open.length);
+    for (const maxActive of [cfg.maxActive, 1]) {
+      const res = maxActive === cfg.maxActive ? result : backtest(market, { ...cfg, maxActive });
+      for (const t of res.trades) {
+        const open = res.trades.filter((x) => x.createdAt <= t.createdAt && (x.resolvedAt === null || x.resolvedAt > t.createdAt));
+        expect(open.length).toBeLessThanOrEqual(maxActive);
+        expect(new Set(open.map((x) => x.symbol)).size).toBe(open.length);
+      }
     }
   });
 
-  it("кожна опублікована угода проходить поріг R:R, а результат уже після комісій", () => {
+  it("сигнали лише на свіжій свічці 4h, стоп не ближче порога, результат уже після комісій", () => {
     for (const t of result.trades) {
-      expect(t.rr).toBeGreaterThanOrEqual(cfg.minRr);
-      if (t.netR !== null) expect(t.netR).toBeCloseTo(t.resultR! - t.feeR, 3);
+      expect(t.createdAt % (4 * HOUR)).toBe(0);
+      expect(stopDistancePct(t.entry, t.stop)).toBeGreaterThanOrEqual(cfg.minStopPct);
+      if (t.netR !== null) expect(t.netR).toBeCloseTo(t.resultR! - t.feeR - t.slipR, 3);
     }
+  });
+
+  it("проковзування погіршує результат тих самих угод", () => {
+    const slipped = backtest(market, { ...cfg, slippagePct: 0.1 });
+    expect(slipped.trades.map((t) => t.createdAt)).toEqual(result.trades.map((t) => t.createdAt));
+    const closed = slipped.trades.filter((t) => t.netR !== null);
+    expect(closed.length).toBeGreaterThan(0);
+    for (const t of closed) expect(t.slipR).toBeGreaterThan(0);
+    expect(result.trades.every((t) => t.slipR === 0)).toBe(true);
   });
 
   it("звіт збирає підсумки без збоїв", () => {
     const report = buildReport(result);
     expect(report.overall.signals).toBe(result.trades.length);
-    expect(report.overall.trades + report.overall.noEntry + report.overall.stillOpen).toBe(result.trades.length);
+    expect(report.overall.trades + report.overall.stillOpen).toBe(result.trades.length);
+    expect(report.overall.hitRate).not.toBeNull();
     expect(Object.values(report.bySetup).reduce((s, g) => s + g.trades, 0)).toBe(report.overall.trades);
   });
 });

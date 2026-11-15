@@ -1,20 +1,16 @@
-import { entryMid, stopDistancePct } from "../../shared/risk";
-import type { MarketMood, SymbolRegime } from "../regime";
+import { stopDistancePct } from "../../shared/risk";
 import type { Candidate } from "./types";
 
-export const REJECTIONS = ["rr", "stop", "regime", "market", "duplicate", "cooldown", "macro", "max_active"] as const;
+export const REJECTIONS = ["stop", "duplicate", "cooldown", "macro", "max_active"] as const;
 export type Rejection = (typeof REJECTIONS)[number];
 
 export interface FilterContext {
-  minRr: number;
   /**
-   * Стоп не ближче за стільки відсотків від середини зони входу. Комісії платяться з обсягу,
+   * Стоп не ближче за стільки відсотків від входу. Комісії платяться з обсягу,
    * тож що ближчий стоп, то більша їхня частка в R; 0 вимикає перевірку.
    */
   minStopPct: number;
-  regime: SymbolRegime;
-  mood: MarketMood;
-  /** Монети з відкритим сигналом (чекає входу або активний). */
+  /** Монети з відкритим сигналом. */
   openSymbols: Set<string>;
   /** Ключі `symbol|setup|side`, які вже розглядались протягом періоду охолодження. */
   recent: Set<string>;
@@ -30,19 +26,11 @@ export const candidateKey = (c: Pick<Candidate, "symbol" | "setup" | "side">) =>
 
 /**
  * Фільтр до моделі. Повертає причину відмови або null, якщо кандидат проходить.
- * Сетап має відповідати режиму: відкат лише за трендом 4h і не проти тренду 1d;
- * пробій і зняття ліквідності не проти тренду 4h; жоден сетап не проти настрою ринку.
+ * Напрям тренду (EMA200 на 4h) перевіряє вже детектор; додаткові фільтри режиму й настрою ринку
+ * бектест не підтвердив, тож їх тут немає.
  */
 export function reject(c: Candidate, ctx: FilterContext): Rejection | null {
-  if (!(c.rr >= ctx.minRr)) return "rr";
-  if (stopDistancePct(entryMid(c.entryLow, c.entryHigh), c.stop) < ctx.minStopPct) return "stop";
-  const withTrend = c.side === "long" ? "up" : "down";
-  const against = c.side === "long" ? "down" : "up";
-  const { trend, higherTrend } = ctx.regime;
-  if (c.setup === "trend_pullback" ? trend !== withTrend || higherTrend === against : trend === against || trend === null) {
-    return "regime";
-  }
-  if (ctx.mood === (c.side === "long" ? "risk_off" : "risk_on")) return "market";
+  if (stopDistancePct(c.entry, c.stop) < ctx.minStopPct) return "stop";
   if (ctx.openSymbols.has(c.symbol)) return "duplicate";
   if (ctx.recent.has(candidateKey(c))) return "cooldown";
   if (ctx.minutesToMacro !== null && ctx.minutesToMacro <= ctx.macroBlackoutHours * 60) return "macro";

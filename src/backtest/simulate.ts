@@ -1,16 +1,17 @@
-import { feeR, type Liquidity } from "../shared/risk";
+import { feeR } from "../shared/risk";
 import type { Candle } from "../worker/market/types";
 import { marketRegime, trend, type MarketMood, type SymbolRegime } from "../worker/regime";
 import { CANDLE_LIMIT } from "../worker/scan";
 import { detect } from "../worker/signals/detectors";
 import { candidateKey, reject, type Rejection } from "../worker/signals/filter";
+import { EXIT_BARS } from "../worker/signals/detectors";
 import { replay, type TrackResult } from "../worker/signals/track";
 import type { Candidate, SignalStatus } from "../worker/signals/types";
 import { timeframeFeatures } from "../worker/snapshot";
 
 /**
  * Бектест коду без моделі: ті самі детектори, фільтр і супровід, що й у рушії, на історичних свічках.
- * Кожну годину (одразу після закриття свічки 1h) рушій бачить лише свічки, що вже закрились.
+ * Скан іде щогодини, як у рушії, а сетап шукається лише одразу після закриття свічки 4h; видно тільки закриті свічки.
  * Модель не викликається: результат показує базову якість сетапів, ніби аналітик і скептик погоджувались завжди.
  * Макроподій в історії немає, тож фільтр «macro» не спрацьовує.
  */
@@ -30,29 +31,28 @@ export interface BacktestConfig {
   /** Перший і останній момент скану, мс UTC. Скан іде на початку кожної години. */
   from: number;
   to: number;
-  minRr: number;
   minStopPct: number;
   maxActive: number;
   cooldownHours: number;
   maxCandidatesPerScan: number;
-  ttlHours: number;
   maxHoldHours: number;
-  /** Комісії, % від обсягу: лімітні ордери (вхід, цілі) і ринкові (стоп, беззбиток, закриття за часом). */
+  /** Комісії, % від обсягу. Усі виконання трендового сетапу ринкові (taker). */
   makerPct: number;
   takerPct: number;
+  /** Проковзування, % від ціни на кожному виконанні (вхід і вихід): стрес-тест, у рушії не рахується. */
+  slippagePct: number;
 }
 
 /** Стартові налаштування, як у міграціях. */
 export const DEFAULT_CONFIG: Omit<BacktestConfig, "from" | "to"> = {
-  minRr: 2,
   minStopPct: 1,
   maxActive: 3,
   cooldownHours: 6,
   maxCandidatesPerScan: 3,
-  ttlHours: 12,
-  maxHoldHours: 48,
+  maxHoldHours: 336,
   makerPct: 0.02,
   takerPct: 0.05,
+  slippagePct: 0,
 };
 
 export interface Trade extends Candidate {
@@ -60,13 +60,15 @@ export interface Trade extends Candidate {
   mood: MarketMood;
   regime: SymbolRegime;
   status: SignalStatus;
-  /** Як виконався вхід; null, якщо входу не було. */
-  entryKind: Liquidity | null;
-  /** Результат без комісій, R; null, якщо входу не було або позиція ще відкрита на кінець даних. */
+  /** Результат без комісій, R; null, якщо позиція ще відкрита на кінець даних. */
   resultR: number | null;
   feeR: number;
-  /** Після комісій. */
+  /** Проковзування в R (лише в бектесті). */
+  slipR: number;
+  /** Після комісій і проковзування. */
   netR: number | null;
+  /** Чи пройшла ціна +1R до закриття позиції: подія, яку оцінює модель. */
+  hit: 0 | 1 | null;
   resolvedAt: number | null;
   events: TrackResult["events"];
 }
@@ -75,7 +77,7 @@ export interface Funnel {
   scans: number;
   detected: number;
   filtered: Partial<Record<Rejection, number>>;
-  /** Пройшли фільтр, але не потрапили в скан: слабший R:R по тій самій монеті або понад ліміт кандидатів за скан. */
+  /** Пройшли фільтр, але не потрапили в скан: другий напрям по тій самій монеті або понад ліміт кандидатів за скан. */
   capped: number;
   published: number;
 }
@@ -132,20 +134,22 @@ function regimeOf(h4: Candle[], d1: Candle[]): { regime: SymbolRegime; above200:
   };
 }
 
-/** Повний супровід сигналу за свічками 15m після його створення. */
-function resolve(c: Candidate, createdAt: number, m15: Candle[], cfg: BacktestConfig, dataEnd: number) {
-  const expiresAt = createdAt + cfg.ttlHours * HOUR;
-  const start = firstIndex(m15, (x) => x.openTime >= createdAt - 60_000);
-  const horizon = expiresAt + cfg.maxHoldHours * HOUR + 2 * HOUR;
-  const end = firstIndex(m15, (x) => x.openTime > horizon);
-  const res = replay(
-    { side: c.side, entryLow: c.entryLow, entryHigh: c.entryHigh, stop: c.stop, tp1: c.tp1, tp2: c.tp2, createdAt, expiresAt },
-    m15.slice(start, end),
-    dataEnd,
-    cfg.maxHoldHours * HOUR,
+/** Повний супровід сигналу за свічками 1h і 4h після його створення. */
+function resolve(c: Candidate, createdAt: number, data: SymbolCandles, cfg: BacktestConfig) {
+  const hold = cfg.maxHoldHours * HOUR;
+  const h1 = data["1h"].slice(
+    firstIndex(data["1h"], (x) => x.closeTime > createdAt),
+    firstIndex(data["1h"], (x) => x.openTime > createdAt + hold + HOUR),
   );
-  const fee = res.resolvedAt === null ? 0 : feeR(res.entry, c.stop, res.exits, { makerPct: cfg.makerPct, takerPct: cfg.takerPct });
-  return { res, fee };
+  const h4 = data["4h"].slice(
+    Math.max(0, firstIndex(data["4h"], (x) => x.closeTime > createdAt) - EXIT_BARS),
+    firstIndex(data["4h"], (x) => x.openTime > createdAt + hold + 4 * HOUR),
+  );
+  const res = replay({ side: c.side, entry: c.entry, stop: c.stop, createdAt }, h1, h4, hold);
+  const done = res.resolvedAt !== null;
+  const fee = done ? feeR(res.entry, c.stop, res.exits, { makerPct: cfg.makerPct, takerPct: cfg.takerPct }) : 0;
+  const slip = done ? feeR(res.entry, c.stop, res.exits, { makerPct: cfg.slippagePct, takerPct: cfg.slippagePct }) : 0;
+  return { res, fee, slip };
 }
 
 /** Що бачив скан, коли знайшов кандидата: для дослідження сетапів поза лімітами фільтра. */
@@ -175,7 +179,6 @@ export function backtest(
     regime: { trend: null, higherTrend: null, volatility: null },
     above200: null,
   }));
-  const dataEnd = Math.max(...symbols.map((s) => s["15m"].at(-1)?.closeTime ?? 0)) + 1;
   const trades: Trade[] = [];
   const funnel: Funnel = { scans: 0, detected: 0, filtered: {}, capped: 0, published: 0 };
   const start = Math.ceil(cfg.from / HOUR) * HOUR;
@@ -201,17 +204,13 @@ export function backtest(
 
     const passed: (Candidate & { regime: SymbolRegime })[] = [];
     for (const s of states) {
-      const h1 = s.h1.window(t);
-      // Скан бачить лише свічку 1h, що закрилась щойно; монети без свіжих даних пропускаються.
-      if (!h1.length || t - h1[h1.length - 1]!.closeTime > 20 * 60_000) continue;
       const h4 = s.h4.window(t);
-      for (const c of detect(s.data.symbol, h1, h4)) {
+      // Сетап шукається лише на свічці 4h, що закрилась щойно; монети без свіжих даних пропускаються.
+      if (!h4.length || t - h4[h4.length - 1]!.closeTime > 20 * 60_000) continue;
+      for (const c of detect(s.data.symbol, h4)) {
         funnel.detected++;
         const reason = reject(c, {
-          minRr: cfg.minRr,
           minStopPct: cfg.minStopPct,
-          regime: s.regime,
-          mood,
           openSymbols,
           recent,
           minutesToMacro: null,
@@ -219,13 +218,12 @@ export function backtest(
           openCount: open.length,
           maxActive: cfg.maxActive,
         });
-        onCandidate?.(c, { t, mood, regime: s.regime, h1, h4, d1: s.d1.window(t), m15: s.data["15m"], rejection: reason });
+        onCandidate?.(c, { t, mood, regime: s.regime, h1: s.h1.window(t), h4, d1: s.d1.window(t), m15: s.data["15m"], rejection: reason });
         if (reason) funnel.filtered[reason] = (funnel.filtered[reason] ?? 0) + 1;
         else passed.push({ ...c, regime: s.regime });
       }
     }
-    // Як у рушії: найкращий за R:R кандидат на монету, не більше ліміту за скан, ліміт відкритих перевіряється знову.
-    passed.sort((a, b) => b.rr - a.rr);
+    // Як у рушії: один кандидат на монету в порядку списку монет, не більше ліміту за скан, ліміт відкритих перевіряється знову.
     const chosen = passed.filter((c, i) => passed.findIndex((x) => x.symbol === c.symbol) === i).slice(0, cfg.maxCandidatesPerScan);
     funnel.capped += passed.length - chosen.length;
     let openCount = open.length;
@@ -235,17 +233,18 @@ export function backtest(
         continue;
       }
       const data = states.find((s) => s.data.symbol === c.symbol)!.data;
-      const { res, fee } = resolve(c, t, data["15m"], cfg, dataEnd);
+      const { res, fee, slip } = resolve(c, t, data, cfg);
       trades.push({
         ...c,
         createdAt: t,
         mood,
         regime,
         status: res.status,
-        entryKind: res.entry?.kind ?? null,
         resultR: res.resultR,
         feeR: fee,
-        netR: res.resultR === null ? null : Number((res.resultR - fee).toFixed(3)),
+        slipR: slip,
+        netR: res.resultR === null ? null : Number((res.resultR - fee - slip).toFixed(3)),
+        hit: res.hit,
         resolvedAt: res.resolvedAt,
         events: res.events,
       });

@@ -15,6 +15,9 @@ export interface SignalStatRow {
   p_skeptic: number | null;
   playbook_version: number | null;
   shadow_status: string | null;
+  /** Подія для калібрування: ціна пройшла +1R до закриття (1), ні (0), ще невідомо (null). */
+  hit: number | null;
+  shadow_hit: number | null;
   shadow_r: number | null;
   /** Останнє рішення в журналі. */
   action: "taken" | "skipped" | null;
@@ -116,16 +119,16 @@ export function calibration(points: { p: number; hit: 0 | 1 }[]): Calibration {
 }
 
 /**
- * Чи дійшла ціна до першої цілі раніше за стоп. Статус tp1 чи tp2 означає «так», stopped означає «ні»;
- * прострочені й закриті за часом без цілі в калібрування не йдуть: подія не розв'язалась.
+ * Чи відбулась подія, яку оцінювала модель: ціна пройшла +1R до закриття позиції.
+ * Для відхилених береться результат тіні; поки позиція відкрита і +1R ще не було, подія не розв'язалась.
  */
-export function hit(status: string | null): 0 | 1 | null {
-  if (status === "tp1" || status === "tp2") return 1;
-  if (status === "stopped") return 0;
-  return null;
+export function hit(row: { status: string; hit: number | null; shadow_hit: number | null }): 0 | 1 | null {
+  const v = row.status === "rejected" ? row.shadow_hit : row.hit;
+  return v === 1 ? 1 : v === 0 ? 0 : null;
 }
 
-const CLOSED = new Set(["tp1", "tp2", "stopped", "expired"]);
+/** Закриті статуси. tp1, tp2 і expired лишились від сетапів на 1h. */
+const CLOSED = new Set(["exited", "stopped", "tp1", "tp2", "expired"]);
 const isTrade = (r: SignalStatRow) => CLOSED.has(r.status) && r.result_r !== null;
 
 export interface StatsInput {
@@ -155,7 +158,7 @@ export function computeStats(input: StatsInput): Stats {
   const shadow = rejected.filter((s) => s.shadow_r !== null && s.shadow_status !== null && CLOSED.has(s.shadow_status));
 
   const outcomes = input.signals
-    .map((s) => ({ s, hit: hit(s.status === "rejected" ? s.shadow_status : s.status) }))
+    .map((s) => ({ s, hit: hit(s) }))
     .filter((x): x is { s: SignalStatRow; hit: 0 | 1 } => x.hit !== null);
   const points = (key: "p_analyst" | "p_skeptic") =>
     outcomes.filter((x) => x.s[key] !== null).map((x) => ({ p: x.s[key]!, hit: x.hit }));
@@ -231,7 +234,7 @@ export async function loadStats(db: D1Database, opts: { from: string | null; now
   const [signals, forecasts, runs, spend, budget, riskPct, firstSignal] = await Promise.all([
     db
       .prepare(
-        `SELECT id, created_at, resolved_at, setup, status, result_r, fee_r, p_analyst, p_skeptic, playbook_version, shadow_status, shadow_r,
+        `SELECT id, created_at, resolved_at, setup, status, result_r, fee_r, p_analyst, p_skeptic, playbook_version, shadow_status, shadow_r, hit, shadow_hit,
            (SELECT action FROM journal WHERE signal_id = signals.id ORDER BY id DESC LIMIT 1) AS action
          FROM signals WHERE created_at >= ? OR resolved_at >= ?`,
       )

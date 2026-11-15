@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { entryMid, positionSize } from "../shared/risk";
+import { entryMid, positionSize, stopDistancePct } from "../shared/risk";
 import { SignalChart } from "./Chart";
 import { fmtPrice, useLivePrice } from "./live";
 import { api, c, card, day, dim, h2, p, primary, secondary, signed, time } from "./ui";
@@ -13,9 +13,10 @@ export interface SignalCard {
   entry_low: number;
   entry_high: number;
   stop: number;
-  tp1: number;
+  /** Цілі й R:R були в сетапів на 1h; у трендового пробою позицію закриває вихід за каналом. */
+  tp1: number | null;
   tp2: number | null;
-  rr: number;
+  rr: number | null;
   p_analyst: number | null;
   p_skeptic: number | null;
   status: string;
@@ -25,7 +26,6 @@ export interface SignalCard {
   shadow_status: string | null;
   shadow_r: number | null;
   action?: "taken" | "skipped" | null;
-  tp1_hit?: number;
 }
 
 interface Similar { from: number; to: number; n: number; hits: number }
@@ -43,15 +43,16 @@ interface SignalFull extends SignalCard {
 }
 
 export const SETUP: Record<string, string> = {
+  trend_breakout: "Трендовий пробій 4h",
   trend_pullback: "Відкат у тренді",
   breakout_retest: "Пробій із ретестом",
   liquidity_sweep: "Зняття ліквідності",
 };
 const STATUS: Record<string, string> = {
-  pending: "чекає входу", active: "активний", tp1: "ціль", tp2: "ціль 2", stopped: "стоп", expired: "прострочений", rejected: "відхилений",
+  pending: "чекає входу", active: "позиція відкрита", exited: "вихід за каналом", tp1: "ціль", tp2: "ціль 2", stopped: "стоп", expired: "прострочений", rejected: "відхилений",
 };
 const EVENT: Record<string, string> = {
-  entry: "Вхід", tp1: "Ціль 1", tp2: "Ціль 2", breakeven: "Беззбиток", stop: "Стоп", expired: "Прострочено без входу", missed: "Ціна дійшла до цілі без входу", timeout: "Закрито за часом",
+  entry: "Вхід за ринком", exit: "Вихід за каналом 4h", tp1: "Ціль 1", tp2: "Ціль 2", breakeven: "Беззбиток", stop: "Стоп", expired: "Прострочено без входу", missed: "Ціна дійшла до цілі без входу", timeout: "Закрито за часом",
 };
 const pct = (v: number | null) => (v === null ? "—" : `${Math.round(v * 100)}%`);
 const coin = (s: string) => s.replace(/USDT$/, "");
@@ -75,7 +76,8 @@ function Row({ label, value, color }: { label: string; value: string; color?: st
 
 function Head({ s }: { s: SignalCard }) {
   const done = s.status !== "pending" && s.status !== "active";
-  const color = s.status === "tp1" || s.status === "tp2" ? c.blue : s.status === "stopped" || s.status === "rejected" ? c.orange : c.dim;
+  const r = netR(s);
+  const color = r !== null ? (r > 0 ? c.blue : c.orange) : s.status === "rejected" ? c.orange : c.dim;
   return (
     <>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12 }}>
@@ -83,8 +85,8 @@ function Head({ s }: { s: SignalCard }) {
           {coin(s.symbol)} <span style={{ color: s.side === "long" ? c.blue : c.orange }}>{s.side === "long" ? "лонг" : "шорт"}</span>
         </span>
         <span style={{ fontSize: 13, color }}>
-          {s.status === "active" && s.tp1_hit ? "ціль 1 взято" : STATUS[s.status] ?? s.status}
-          {netR(s) !== null && ` · ${signed(netR(s)!)}R`}
+          {STATUS[s.status] ?? s.status}
+          {r !== null && ` · ${signed(r)}R`}
           {s.status === "rejected" && s.shadow_r !== null && ` · якби брали ${signed(s.shadow_r)}R`}
         </span>
       </div>
@@ -95,13 +97,21 @@ function Head({ s }: { s: SignalCard }) {
   );
 }
 
+/** Вхід: одна ціна для входу за ринком або зона для лімітного входу старих сетапів. */
+const entryText = (s: SignalCard) => (s.entry_low === s.entry_high ? `за ринком біля ${s.entry_low}` : `${s.entry_low} – ${s.entry_high}`);
+
 function Levels({ s }: { s: SignalCard }) {
+  const entry = entryMid(s.entry_low, s.entry_high);
   return (
     <>
-      <Row label="Зона входу" value={`${s.entry_low} – ${s.entry_high}`} />
-      <Row label="Стоп" value={String(s.stop)} color={c.orange} />
-      <Row label="Ціль" value={s.tp2 === null ? String(s.tp1) : `${s.tp1} · далі ${s.tp2}`} color={c.blue} />
-      <Row label="R:R" value={String(s.rr)} />
+      <Row label="Вхід" value={entryText(s)} />
+      <Row label="Стоп" value={`${s.stop} · ${stopDistancePct(entry, s.stop).toFixed(1)}%`} color={c.orange} />
+      {s.tp1 === null ? (
+        <Row label="Вихід" value="закриття 4h за каналом 10 свічок" color={c.blue} />
+      ) : (
+        <Row label="Ціль" value={s.tp2 === null ? String(s.tp1) : `${s.tp1} · далі ${s.tp2}`} color={c.blue} />
+      )}
+      {s.rr !== null && <Row label="R:R" value={String(s.rr)} />}
       <Row label="Аналітик / скептик" value={`${pct(s.p_analyst)} / ${pct(s.p_skeptic)}`} />
     </>
   );
@@ -190,7 +200,7 @@ function SimilarHint({ who, v }: { who: string; v: Similar | null }) {
     <p style={dim}>
       {v.n === 0
         ? `Сигналів з оцінкою ${who} ${range} з відомим результатом ще немає.`
-        : `З оцінкою ${who} ${range} ціль досягалась ${v.hits} з ${v.n} разів (${Math.round((v.hits / v.n) * 100)}%).`}
+        : `З оцінкою ${who} ${range} ціна проходила +1R ${v.hits} з ${v.n} разів (${Math.round((v.hits / v.n) * 100)}%).`}
     </p>
   );
 }
@@ -245,7 +255,10 @@ function SignalDetails({ s, busy, journal, onBack }: { s: SignalFull; busy: bool
         </section>
       )}
       <p style={dim}>
-        Вхід зараховується, коли ціна дійшла до середини зони (лімітний ордер), а не лише зачепила її край; результат в R рахується від цієї ціни і вже після комісій.{s.tp2 !== null && " На першій цілі фіксується половина позиції, стоп решти переходить у беззбиток."} Це аналіз, а не фінансова порада.
+        {s.tp1 === null
+          ? "Вхід за ринком у момент сигналу. Позицію закриває стоп або закриття свічки 4h за каналом 10 свічок: про вихід прийде сповіщення. Більшість угод закривається невеликим збитком, результат дають рідкі довгі тренди. Результат в R рахується від ціни входу і вже після комісій."
+          : "Вхід зараховувався, коли ціна дійшла до середини зони; результат в R рахується від цієї ціни і вже після комісій."}{" "}
+        Це аналіз, а не фінансова порада.
       </p>
     </>
   );
@@ -308,8 +321,8 @@ export function OpenSignals({ onOpen, lastScan }: { onOpen: (id: number) => void
       {list.map((s) => (
         <button key={s.id} type="button" onClick={() => onOpen(s.id)} style={{ ...card, color: c.ink, textAlign: "left", font: "inherit", cursor: "pointer" }}>
           <Head s={s} />
-          <Row label="Вхід" value={`${s.entry_low} – ${s.entry_high}`} />
-          <Row label="Стоп / ціль" value={`${s.stop} / ${s.tp1}`} />
+          <Row label="Вхід" value={entryText(s)} />
+          <Row label="Стоп" value={String(s.stop)} />
         </button>
       ))}
     </>

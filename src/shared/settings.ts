@@ -39,13 +39,11 @@ export const SETTINGS: SettingSpec[] = [
   { key: "risk_per_trade_pct", group: "Ризик", label: "Ризик на угоду, % депозиту", kind: "number", check: num(0.1, 5) },
   { key: "fee_maker_pct", group: "Ризик", label: "Комісія maker, %", help: "Лімітні ордери: вхід у зоні й цілі. Ф'ючерси Binance, VIP 0: 0.02%.", kind: "number", check: num(0, 0.5) },
   { key: "fee_taker_pct", group: "Ризик", label: "Комісія taker, %", help: "Ринкові ордери: стоп, беззбиток, закриття за часом і вхід, якщо ціна вже за серединою зони. Ф'ючерси Binance, VIP 0: 0.05%.", kind: "number", check: num(0, 0.5) },
-  { key: "min_rr", group: "Сигнали", label: "Мінімальний R:R", kind: "number", check: num(1, 10) },
   { key: "min_stop_pct", group: "Сигнали", label: "Стоп не ближче, % від входу", help: "Кандидати з ближчим стопом відсіюються до моделі: на них комісії з'їдають надто велику частку R. 0 вимикає перевірку.", kind: "number", check: num(0, 10) },
   { key: "skeptic_threshold", group: "Сигнали", label: "Поріг скептика", help: "Частка від 0.5 до 0.95: 0.6 означає 60%.", kind: "number", check: num(0.5, 0.95) },
   { key: "max_active_signals", group: "Сигнали", label: "Відкритих сигналів не більше", kind: "number", check: num(1, 10, true) },
   { key: "max_candidates_per_scan", group: "Сигнали", label: "Кандидатів до моделі за скан", kind: "number", check: num(1, 10, true) },
-  { key: "signal_ttl_hours", group: "Сигнали", label: "Сигнал чекає входу, год", kind: "number", check: num(1, 72) },
-  { key: "signal_max_hold_hours", group: "Сигнали", label: "Найдовше тримати позицію, год", kind: "number", check: num(4, 240) },
+  { key: "signal_max_hold_hours", group: "Сигнали", label: "Найдовше тримати позицію, год", help: "Зазвичай позицію закриває стоп або вихід за каналом 4h; це запобіжник. Не більше 480 год: супровід іде за свічками 1h, а кеш тримає ~20 днів.", kind: "number", check: num(4, 480) },
   { key: "signal_cooldown_hours", group: "Сигнали", label: "Пауза для того самого сетапу по монеті, год", kind: "number", check: num(0, 72) },
   { key: "macro_blackout_hours", group: "Сигнали", label: "Без нових сигналів до макроподії, год", kind: "number", check: num(0, 24) },
   {
@@ -167,12 +165,12 @@ export function validateSettings(changes: Record<string, unknown>): { values: Re
   return { values, errors };
 }
 
-export const SETUP_KEYS = ["trend_pullback", "breakout_retest", "liquidity_sweep"] as const;
+export const SETUP_KEYS = ["trend_breakout"] as const;
 
 /** Перевірка нової версії правил сетапів: усі три сетапи, розумна довжина. */
 export function validatePlaybook(raw: unknown): { ok: true; rules: Record<string, string> } | { ok: false; error: string } {
   const r = raw as Record<string, unknown> | null;
-  if (!r || typeof r !== "object") return { ok: false, error: "потрібні правила для трьох сетапів" };
+  if (!r || typeof r !== "object") return { ok: false, error: "потрібні правила сетапів" };
   const rules: Record<string, string> = {};
   for (const key of SETUP_KEYS) {
     const text = typeof r[key] === "string" ? (r[key] as string).trim() : "";
