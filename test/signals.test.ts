@@ -166,8 +166,26 @@ describe("супровід сигналу", () => {
     expect(run([[103, 102, 102.5]])).toEqual({ status: "pending", events: [], resultR: null, resolvedAt: null, exits: [] });
   });
 
+  it("ціна зачепила край зони, але не дійшла до середини: входу немає", () => {
+    const r = run([[103, 100.5, 101], [103, 100.1, 102.5]]);
+    expect(r.status).toBe("pending");
+    expect(r.events).toEqual([]);
+  });
+
+  it("ціна зачепила край зони і пішла до цілі: сигнал пропущено, а не взято", () => {
+    const r = run([[102, 100.5, 101], [104.2, 101, 104]]);
+    expect(r).toMatchObject({ status: "expired", resultR: null, exits: [] });
+    expect(r.events.map((e) => e.type)).toEqual(["missed"]);
+    const short = sig({ side: "short", entryLow: 99, entryHigh: 101, stop: 102, tp1: 96 });
+    expect(run([[99.5, 98, 99], [99, 95.9, 96.5]], short).events.map((e) => e.type)).toEqual(["missed"]);
+  });
+
+  it("вхід за середину зони: ціна події входу дорівнює середині", () => {
+    expect(run([[102, 100, 101]]).events).toEqual([{ type: "entry", ts: T0 + M15 - 1, price: 100 }]);
+  });
+
   it("вхід, потім ціль: результат дорівнює R:R від середини зони", () => {
-    const r = run([[103, 102, 102.5], [102, 100.5, 101], [103, 100.8, 102.8], [104.2, 102.5, 104]]);
+    const r = run([[103, 102, 102.5], [102, 99.8, 101], [103, 100.8, 102.8], [104.2, 102.5, 104]]);
     expect(r.status).toBe("tp1");
     expect(r.events.map((e) => e.type)).toEqual(["entry", "tp1"]);
     expect(r.resultR).toBe(2); // (104 − 100) / (100 − 98)
@@ -175,16 +193,16 @@ describe("супровід сигналу", () => {
   });
 
   it("вхід, потім стоп: −1R", () => {
-    const r = run([[102, 100.5, 101], [101, 97.9, 98.2]]);
+    const r = run([[102, 99.8, 101], [101, 97.9, 98.2]]);
     expect(r).toMatchObject({ status: "stopped", resultR: -1 });
   });
 
   it("свічка, що зачепила і стоп, і ціль, рахується як стоп", () => {
-    expect(run([[102, 100.5, 101], [104.5, 97.5, 100]])).toMatchObject({ status: "stopped", resultR: -1 });
+    expect(run([[102, 99.8, 101], [104.5, 97.5, 100]])).toMatchObject({ status: "stopped", resultR: -1 });
   });
 
   it("у свічці входу ціль не зараховується, а стоп зараховується", () => {
-    expect(run([[104.5, 100.5, 104]]).status).toBe("active");
+    expect(run([[104.5, 99.8, 104]]).status).toBe("active");
     expect(run([[102, 97.5, 98]]).events.map((e) => e.type)).toEqual(["entry", "stop"]);
   });
 
@@ -202,7 +220,7 @@ describe("супровід сигналу", () => {
   });
 
   it("активний сигнал закривається за часом із фактичним результатом", () => {
-    const r = replay(sig(), bars([[102, 100.5, 101], [102, 100.6, 101], [102, 100.6, 101.5]]), T0 + 3 * M15, 2 * M15 - 2);
+    const r = replay(sig(), bars([[102, 99.8, 101], [102, 100.6, 101], [102, 100.6, 101.5]]), T0 + 3 * M15, 2 * M15 - 2);
     expect(r).toMatchObject({ status: "expired", resultR: 0.75 }); // (101.5 − 100) / 2
     expect(r.events.map((e) => e.type)).toEqual(["entry", "timeout"]);
   });
@@ -210,8 +228,8 @@ describe("супровід сигналу", () => {
   it("шорт дзеркальний", () => {
     const s = sig({ side: "short", entryLow: 99, entryHigh: 101, stop: 102, tp1: 96 });
     expect(run([[98, 97, 97.5]], s).status).toBe("pending");
-    expect(run([[99.5, 98, 99], [99, 95.9, 96.5]], s)).toMatchObject({ status: "tp1", resultR: 2 });
-    expect(run([[99.5, 98, 99], [102.1, 99, 101]], s)).toMatchObject({ status: "stopped", resultR: -1 });
+    expect(run([[100.2, 98, 99], [99, 95.9, 96.5]], s)).toMatchObject({ status: "tp1", resultR: 2 });
+    expect(run([[100.2, 98, 99], [102.1, 99, 101]], s)).toMatchObject({ status: "stopped", resultR: -1 });
   });
 
   it("свічки до створення сигналу не враховуються", () => {
@@ -221,7 +239,7 @@ describe("супровід сигналу", () => {
 
   describe("друга ціль", () => {
     const s2 = sig({ tp2: 108 });
-    const entered: [number, number, number][] = [[102, 100.5, 101], [104.2, 101, 104]];
+    const entered: [number, number, number][] = [[102, 99.8, 101], [104.2, 101, 104]];
 
     it("половина на першій цілі, решта на другій", () => {
       const r = run([...entered, [106, 103, 105], [108.5, 105, 108]], s2);
@@ -243,7 +261,7 @@ describe("супровід сигналу", () => {
     });
 
     it("у свічці першої цілі друга не рахується, а свічка з беззбитком і другою ціллю дає беззбиток", () => {
-      expect(run([[102, 100.5, 101], [108.5, 101, 108]], s2).status).toBe("active");
+      expect(run([[102, 99.8, 101], [108.5, 101, 108]], s2).status).toBe("active");
       expect(run([...entered, [108.5, 99.5, 104]], s2).status).toBe("tp1");
     });
 
@@ -262,7 +280,7 @@ describe("супровід сигналу", () => {
   });
 
   it("відтворення детерміноване: повторний прогін дає той самий результат", () => {
-    const rows: [number, number, number][] = [[102, 100.5, 101], [103, 100.8, 102.8], [104.2, 102.5, 104], [90, 80, 85]];
+    const rows: [number, number, number][] = [[102, 99.8, 101], [103, 100.8, 102.8], [104.2, 102.5, 104], [90, 80, 85]];
     expect(run(rows)).toEqual(run(rows));
     expect(run(rows).status).toBe("tp1");
   });

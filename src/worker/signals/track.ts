@@ -50,7 +50,9 @@ const START_TOLERANCE_MS = 60_000;
 
 /**
  * Правила:
- * - вхід, коли ціна торкнулась зони; якщо ціна дійшла до першої цілі без входу, сигнал «пішов без нас»;
+ * - вхід лімітним ордером на середині зони: лише коли ціна дійшла до середини, а не просто зачепила край.
+ *   Інакше в статистику потрапляли б угоди, яких реальний ордер не взяв би, а результат рахується саме від середини;
+ * - якщо ціна дійшла до першої цілі без входу, сигнал «пішов без нас»;
  * - у свічці входу може спрацювати стоп, але не ціль: порядок усередині свічки невідомий;
  * - якщо свічка зачепила і стоп, і ціль, рахуємо стоп;
  * - без другої цілі вся позиція закривається на першій; з другою на першій фіксується половина,
@@ -79,8 +81,7 @@ export function replay(s: TrackedSignal, candles: Candle[], now: number, maxHold
 
     if (enteredAt === null) {
       if (c.openTime >= s.expiresAt) break;
-      const touched = long ? c.low <= s.entryHigh : c.high >= s.entryLow;
-      if (!touched) {
+      if (!below(c, mid)) {
         if (above(c, s.tp1)) {
           events.push({ type: "missed", ts: c.closeTime, price: s.tp1 });
           return done("expired", c.closeTime);
@@ -88,7 +89,7 @@ export function replay(s: TrackedSignal, candles: Candle[], now: number, maxHold
         continue;
       }
       enteredAt = c.closeTime;
-      events.push({ type: "entry", ts: c.closeTime, price: long ? s.entryHigh : s.entryLow });
+      events.push({ type: "entry", ts: c.closeTime, price: mid });
       if (below(c, s.stop)) {
         events.push({ type: "stop", ts: c.closeTime, price: s.stop });
         exits.push({ price: s.stop, share: 1 });

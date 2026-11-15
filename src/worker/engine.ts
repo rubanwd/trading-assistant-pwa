@@ -948,7 +948,7 @@ export class Engine extends DurableObject<Env> {
       ]);
       const name = `${coin(sig.symbol)} ${SIDE_NAME[sig.side]}`;
       const text: Partial<Record<EventType, [title: string, body: string]>> = {
-        entry: [`Вхід: ${name}`, `Ціна в зоні входу ${sig.entry_low}–${sig.entry_high}. Стоп ${sig.stop}, ціль ${sig.tp1}.`],
+        entry: [`Вхід: ${name}`, `Ціна дійшла до середини зони входу ${Number(entryMid(sig.entry_low, sig.entry_high).toPrecision(6))}. Стоп ${sig.stop}, ціль ${sig.tp1}.`],
         tp1:
           sig.tp2 === null
             ? [`Ціль: ${name}`, `Ціна дійшла до ${sig.tp1}. Результат +${res.resultR ?? sig.rr}R.`]
