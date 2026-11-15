@@ -40,6 +40,7 @@ export const SETTINGS: SettingSpec[] = [
   { key: "fee_maker_pct", group: "Ризик", label: "Комісія maker, %", help: "Лімітні ордери: вхід у зоні й цілі. Ф'ючерси Binance, VIP 0: 0.02%.", kind: "number", check: num(0, 0.5) },
   { key: "fee_taker_pct", group: "Ризик", label: "Комісія taker, %", help: "Ринкові ордери: стоп, беззбиток, закриття за часом і вхід, якщо ціна вже за серединою зони. Ф'ючерси Binance, VIP 0: 0.05%.", kind: "number", check: num(0, 0.5) },
   { key: "min_rr", group: "Сигнали", label: "Мінімальний R:R", kind: "number", check: num(1, 10) },
+  { key: "min_stop_pct", group: "Сигнали", label: "Стоп не ближче, % від входу", help: "Кандидати з ближчим стопом відсіюються до моделі: на них комісії з'їдають надто велику частку R. 0 вимикає перевірку.", kind: "number", check: num(0, 10) },
   { key: "skeptic_threshold", group: "Сигнали", label: "Поріг скептика", help: "Частка від 0.5 до 0.95: 0.6 означає 60%.", kind: "number", check: num(0.5, 0.95) },
   { key: "max_active_signals", group: "Сигнали", label: "Відкритих сигналів не більше", kind: "number", check: num(1, 10, true) },
   { key: "max_candidates_per_scan", group: "Сигнали", label: "Кандидатів до моделі за скан", kind: "number", check: num(1, 10, true) },

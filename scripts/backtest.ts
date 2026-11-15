@@ -31,6 +31,7 @@ const HELP = `Бектест коду без моделі.
   --to YYYY-MM          останній місяць (типово попередній повний місяць)
   --symbols A,B         монети (типово стартовий список із 15)
   --min-rr N            мінімальний R:R (${DEFAULT_CONFIG.minRr})
+  --min-stop N          стоп не ближче, % від входу (${DEFAULT_CONFIG.minStopPct})
   --max-active N        відкритих сигналів не більше (${DEFAULT_CONFIG.maxActive})
   --cooldown N          пауза для того самого сетапу по монеті, год (${DEFAULT_CONFIG.cooldownHours})
   --per-scan N          кандидатів за скан (${DEFAULT_CONFIG.maxCandidatesPerScan})
@@ -95,7 +96,7 @@ async function main() {
   const { values } = parseArgs({
     options: {
       from: { type: "string" }, to: { type: "string" }, symbols: { type: "string" },
-      "min-rr": { type: "string" }, "max-active": { type: "string" }, cooldown: { type: "string" },
+      "min-rr": { type: "string" }, "min-stop": { type: "string" }, "max-active": { type: "string" }, cooldown: { type: "string" },
       "per-scan": { type: "string" }, ttl: { type: "string" }, "max-hold": { type: "string" },
       maker: { type: "string" }, taker: { type: "string" }, out: { type: "string" }, help: { type: "boolean", short: "h" },
     },
@@ -141,6 +142,7 @@ async function main() {
     from: start,
     to: end,
     minRr: num(values["min-rr"], DEFAULT_CONFIG.minRr),
+    minStopPct: num(values["min-stop"], DEFAULT_CONFIG.minStopPct),
     maxActive: num(values["max-active"], DEFAULT_CONFIG.maxActive),
     cooldownHours: num(values.cooldown, DEFAULT_CONFIG.cooldownHours),
     maxCandidatesPerScan: num(values["per-scan"], DEFAULT_CONFIG.maxCandidatesPerScan),

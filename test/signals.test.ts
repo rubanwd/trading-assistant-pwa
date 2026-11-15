@@ -93,6 +93,7 @@ describe("фільтр", () => {
   };
   const ctx = (over: Partial<FilterContext> = {}): FilterContext => ({
     minRr: 2,
+    minStopPct: 0,
     regime: { trend: "up", higherTrend: "up", volatility: "normal" },
     mood: "mixed",
     openSymbols: new Set(),
@@ -111,6 +112,15 @@ describe("фільтр", () => {
 
   it("відсіює за R:R", () => {
     expect(reject({ ...c, rr: 1.99 }, ctx())).toBe("rr");
+  });
+
+  it("відсіює надто близький стоп", () => {
+    // Середина зони 100, стоп 98: відстань 2%.
+    expect(reject(c, ctx({ minStopPct: 2 }))).toBeNull();
+    expect(reject(c, ctx({ minStopPct: 2.01 }))).toBe("stop");
+    const short = { ...c, side: "short" as const, stop: 101.5 };
+    expect(reject(short, ctx({ minStopPct: 1.6, regime: { trend: "down", higherTrend: "down", volatility: "normal" } }))).toBe("stop");
+    expect(reject({ ...c, rr: 1.5 }, ctx({ minStopPct: 5 }))).toBe("rr");
   });
 
   it("відкат лише за трендом 4h і не проти 1d", () => {

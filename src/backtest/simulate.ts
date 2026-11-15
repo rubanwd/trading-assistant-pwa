@@ -31,6 +31,7 @@ export interface BacktestConfig {
   from: number;
   to: number;
   minRr: number;
+  minStopPct: number;
   maxActive: number;
   cooldownHours: number;
   maxCandidatesPerScan: number;
@@ -44,6 +45,7 @@ export interface BacktestConfig {
 /** Стартові налаштування, як у міграціях. */
 export const DEFAULT_CONFIG: Omit<BacktestConfig, "from" | "to"> = {
   minRr: 2,
+  minStopPct: 1,
   maxActive: 3,
   cooldownHours: 6,
   maxCandidatesPerScan: 3,
@@ -189,6 +191,7 @@ export function backtest(symbols: SymbolCandles[], cfg: BacktestConfig): Backtes
         funnel.detected++;
         const reason = reject(c, {
           minRr: cfg.minRr,
+          minStopPct: cfg.minStopPct,
           regime: s.regime,
           mood,
           openSymbols,

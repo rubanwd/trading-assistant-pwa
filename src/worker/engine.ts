@@ -1015,8 +1015,9 @@ export class Engine extends DurableObject<Env> {
     summary.detection = fresh.length > 0;
     if (!fresh.length) return [];
 
-    const [minRr, maxActive, blackout, macro, cooldown, perScan] = await Promise.all([
+    const [minRr, minStopPct, maxActive, blackout, macro, cooldown, perScan] = await Promise.all([
       this.setting("min_rr", 2),
+      this.setting("min_stop_pct", 1),
       this.setting("max_active_signals", 3),
       this.setting("macro_blackout_hours", 2),
       this.setting<unknown>("macro_events", []),
@@ -1043,6 +1044,7 @@ export class Engine extends DurableObject<Env> {
         summary.detected++;
         const reason = reject(candidate, {
           minRr,
+          minStopPct,
           regime: snap.regime,
           mood: scan.market.mood,
           openSymbols,
@@ -1241,7 +1243,7 @@ export class Engine extends DurableObject<Env> {
       .all<{ ts: string; action: string | null; note: string }>();
     const settings = Object.fromEntries(
       await Promise.all(
-        ["min_rr", "skeptic_threshold", "max_active_signals", "signal_ttl_hours", "signal_max_hold_hours", "fee_maker_pct", "fee_taker_pct"].map(async (k) => [k, await this.setting<unknown>(k, null)] as const),
+        ["min_rr", "min_stop_pct", "skeptic_threshold", "max_active_signals", "signal_ttl_hours", "signal_max_hold_hours", "fee_maker_pct", "fee_taker_pct"].map(async (k) => [k, await this.setting<unknown>(k, null)] as const),
       ),
     );
     const input = weeklyInput({ week, allTime, playbook: { version: playbook.version, rules: playbook.rules as Record<string, string> }, settings, notes: notes.results.map((n) => ({ ...n, note: n.note.slice(0, 300) })) });

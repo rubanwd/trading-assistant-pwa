@@ -1,11 +1,17 @@
+import { entryMid, stopDistancePct } from "../../shared/risk";
 import type { MarketMood, SymbolRegime } from "../regime";
 import type { Candidate } from "./types";
 
-export const REJECTIONS = ["rr", "regime", "market", "duplicate", "cooldown", "macro", "max_active"] as const;
+export const REJECTIONS = ["rr", "stop", "regime", "market", "duplicate", "cooldown", "macro", "max_active"] as const;
 export type Rejection = (typeof REJECTIONS)[number];
 
 export interface FilterContext {
   minRr: number;
+  /**
+   * Стоп не ближче за стільки відсотків від середини зони входу. Комісії платяться з обсягу,
+   * тож що ближчий стоп, то більша їхня частка в R; 0 вимикає перевірку.
+   */
+  minStopPct: number;
   regime: SymbolRegime;
   mood: MarketMood;
   /** Монети з відкритим сигналом (чекає входу або активний). */
@@ -29,6 +35,7 @@ export const candidateKey = (c: Pick<Candidate, "symbol" | "setup" | "side">) =>
  */
 export function reject(c: Candidate, ctx: FilterContext): Rejection | null {
   if (!(c.rr >= ctx.minRr)) return "rr";
+  if (stopDistancePct(entryMid(c.entryLow, c.entryHigh), c.stop) < ctx.minStopPct) return "stop";
   const withTrend = c.side === "long" ? "up" : "down";
   const against = c.side === "long" ? "down" : "up";
   const { trend, higherTrend } = ctx.regime;

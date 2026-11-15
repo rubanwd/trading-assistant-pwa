@@ -31,6 +31,9 @@ export function riskReward(entry: number, stop: number, target: number): number 
   return risk === 0 ? 0 : Math.abs(target - entry) / risk;
 }
 
+/** Відстань до стопа у відсотках від ціни входу. */
+export const stopDistancePct = (entry: number, stop: number) => (entry > 0 ? (Math.abs(entry - stop) / entry) * 100 : 0);
+
 /** Середина зони входу: опорна ціна для R:R і результату в R. */
 export const entryMid = (entryLow: number, entryHigh: number) => (entryLow + entryHigh) / 2;
 
