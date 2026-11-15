@@ -40,6 +40,7 @@ R:R не нижче 2; поріг скептика 60%; активних сиг�
 - Модель: єдиний шлях `Engine.llm` (`llm.ts`, OpenRouter Chat Completions): стеля перед викликом, модель агента з налаштувань, `provider.require_parameters`, запис у `llm_calls` з вартістю від OpenRouter. Каталог моделей `Engine.models()` (кеш 6 год), стан ключа `Engine.keyInfo()`, пробний виклик `Engine.testAgent()`. API: `GET/PUT /api/ai`, `POST /api/ai/test`.
 - Сигнали (`src/worker/signals`): `detectors.ts`, `filter.ts`, `review.ts`, `track.ts` (друга ціль: половина на першій, стоп у беззбиток). Комісії `feeR` у `src/shared/risk.ts`, пишуться в `signals.fee_r`. Відхилені моделлю супроводжуються в тіні (`shadow_status`, `shadow_r` уже після комісій).
 - Статистика: `stats.ts` (чисті функції й завантажувач D1), тижневий розбір `weekly.ts`.
+- Бектест (локально, не на Cloudflare): `npm run backtest`, код у `src/backtest/` (`simulate.ts` викликає ті самі `detect`, `reject`, `replay`), CLI `scripts/backtest.ts`, свічки з `data.binance.vision`. Зміни в детекторах, фільтрі чи супроводі одразу діють і в бектесті.
 - Налаштування: схема й перевірка в `src/shared/settings.ts`, API `GET/PUT /api/settings`; правила сетапів `GET/POST /api/playbook` з версіями.
 - Вхід: `access.ts` перевіряє підпис токена Cloudflare Access; ключі команди бере рушій.
 - Застосунок: вкладки «Сьогодні», «Сигнали», «Звіти», «Статистика», екрани «Налаштування» і «Моделі ШІ» (`Ai.tsx`); графік `Chart.tsx`, жива ціна `live.ts` (WebSocket Binance з браузера), офлайн-кеш у `public/sw.js`.
