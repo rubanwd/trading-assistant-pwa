@@ -996,7 +996,7 @@ export class Engine extends DurableObject<Env> {
 
     const [minStopPct, maxActive, blackout, macro, cooldown, perScan] = await Promise.all([
       this.setting("min_stop_pct", 1),
-      this.setting("max_active_signals", 3),
+      this.setting("max_active_signals", 6),
       this.setting("macro_blackout_hours", 2),
       this.setting<unknown>("macro_events", []),
       this.setting("signal_cooldown_hours", 6),
@@ -1045,7 +1045,7 @@ export class Engine extends DurableObject<Env> {
     if (!candidate || !summary || !scan) return;
     const db = this.env.DB;
     const [maxActive, macro, threshold, maxHold] = await Promise.all([
-      this.setting("max_active_signals", 3),
+      this.setting("max_active_signals", 6),
       this.setting<unknown>("macro_events", []),
       this.setting("skeptic_threshold", 0.6),
       this.setting("signal_max_hold_hours", 336),
@@ -1134,7 +1134,7 @@ export class Engine extends DurableObject<Env> {
 
   /** Текст сповіщення про новий сигнал. Розмір позиції рахує код від ризику на угоду. */
   private async signalMessage(id: number, c: Candidate): Promise<PushMessage> {
-    const [deposit, riskPct] = await Promise.all([this.setting<number | null>("deposit_usd", null), this.setting("risk_per_trade_pct", 1)]);
+    const [deposit, riskPct] = await Promise.all([this.setting<number | null>("deposit_usd", null), this.setting("risk_per_trade_pct", 0.5)]);
     const size = deposit ? positionSize(deposit, riskPct, c.entry, c.stop) : null;
     return {
       title: `Сигнал: ${coin(c.symbol)} ${SIDE_NAME[c.side]}`,

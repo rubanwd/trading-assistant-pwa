@@ -178,7 +178,7 @@ app.get("/api/signals/:id{[0-9]+}", async (c) => {
     reasoning: row.reasoning ? JSON.parse(row.reasoning) : null,
     events: events.results,
     journal: journal.results,
-    risk: { depositUsd: setting("deposit_usd"), riskPct: setting("risk_per_trade_pct") ?? 1 },
+    risk: { depositUsd: setting("deposit_usd"), riskPct: setting("risk_per_trade_pct") ?? 0.5 },
   });
 });
 

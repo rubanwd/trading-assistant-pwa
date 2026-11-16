@@ -46,7 +46,7 @@ export interface BacktestConfig {
 /** Стартові налаштування, як у міграціях. */
 export const DEFAULT_CONFIG: Omit<BacktestConfig, "from" | "to"> = {
   minStopPct: 1,
-  maxActive: 3,
+  maxActive: 6,
   cooldownHours: 6,
   maxCandidatesPerScan: 3,
   maxHoldHours: 336,

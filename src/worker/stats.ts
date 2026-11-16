@@ -247,7 +247,7 @@ export async function loadStats(db: D1Database, opts: { from: string | null; now
       .bind(monthStart(opts.now))
       .all<{ pipeline: string; usd: number; calls: number }>(),
     setting<number | null>("llm_budget_usd", null),
-    setting("risk_per_trade_pct", 1),
+    setting("risk_per_trade_pct", 0.5),
     db.prepare("SELECT MIN(created_at) AS at FROM signals WHERE status != 'rejected' AND created_at >= ?").bind(from).first<{ at: string | null }>(),
   ]);
 
