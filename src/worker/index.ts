@@ -147,7 +147,7 @@ app.get("/api/signals/:id{[0-9]+}", async (c) => {
   const row = await db.prepare(`SELECT ${SIGNAL_COLUMNS}, reasoning, playbook_version FROM signals WHERE id = ?`).bind(id).first<Record<string, unknown> & { reasoning: string | null }>();
   if (!row) return c.json({ error: "not found" }, 404);
   const [events, journal, settings] = await Promise.all([
-    db.prepare("SELECT ts, type, price FROM signal_events WHERE signal_id = ? AND type != 'push' ORDER BY id").bind(id).all(),
+    db.prepare("SELECT ts, type, price FROM signal_events WHERE signal_id = ? AND type NOT IN ('push', 'push_position') ORDER BY id").bind(id).all(),
     db.prepare("SELECT id, ts, action, note, entry, exit, size FROM journal WHERE signal_id = ? ORDER BY id DESC").bind(id).all(),
     db.prepare("SELECT key, value FROM settings WHERE key IN ('deposit_usd', 'risk_per_trade_pct')").all<{ key: string; value: string }>(),
   ]);

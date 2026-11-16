@@ -81,7 +81,7 @@ export const SETTINGS: SettingSpec[] = [
     key: "quiet_hours",
     group: "Звіти й сповіщення",
     label: "Тихі години",
-    help: "У цей час сповіщення про сигнали не надсилаються.",
+    help: "У цей час сповіщення про нові сигнали не надсилаються. Стоп і вихід із позиції приходять завжди.",
     kind: "quiet",
     check: (v) => {
       if (v === null) return ok(null);
@@ -90,7 +90,7 @@ export const SETTINGS: SettingSpec[] = [
       return ok({ from: q.from, to: q.to });
     },
   },
-  { key: "max_signal_pushes_per_day", group: "Звіти й сповіщення", label: "Сповіщень про сигнали на добу", kind: "number", check: num(0, 50, true) },
+  { key: "max_signal_pushes_per_day", group: "Звіти й сповіщення", label: "Сповіщень про нові сигнали на добу", help: "Стоп і вихід із позиції приходять завжди й цей ліміт не витрачають.", kind: "number", check: num(0, 50, true) },
   {
     key: "timezone",
     group: "Звіти й сповіщення",

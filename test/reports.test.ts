@@ -6,7 +6,7 @@ import { decodeEntities, newsHash, parseFeed } from "../src/worker/news/rss";
 import { sanitizeTriage, triageSchema } from "../src/worker/news/triage";
 import { parseSubscription, sendPush } from "../src/worker/push";
 import { reportSchema, sanitizeReport } from "../src/worker/report/schema";
-import { clock, dueReports, localTime, parseClock } from "../src/worker/time";
+import { clock, dueReports, inQuietHours, localTime, parseClock } from "../src/worker/time";
 import { candles } from "./helpers";
 
 describe("час звітів", () => {
@@ -37,6 +37,19 @@ describe("час звітів", () => {
     expect(parseClock("07:30")).toBe(450);
     expect(parseClock("24:00")).toBeNull();
     expect(dueReports(Date.UTC(2026, 10, 12, 5, 30), kyiv, { morning: "зранку", evening: "20:30" })).toEqual([]);
+  });
+
+  it("тихі години, зокрема через північ", () => {
+    const night = { from: "23:00", to: "07:00" };
+    expect(inQuietHours(23 * 60, night)).toBe(true);
+    expect(inQuietHours(3 * 60, night)).toBe(true);
+    expect(inQuietHours(7 * 60, night)).toBe(false);
+    expect(inQuietHours(12 * 60, night)).toBe(false);
+    expect(inQuietHours(13 * 60, { from: "12:00", to: "14:00" })).toBe(true);
+    expect(inQuietHours(14 * 60, { from: "12:00", to: "14:00" })).toBe(false);
+    expect(inQuietHours(3 * 60, null)).toBe(false);
+    expect(inQuietHours(3 * 60, { from: "07:00", to: "07:00" })).toBe(false);
+    expect(inQuietHours(3 * 60, { from: "ніч", to: "07:00" })).toBe(false);
   });
 });
 

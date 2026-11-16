@@ -50,7 +50,7 @@ import {
 import { replay, type EventType } from "./signals/track";
 import { SETUP_NAME, type Candidate, type SetupId, type SignalStatus } from "./signals/types";
 import type { Snapshot } from "./snapshot";
-import { clock, dueReports, dueWeekly, localTime, parseClock, type ReportKind, type ReportTimes } from "./time";
+import { clock, dueReports, dueWeekly, inQuietHours, localTime, type ReportKind, type ReportTimes } from "./time";
 
 export interface ProbeTarget {
   name: string;
@@ -946,7 +946,7 @@ export class Engine extends DurableObject<Env> {
       const lastEvent = [...fresh].reverse().find((e) => text[e.type]);
       if (lastEvent) {
         const [title, body] = text[lastEvent.type]!;
-        await this.signalPush(sig.id, { title, body, url: `/?signal=${sig.id}`, tag: `signal-${sig.id}` }, now);
+        await this.signalPush(sig.id, { title, body, url: `/?signal=${sig.id}`, tag: `signal-${sig.id}` }, now, "position");
       }
     }
     await this.trackShadows(now, maxHoldMs, fees);
@@ -1166,22 +1166,27 @@ export class Engine extends DurableObject<Env> {
   }
 
   /**
-   * Сповіщення про сигнал: не в тихі години і не більше ліміту на місцеву добу.
-   * Надіслане лягає в signal_events подією push, за нею і рахується ліміт.
+   * Сповіщення про сигнал.
+   * - kind "signal" (новий сигнал): не в тихі години і не більше ліміту на місцеву добу. Надіслане лягає
+   *   в signal_events подією push, за нею і рахується ліміт.
+   * - kind "position" (стоп, вихід за каналом, закриття за часом): завжди, бо це команда закрити відкриту позицію,
+   *   а іншого способу дізнатися про вихід немає. Пишеться подією push_position і ліміт не витрачає.
    */
-  private async signalPush(signalId: number, message: PushMessage, now: number): Promise<void> {
+  private async signalPush(signalId: number, message: PushMessage, now: number, kind: "signal" | "position" = "signal"): Promise<void> {
+    if (kind === "position") {
+      await this.push(message);
+      await this.env.DB.prepare("INSERT INTO signal_events (signal_id, ts, type, price) VALUES (?, ?, 'push_position', NULL)")
+        .bind(signalId, new Date(now).toISOString())
+        .run();
+      return;
+    }
     const [timezone, quiet, limit] = await Promise.all([
       this.setting("timezone", "Europe/Kyiv"),
       this.setting<{ from?: string; to?: string } | null>("quiet_hours", null),
       this.setting("max_signal_pushes_per_day", 5),
     ]);
     const local = localTime(now, timezone);
-    const from = parseClock(quiet?.from ?? "");
-    const to = parseClock(quiet?.to ?? "");
-    if (from !== null && to !== null && from !== to) {
-      const m = local.minutes;
-      if (from < to ? m >= from && m < to : m >= from || m < to) return;
-    }
+    if (inQuietHours(local.minutes, quiet)) return;
     const dayStart = new Date(now - local.minutes * 60_000).toISOString();
     const sent = await this.env.DB.prepare("SELECT COUNT(*) AS n FROM signal_events WHERE type = 'push' AND ts >= ?").bind(dayStart).first<{ n: number }>();
     if ((sent?.n ?? 0) >= limit) return;
