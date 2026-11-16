@@ -6,7 +6,7 @@ import { parseSubscription } from "./push";
 import { SETTINGS, validatePlaybook, validateSettings } from "../shared/settings";
 import { AGENTS, AI_KEYS, aiFromSettings, DEFAULT_AI, validateAi, type AgentConfig, type AiConfig, type ModelInfo } from "../shared/ai";
 import { PIPELINE_AGENT } from "./llm";
-import { PLAYBOOK_V1 } from "./signals/review";
+import { PLAYBOOK_DEFAULT } from "./signals/review";
 import { calibration, hit, loadStats } from "./stats";
 
 export { Engine } from "./engine";
@@ -122,20 +122,19 @@ app.post("/api/reports/run", async (c) => {
 });
 
 const SIGNAL_COLUMNS =
-  "id, created_at, symbol, side, setup, entry_low, entry_high, stop, tp1, tp2, rr, p_analyst, p_skeptic, status, expires_at, result_r, fee_r, resolved_at, shadow_status, shadow_r";
+  "id, created_at, symbol, side, setup, entry_low, entry_high, stop, tp1, tp2, rr, p_analyst, p_skeptic, status, expires_at, result_r, fee_r, resolved_at, shadow_status, shadow_r, hit, shadow_hit";
 
-/** Сигнали: open (чекають входу або активні), closed (із результатом), rejected (відхилені моделлю). */
+/** Сигнали: open (позиція відкрита), closed (із результатом), rejected (відхилені моделлю). */
 app.get("/api/signals", async (c) => {
   const where: Record<string, string> = {
     open: "status IN ('pending', 'active')",
-    closed: "status IN ('tp1', 'tp2', 'stopped', 'expired')",
+    closed: "status IN ('exited', 'stopped', 'tp1', 'tp2', 'expired')",
     rejected: "status = 'rejected'",
   };
   const scope = c.req.query("scope") ?? "open";
   if (!where[scope]) return c.json({ error: "scope must be open, closed or rejected" }, 400);
   const rows = await c.env.DB.prepare(
-    `SELECT ${SIGNAL_COLUMNS}, (SELECT action FROM journal WHERE signal_id = signals.id ORDER BY id DESC LIMIT 1) AS action,
-       EXISTS (SELECT 1 FROM signal_events WHERE signal_id = signals.id AND type = 'tp1') AS tp1_hit
+    `SELECT ${SIGNAL_COLUMNS}, (SELECT action FROM journal WHERE signal_id = signals.id ORDER BY id DESC LIMIT 1) AS action
      FROM signals WHERE ${where[scope]} ORDER BY created_at DESC LIMIT 50`,
   ).all();
   return c.json({ signals: rows.results });
@@ -148,7 +147,7 @@ app.get("/api/signals/:id{[0-9]+}", async (c) => {
   const row = await db.prepare(`SELECT ${SIGNAL_COLUMNS}, reasoning, playbook_version FROM signals WHERE id = ?`).bind(id).first<Record<string, unknown> & { reasoning: string | null }>();
   if (!row) return c.json({ error: "not found" }, 404);
   const [events, journal, settings] = await Promise.all([
-    db.prepare("SELECT ts, type, price FROM signal_events WHERE signal_id = ? AND type != 'push' ORDER BY id").bind(id).all(),
+    db.prepare("SELECT ts, type, price FROM signal_events WHERE signal_id = ? AND type NOT IN ('push', 'push_position') ORDER BY id").bind(id).all(),
     db.prepare("SELECT id, ts, action, note, entry, exit, size FROM journal WHERE signal_id = ? ORDER BY id DESC").bind(id).all(),
     db.prepare("SELECT key, value FROM settings WHERE key IN ('deposit_usd', 'risk_per_trade_pct')").all<{ key: string; value: string }>(),
   ]);
@@ -158,15 +157,15 @@ app.get("/api/signals/:id{[0-9]+}", async (c) => {
   };
   // «Кожне число пояснює себе»: як часто збувались сигнали з такою самою оцінкою.
   const history = await db
-    .prepare("SELECT p_analyst, p_skeptic, status, shadow_status FROM signals WHERE id != ? AND (p_analyst IS NOT NULL OR p_skeptic IS NOT NULL)")
+    .prepare("SELECT p_analyst, p_skeptic, status, hit, shadow_hit FROM signals WHERE id != ? AND (p_analyst IS NOT NULL OR p_skeptic IS NOT NULL)")
     .bind(id)
-    .all<{ p_analyst: number | null; p_skeptic: number | null; status: string; shadow_status: string | null }>();
+    .all<{ p_analyst: number | null; p_skeptic: number | null; status: string; hit: number | null; shadow_hit: number | null }>();
   const similar = (key: "p_analyst" | "p_skeptic") => {
     const p = row[key] as number | null;
     if (p === null) return null;
     const from = Math.min(Math.floor(p * 10), 9) / 10;
     const pts = history.results.flatMap((h) => {
-      const o = hit(h.status === "rejected" ? h.shadow_status : h.status);
+      const o = hit(h);
       const q = h[key];
       return o === null || q === null || q < from || q >= from + 0.1 ? [] : [{ p: q, hit: o }];
     });
@@ -179,7 +178,7 @@ app.get("/api/signals/:id{[0-9]+}", async (c) => {
     reasoning: row.reasoning ? JSON.parse(row.reasoning) : null,
     events: events.results,
     journal: journal.results,
-    risk: { depositUsd: setting("deposit_usd"), riskPct: setting("risk_per_trade_pct") ?? 1 },
+    risk: { depositUsd: setting("deposit_usd"), riskPct: setting("risk_per_trade_pct") ?? 0.5 },
   });
 });
 
@@ -249,7 +248,7 @@ app.get("/api/playbook", async (c) => {
   const active = versions.results.find((v) => v.active === 1) ?? null;
   const days = minDays ? Number(JSON.parse(minDays.value)) : 14;
   return c.json({
-    active: active ? { version: active.version, created_at: active.created_at, rules: JSON.parse(active.content) } : { version: null, created_at: null, rules: PLAYBOOK_V1 },
+    active: active ? { version: active.version, created_at: active.created_at, rules: JSON.parse(active.content) } : { version: null, created_at: null, rules: PLAYBOOK_DEFAULT },
     versions: versions.results.map(({ content: _content, ...v }) => v),
     nextAllowedAt: active ? new Date(Date.parse(active.created_at) + days * 86_400_000).toISOString() : null,
   });

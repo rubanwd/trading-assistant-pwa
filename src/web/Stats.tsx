@@ -22,7 +22,7 @@ const PIPELINE: Record<string, string> = {
   analyst: "Аналітик", skeptic: "Скептик", weekly_review: "Тижневий розбір", test: "Пробні виклики",
 };
 const FILTER: Record<string, string> = {
-  rr: "R:R нижче порога", regime: "проти режиму", market: "проти настрою ринку", duplicate: "уже є сигнал по монеті",
+  rr: "R:R нижче порога", stop: "стоп надто близько", regime: "проти режиму", market: "проти настрою ринку", duplicate: "уже є сигнал по монеті",
   cooldown: "пауза після сетапу", macro: "перед макроподією", max_active: "ліміт відкритих",
 };
 
@@ -123,7 +123,7 @@ export function StatsView({ stats }: { stats: Stats }) {
 
       <section style={card}>
         <h2 style={h2}>Воронка</h2>
-        <Row label="Сканів зі свіжою свічкою 1h" value={String(stats.funnel.scans)} />
+        <Row label="Сканів зі свіжою свічкою 4h" value={String(stats.funnel.scans)} />
         <Row label="Знайдено сетапів" value={String(stats.funnel.detected)} />
         {Object.entries(stats.funnel.filtered)
           .sort((a, b) => b[1] - a[1])

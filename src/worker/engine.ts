@@ -31,14 +31,14 @@ import { reportInput, type NewsField, type PriorForecast } from "./report/input"
 import { reportSchema, reportSystem, sanitizeReport, type ReportContent } from "./report/schema";
 import { CANDLE_LIMIT, CHUNK_SIZE, marketFromSnapshots, scanChunk, type ChunkResult } from "./scan";
 import { CachedMarket, SqlCandleStorage } from "./market/cache";
-import { entryMid, feeR, positionSize } from "../shared/risk";
-import { detect } from "./signals/detectors";
+import { feeR, positionSize, stopDistancePct, type Fees } from "../shared/risk";
+import { detect, EXIT_BARS } from "./signals/detectors";
 import { candidateKey, minutesToMacro, reject, type Rejection } from "./signals/filter";
 import {
   ANALYST_SCHEMA,
   ANALYST_SYSTEM,
   decide,
-  PLAYBOOK_V1,
+  PLAYBOOK_DEFAULT,
   reviewInput,
   sanitizeAnalyst,
   sanitizeSkeptic,
@@ -50,7 +50,7 @@ import {
 import { replay, type EventType } from "./signals/track";
 import { SETUP_NAME, type Candidate, type SetupId, type SignalStatus } from "./signals/types";
 import type { Snapshot } from "./snapshot";
-import { clock, dueReports, dueWeekly, localTime, parseClock, type ReportKind, type ReportTimes } from "./time";
+import { clock, dueReports, dueWeekly, inQuietHours, localTime, type ReportKind, type ReportTimes } from "./time";
 
 export interface ProbeTarget {
   name: string;
@@ -130,11 +130,12 @@ interface SignalRow {
   entry_low: number;
   entry_high: number;
   stop: number;
-  tp1: number;
+  tp1: number | null;
   tp2: number | null;
-  rr: number;
+  rr: number | null;
   status: SignalStatus;
   expires_at: string;
+  hit: 0 | 1 | null;
 }
 
 const HOUR = 3_600_000;
@@ -900,72 +901,55 @@ export class Engine extends DurableObject<Env> {
     state.steps.unshift(...state.candidates.map((_, i) => `review:${i}`));
   }
 
-  /** Вхід, ціль, стоп або прострочення для кожного відкритого сигналу. Повертає кількість змін. */
+  /** Стоп, вихід за каналом або закриття за часом для кожного відкритого сигналу. Повертає кількість змін. */
   private async trackSignals(now: number): Promise<number> {
     const db = this.env.DB;
     const open = await db
-      .prepare("SELECT id, created_at, symbol, side, setup, entry_low, entry_high, stop, tp1, tp2, rr, status, expires_at FROM signals WHERE status IN ('pending', 'active') ORDER BY id")
+      .prepare("SELECT id, created_at, symbol, side, setup, entry_low, entry_high, stop, tp1, tp2, rr, status, expires_at, hit FROM signals WHERE status IN ('pending', 'active') ORDER BY id")
       .all<SignalRow>();
-    const maxHoldMs = (await this.setting("signal_max_hold_hours", 48)) * HOUR;
-    const feePct = await this.setting("fee_pct_per_side", 0.05);
+    const maxHoldMs = (await this.setting("signal_max_hold_hours", 336)) * HOUR;
+    const fees: Fees = { makerPct: await this.setting("fee_maker_pct", 0.02), takerPct: await this.setting("fee_taker_pct", 0.05) };
     let updated = 0;
     const market = await this.market();
     for (const sig of open.results) {
       // Свічки з кешу: якщо монета в списку, скан їх щойно оновив, і біржу не питаємо.
-      const candles = await market.candles(sig.symbol, "15m", CANDLE_LIMIT);
-      const res = replay(
-        {
-          side: sig.side,
-          entryLow: sig.entry_low,
-          entryHigh: sig.entry_high,
-          stop: sig.stop,
-          tp1: sig.tp1,
-          tp2: sig.tp2,
-          createdAt: Date.parse(sig.created_at),
-          expiresAt: Date.parse(sig.expires_at),
-        },
-        candles,
-        now,
-        maxHoldMs,
-      );
+      const [h1, h4] = await Promise.all([market.candles(sig.symbol, "1h", CANDLE_LIMIT), market.candles(sig.symbol, "4h", CANDLE_LIMIT)]);
+      const res = replay({ side: sig.side, entry: sig.entry_low, stop: sig.stop, createdAt: Date.parse(sig.created_at) }, h1, h4, maxHoldMs);
       const known = await db.prepare("SELECT type FROM signal_events WHERE signal_id = ?").bind(sig.id).all<{ type: string }>();
       const have = new Set(known.results.map((e) => e.type));
       const fresh = res.events.filter((e) => !have.has(e.type));
-      if (!fresh.length && res.status === sig.status) continue;
+      if (!fresh.length && res.status === sig.status && res.hit === sig.hit) continue;
       updated++;
       const insert = db.prepare("INSERT INTO signal_events (signal_id, ts, type, price) VALUES (?, ?, ?, ?)");
       await db.batch([
         ...fresh.map((e) => insert.bind(sig.id, new Date(e.ts).toISOString(), e.type, e.price)),
         db
-          .prepare("UPDATE signals SET status = ?, result_r = ?, fee_r = ?, resolved_at = ? WHERE id = ?")
+          .prepare("UPDATE signals SET status = ?, result_r = ?, fee_r = ?, resolved_at = ?, hit = ? WHERE id = ?")
           .bind(
             res.status,
             res.resultR,
-            res.resolvedAt === null ? null : feeR(entryMid(sig.entry_low, sig.entry_high), sig.stop, res.exits, feePct),
+            res.resolvedAt === null ? null : feeR(res.entry, sig.stop, res.exits, fees),
             res.resolvedAt === null ? null : new Date(res.resolvedAt).toISOString(),
+            res.hit,
             sig.id,
           ),
       ]);
       const name = `${coin(sig.symbol)} ${SIDE_NAME[sig.side]}`;
+      const signed = (r: number | null) => (r === null ? "" : `${r > 0 ? "+" : r < 0 ? "−" : ""}${Math.abs(r)}R`);
+      // Про вхід сповіщає сам сигнал: вхід за ринком у момент публікації.
       const text: Partial<Record<EventType, [title: string, body: string]>> = {
-        entry: [`Вхід: ${name}`, `Ціна в зоні входу ${sig.entry_low}–${sig.entry_high}. Стоп ${sig.stop}, ціль ${sig.tp1}.`],
-        tp1:
-          sig.tp2 === null
-            ? [`Ціль: ${name}`, `Ціна дійшла до ${sig.tp1}. Результат +${res.resultR ?? sig.rr}R.`]
-            : [`Ціль 1: ${name}`, `Ціна дійшла до ${sig.tp1}. Половину зафіксовано, стоп решти в беззбиток, далі ціль ${sig.tp2}.`],
-        tp2: [`Ціль 2: ${name}`, `Ціна дійшла до ${sig.tp2}. Результат +${res.resultR}R.`],
-        breakeven: [`Беззбиток: ${name}`, `Решта позиції закрилась у беззбиток. Результат +${res.resultR}R.`],
-        stop: [`Стоп: ${name}`, `Ціна дійшла до стопа ${sig.stop}. Результат −1R.`],
-        timeout: [`Закрито за часом: ${name}`, `Сигнал не дійшов ні до цілі, ні до стопа. Результат ${res.resultR}R.`],
+        stop: [`Стоп: ${name}`, `Ціна дійшла до стопа ${sig.stop}. Результат ${signed(res.resultR)}.`],
+        exit: [`Вихід: ${name}`, `Свічка 4h закрилась за каналом ${EXIT_BARS} свічок: закрий позицію. Результат ${signed(res.resultR)}.`],
+        timeout: [`Закрито за часом: ${name}`, `Позиція відкрита найдовший дозволений час. Результат ${signed(res.resultR)}.`],
       };
       // Якщо за один запуск сталося кілька подій, сповіщаємо лише про останню.
       const lastEvent = [...fresh].reverse().find((e) => text[e.type]);
       if (lastEvent) {
         const [title, body] = text[lastEvent.type]!;
-        await this.signalPush(sig.id, { title, body, url: `/?signal=${sig.id}`, tag: `signal-${sig.id}` }, now);
+        await this.signalPush(sig.id, { title, body, url: `/?signal=${sig.id}`, tag: `signal-${sig.id}` }, now, "position");
       }
     }
-    await this.trackShadows(now, maxHoldMs, feePct);
+    await this.trackShadows(now, maxHoldMs, fees);
     return updated;
   }
 
@@ -973,31 +957,26 @@ export class Engine extends DurableObject<Env> {
    * Тіньовий супровід відхилених моделлю кандидатів: ті самі правила, але без подій і сповіщень.
    * shadow_r зберігається вже після комісій. Потрібен, щоб калібрувати оцінки й бачити, що відсіяв скептик.
    */
-  private async trackShadows(now: number, maxHoldMs: number, feePct: number): Promise<void> {
+  private async trackShadows(now: number, maxHoldMs: number, fees: Fees): Promise<void> {
     const db = this.env.DB;
     const rows = await db
       .prepare(
         `SELECT id, created_at, symbol, side, entry_low, entry_high, stop, tp1, tp2, expires_at FROM signals
          WHERE status = 'rejected' AND (shadow_status IS NULL OR shadow_status IN ('pending', 'active')) AND created_at >= ?`,
       )
-      .bind(new Date(now - 4 * 24 * HOUR).toISOString())
+      .bind(new Date(now - maxHoldMs - 24 * HOUR).toISOString())
       .all<SignalRow>();
-    const update = db.prepare("UPDATE signals SET shadow_status = ?, shadow_r = ? WHERE id = ?");
+    const update = db.prepare("UPDATE signals SET shadow_status = ?, shadow_r = ?, shadow_hit = ? WHERE id = ?");
     const statements: D1PreparedStatement[] = [];
     const market = await this.market();
     const watched = new Set(await this.watchlist());
     for (const sig of rows.results) {
       // Тінь ведемо лише для монет зі списку: їхні свічки вже в кеші, зайвих запитів до біржі немає.
       if (!watched.has(sig.symbol)) continue;
-      const candles = await market.candles(sig.symbol, "15m", CANDLE_LIMIT);
-      const res = replay(
-        { side: sig.side, entryLow: sig.entry_low, entryHigh: sig.entry_high, stop: sig.stop, tp1: sig.tp1, tp2: sig.tp2, createdAt: Date.parse(sig.created_at), expiresAt: Date.parse(sig.expires_at) },
-        candles,
-        now,
-        maxHoldMs,
-      );
-      const shadowR = res.resultR === null ? null : Number((res.resultR - feeR(entryMid(sig.entry_low, sig.entry_high), sig.stop, res.exits, feePct)).toFixed(3));
-      statements.push(update.bind(res.status, shadowR, sig.id));
+      const [h1, h4] = await Promise.all([market.candles(sig.symbol, "1h", CANDLE_LIMIT), market.candles(sig.symbol, "4h", CANDLE_LIMIT)]);
+      const res = replay({ side: sig.side, entry: sig.entry_low, stop: sig.stop, createdAt: Date.parse(sig.created_at) }, h1, h4, maxHoldMs);
+      const shadowR = res.resultR === null ? null : Number((res.resultR - feeR(res.entry, sig.stop, res.exits, fees)).toFixed(3));
+      statements.push(update.bind(res.status, shadowR, res.hit, sig.id));
     }
     if (statements.length) await db.batch(statements);
   }
@@ -1010,14 +989,14 @@ export class Engine extends DurableObject<Env> {
     const db = this.env.DB;
     const rows = await db.prepare("SELECT features FROM snapshots WHERE run_id = ?").bind(scan.runId).all<{ features: string }>();
     const snapshots = rows.results.map((r) => JSON.parse(r.features) as Snapshot);
-    // Сетапи шукаємо лише на свічці 1h, що закрилась щойно: о пів на годину вона вже застаріла.
-    const fresh = snapshots.filter((s) => now - Date.parse(s.tf["1h"].closedAt) <= 20 * 60_000);
+    // Сетап шукаємо лише на свічці 4h, що закрилась щойно: наступні скани до закриття нової свічки його не шукають.
+    const fresh = snapshots.filter((s) => now - Date.parse(s.tf["4h"].closedAt) <= 20 * 60_000);
     summary.detection = fresh.length > 0;
     if (!fresh.length) return [];
 
-    const [minRr, maxActive, blackout, macro, cooldown, perScan] = await Promise.all([
-      this.setting("min_rr", 2),
-      this.setting("max_active_signals", 3),
+    const [minStopPct, maxActive, blackout, macro, cooldown, perScan] = await Promise.all([
+      this.setting("min_stop_pct", 1),
+      this.setting("max_active_signals", 6),
       this.setting("macro_blackout_hours", 2),
       this.setting<unknown>("macro_events", []),
       this.setting("signal_cooldown_hours", 6),
@@ -1038,13 +1017,11 @@ export class Engine extends DurableObject<Env> {
     const passed: Candidate[] = [];
     for (const snap of fresh) {
       // Свічки з кешу: скан щойно їх оновив, біржу не питаємо.
-      const [h1, h4] = await Promise.all([market.candles(snap.symbol, "1h", CANDLE_LIMIT), market.candles(snap.symbol, "4h", CANDLE_LIMIT)]);
-      for (const candidate of detect(snap.symbol, h1, h4)) {
+      const h4 = await market.candles(snap.symbol, "4h", CANDLE_LIMIT);
+      for (const candidate of detect(snap.symbol, h4)) {
         summary.detected++;
         const reason = reject(candidate, {
-          minRr,
-          regime: snap.regime,
-          mood: scan.market.mood,
+          minStopPct,
           openSymbols,
           recent: recentKeys,
           minutesToMacro: toMacro,
@@ -1056,8 +1033,7 @@ export class Engine extends DurableObject<Env> {
         else passed.push(candidate);
       }
     }
-    // Найкращий за R:R кандидат на монету; до моделі йде обмежена кількість за скан.
-    passed.sort((a, b) => b.rr - a.rr);
+    // Один кандидат на монету в порядку списку монет; до моделі йде обмежена кількість за скан. Так само рахує бектест.
     return passed.filter((c, i) => passed.findIndex((x) => x.symbol === c.symbol) === i).slice(0, perScan);
   }
 
@@ -1068,11 +1044,11 @@ export class Engine extends DurableObject<Env> {
     const scan = state.scan;
     if (!candidate || !summary || !scan) return;
     const db = this.env.DB;
-    const [maxActive, macro, threshold, ttl] = await Promise.all([
-      this.setting("max_active_signals", 3),
+    const [maxActive, macro, threshold, maxHold] = await Promise.all([
+      this.setting("max_active_signals", 6),
       this.setting<unknown>("macro_events", []),
       this.setting("skeptic_threshold", 0.6),
-      this.setting("signal_ttl_hours", 12),
+      this.setting("signal_max_hold_hours", 336),
     ]);
     // Попередні кроки могли вже опублікувати сигнали: ліміт перевіряється заново.
     const open = await db.prepare("SELECT symbol FROM signals WHERE status IN ('pending', 'active')").all<{ symbol: string }>();
@@ -1106,7 +1082,7 @@ export class Engine extends DurableObject<Env> {
       const user = JSON.stringify(
         reviewInput({
           candidate,
-          rule: playbook.rules[candidate.setup] ?? PLAYBOOK_V1[candidate.setup],
+          rule: playbook.rules[candidate.setup] ?? PLAYBOOK_DEFAULT[candidate.setup],
           snapshot: JSON.parse(own.features) as Snapshot,
           btc: btcRow ? (JSON.parse(btcRow.features) as Snapshot) : null,
           market: scan.market,
@@ -1139,9 +1115,9 @@ export class Engine extends DurableObject<Env> {
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
         )
         .bind(
-          createdAt, candidate.symbol, candidate.side, candidate.setup, candidate.entryLow, candidate.entryHigh, candidate.stop,
-          candidate.tp1, candidate.tp2, candidate.rr, analyst.probability, skeptic?.probability ?? null,
-          decision.publish ? "pending" : "rejected", new Date(now + ttl * HOUR).toISOString(), decision.publish ? null : createdAt,
+          createdAt, candidate.symbol, candidate.side, candidate.setup, candidate.entry, candidate.entry, candidate.stop,
+          null, null, null, analyst.probability, skeptic?.probability ?? null,
+          decision.publish ? "active" : "rejected", new Date(now + maxHold * HOUR).toISOString(), decision.publish ? null : createdAt,
           JSON.stringify(reasoning), own.id, playbook.version,
         )
         .first<{ id: number }>();
@@ -1158,12 +1134,13 @@ export class Engine extends DurableObject<Env> {
 
   /** Текст сповіщення про новий сигнал. Розмір позиції рахує код від ризику на угоду. */
   private async signalMessage(id: number, c: Candidate): Promise<PushMessage> {
-    const [deposit, riskPct] = await Promise.all([this.setting<number | null>("deposit_usd", null), this.setting("risk_per_trade_pct", 1)]);
-    const size = deposit ? positionSize(deposit, riskPct, entryMid(c.entryLow, c.entryHigh), c.stop) : null;
+    const [deposit, riskPct] = await Promise.all([this.setting<number | null>("deposit_usd", null), this.setting("risk_per_trade_pct", 0.5)]);
+    const size = deposit ? positionSize(deposit, riskPct, c.entry, c.stop) : null;
     return {
       title: `Сигнал: ${coin(c.symbol)} ${SIDE_NAME[c.side]}`,
       body:
-        `${SETUP_NAME[c.setup]} · вхід ${c.entryLow}–${c.entryHigh} · стоп ${c.stop} · ціль ${c.tp1} · R:R ${c.rr}` +
+        `${SETUP_NAME[c.setup]} · вхід за ринком біля ${c.entry} · стоп ${c.stop} (${stopDistancePct(c.entry, c.stop).toFixed(1)}%) · ` +
+        `вихід: закриття 4h за каналом ${EXIT_BARS} свічок` +
         (size ? ` · розмір $${Math.round(size.notionalUsd)}` : ""),
       url: `/?signal=${id}`,
       tag: `signal-${id}`,
@@ -1183,28 +1160,33 @@ export class Engine extends DurableObject<Env> {
     }
     const created = await db
       .prepare("INSERT INTO playbook_versions (created_at, content, active) VALUES (?, ?, 1) RETURNING version")
-      .bind(new Date().toISOString(), JSON.stringify(PLAYBOOK_V1))
+      .bind(new Date().toISOString(), JSON.stringify(PLAYBOOK_DEFAULT))
       .first<{ version: number }>();
-    return { version: created!.version, rules: PLAYBOOK_V1 };
+    return { version: created!.version, rules: PLAYBOOK_DEFAULT };
   }
 
   /**
-   * Сповіщення про сигнал: не в тихі години і не більше ліміту на місцеву добу.
-   * Надіслане лягає в signal_events подією push, за нею і рахується ліміт.
+   * Сповіщення про сигнал.
+   * - kind "signal" (новий сигнал): не в тихі години і не більше ліміту на місцеву добу. Надіслане лягає
+   *   в signal_events подією push, за нею і рахується ліміт.
+   * - kind "position" (стоп, вихід за каналом, закриття за часом): завжди, бо це команда закрити відкриту позицію,
+   *   а іншого способу дізнатися про вихід немає. Пишеться подією push_position і ліміт не витрачає.
    */
-  private async signalPush(signalId: number, message: PushMessage, now: number): Promise<void> {
+  private async signalPush(signalId: number, message: PushMessage, now: number, kind: "signal" | "position" = "signal"): Promise<void> {
+    if (kind === "position") {
+      await this.push(message);
+      await this.env.DB.prepare("INSERT INTO signal_events (signal_id, ts, type, price) VALUES (?, ?, 'push_position', NULL)")
+        .bind(signalId, new Date(now).toISOString())
+        .run();
+      return;
+    }
     const [timezone, quiet, limit] = await Promise.all([
       this.setting("timezone", "Europe/Kyiv"),
       this.setting<{ from?: string; to?: string } | null>("quiet_hours", null),
       this.setting("max_signal_pushes_per_day", 5),
     ]);
     const local = localTime(now, timezone);
-    const from = parseClock(quiet?.from ?? "");
-    const to = parseClock(quiet?.to ?? "");
-    if (from !== null && to !== null && from !== to) {
-      const m = local.minutes;
-      if (from < to ? m >= from && m < to : m >= from || m < to) return;
-    }
+    if (inQuietHours(local.minutes, quiet)) return;
     const dayStart = new Date(now - local.minutes * 60_000).toISOString();
     const sent = await this.env.DB.prepare("SELECT COUNT(*) AS n FROM signal_events WHERE type = 'push' AND ts >= ?").bind(dayStart).first<{ n: number }>();
     if ((sent?.n ?? 0) >= limit) return;
@@ -1241,7 +1223,7 @@ export class Engine extends DurableObject<Env> {
       .all<{ ts: string; action: string | null; note: string }>();
     const settings = Object.fromEntries(
       await Promise.all(
-        ["min_rr", "skeptic_threshold", "max_active_signals", "signal_ttl_hours", "signal_max_hold_hours", "fee_pct_per_side"].map(async (k) => [k, await this.setting<unknown>(k, null)] as const),
+        ["min_stop_pct", "skeptic_threshold", "max_active_signals", "signal_max_hold_hours", "fee_maker_pct", "fee_taker_pct"].map(async (k) => [k, await this.setting<unknown>(k, null)] as const),
       ),
     );
     const input = weeklyInput({ week, allTime, playbook: { version: playbook.version, rules: playbook.rules as Record<string, string> }, settings, notes: notes.results.map((n) => ({ ...n, note: n.note.slice(0, 300) })) });

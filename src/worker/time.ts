@@ -43,6 +43,17 @@ export function parseClock(value: string): number | null {
   return m ? Number(m[1]) * 60 + Number(m[2]) : null;
 }
 
+/**
+ * Чи місцевий час (хвилини від півночі) потрапляє в тихі години. Проміжок може переходити через північ (23:00–07:00);
+ * без налаштування, з некоректним часом або з однаковими початком і кінцем тихих годин немає.
+ */
+export function inQuietHours(minutes: number, quiet: { from?: string; to?: string } | null): boolean {
+  const from = parseClock(quiet?.from ?? "");
+  const to = parseClock(quiet?.to ?? "");
+  if (from === null || to === null || from === to) return false;
+  return from < to ? minutes >= from && minutes < to : minutes >= from || minutes < to;
+}
+
 /** Скільки після призначеного часу звіт ще можна наздогнати, якщо запуск пропущено. */
 export const REPORT_WINDOW_MIN = 180;
 

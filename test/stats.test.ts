@@ -7,7 +7,7 @@ import { sanitizeWeekly, weeklyBody } from "../src/worker/weekly";
 let id = 0;
 const sig = (over: Partial<SignalStatRow> = {}): SignalStatRow => ({
   id: ++id, created_at: "2026-11-10T10:00:00.000Z", resolved_at: null, setup: "trend_pullback", status: "pending",
-  result_r: null, fee_r: null, p_analyst: 0.55, p_skeptic: 0.62, playbook_version: 1, shadow_status: null, shadow_r: null, action: null, ...over,
+  result_r: null, fee_r: null, p_analyst: 0.55, p_skeptic: 0.62, playbook_version: 1, shadow_status: null, shadow_r: null, hit: null, shadow_hit: null, action: null, ...over,
 });
 const input = (signals: SignalStatRow[], over: Partial<StatsInput> = {}): StatsInput => ({
   signals, forecasts: [], funnel: [], spend: [], budgetUsd: 25, riskPct: 1, btc: { start: null, end: null }, from: null, to: "2026-11-12T00:00:00.000Z", ...over,
@@ -15,13 +15,13 @@ const input = (signals: SignalStatRow[], over: Partial<StatsInput> = {}): StatsI
 
 describe("статистика", () => {
   const rows = [
-    sig({ status: "tp1", result_r: 2, fee_r: 0.05, action: "taken" }),
-    sig({ status: "tp2", result_r: 3, fee_r: 0.06, setup: "breakout_retest", action: "skipped" }),
-    sig({ status: "stopped", result_r: -1, fee_r: 0.05, action: "taken" }),
+    sig({ status: "exited", result_r: 2, fee_r: 0.05, hit: 1, action: "taken" }),
+    sig({ status: "exited", result_r: 3, fee_r: 0.06, hit: 1, setup: "breakout_retest", action: "skipped" }),
+    sig({ status: "stopped", result_r: -1, fee_r: 0.05, hit: 0, action: "taken" }),
     sig({ status: "expired", result_r: null }), // без входу: не угода
     sig({ status: "expired", result_r: -0.4, fee_r: 0.04 }), // закрито за часом
     sig({ status: "active" }),
-    sig({ status: "rejected", shadow_status: "stopped", shadow_r: -1.05, p_skeptic: 0.4 }),
+    sig({ status: "rejected", shadow_status: "stopped", shadow_r: -1.05, shadow_hit: 0, p_skeptic: 0.4 }),
     sig({ status: "rejected", shadow_status: "pending", shadow_r: null }),
   ];
   const s = computeStats(input(rows, { btc: { start: 100_000, end: 95_000 }, riskPct: 1 }));
@@ -51,10 +51,11 @@ describe("статистика", () => {
     expect(s.rejected).toMatchObject({ count: 2, closed: 1, totalR: -1.05 });
   });
 
-  it("калібрування: ціль раніше за стоп; прострочені не рахуються; відхилені за тіньовим результатом", () => {
-    expect(hit("tp2")).toBe(1);
-    expect(hit("expired")).toBeNull();
-    // tp1, tp2, stopped опубліковані + один тіньовий stopped
+  it("калібрування: ціна пройшла +1R до закриття; нерозв'язані не рахуються; відхилені за тінню", () => {
+    expect(hit({ status: "exited", hit: 1, shadow_hit: null })).toBe(1);
+    expect(hit({ status: "active", hit: null, shadow_hit: null })).toBeNull();
+    expect(hit({ status: "rejected", hit: null, shadow_hit: 0 })).toBe(0);
+    // два виходи з +1R, один стоп опубліковані + один тіньовий стоп
     expect(s.calibration.analyst.n).toBe(4);
     expect(s.calibration.skeptic.bins).toEqual([
       { from: 0.4, to: 0.5, n: 1, predicted: 0.4, actual: 0 },
@@ -119,7 +120,7 @@ describe("налаштування", () => {
   it("приймає коректні значення й нормалізує їх", () => {
     const { values, errors } = validateSettings({
       watchlist: ["btcusdt", "ETHUSDT", "BTCUSDT"],
-      min_rr: 2.5,
+      min_stop_pct: 1.5,
       quiet_hours: null,
       macro_events: [{ at: "2026-12-16T19:00:00Z", name: "ФРС" }, "2026-12-10T13:30:00Z"],
       report_times: { morning: "07:30", evening: "20:30", extra: 1 },
@@ -134,29 +135,29 @@ describe("налаштування", () => {
 
   it("відхиляє некоректні значення й невідомі ключі", () => {
     const { values, errors } = validateSettings({
-      min_rr: 0.5, skeptic_threshold: 60, max_active_signals: 2.5, watchlist: ["BTC"], quiet_hours: { from: "25:00", to: "07:00" },
+      min_stop_pct: -1, skeptic_threshold: 60, max_active_signals: 2.5, watchlist: ["BTC"], quiet_hours: { from: "25:00", to: "07:00" },
       news_feeds: [{ source: "x", url: "http://insecure.com/rss" }], timezone: "Mars/Olympus", market_source: "kraken", secret: 1,
     });
     expect(values).toEqual({});
-    expect(Object.keys(errors).sort()).toEqual(["market_source", "max_active_signals", "min_rr", "news_feeds", "quiet_hours", "secret", "skeptic_threshold", "timezone", "watchlist"]);
+    expect(Object.keys(errors).sort()).toEqual(["market_source", "max_active_signals", "min_stop_pct", "news_feeds", "quiet_hours", "secret", "skeptic_threshold", "timezone", "watchlist"]);
   });
 
   it("кожне стартове налаштування з міграцій проходить перевірку", () => {
     const defaults: Record<string, unknown> = {
-      timezone: "Europe/Kyiv", report_times: { morning: "07:30", evening: "20:30" }, risk_per_trade_pct: 1, min_rr: 2, skeptic_threshold: 0.6,
-      max_active_signals: 3, macro_blackout_hours: 2, max_signal_pushes_per_day: 5, signal_ttl_hours: 12, signal_max_hold_hours: 48,
+      timezone: "Europe/Kyiv", report_times: { morning: "07:30", evening: "20:30" }, risk_per_trade_pct: 0.5, skeptic_threshold: 0.6,
+      max_active_signals: 6, min_stop_pct: 1, macro_blackout_hours: 2, max_signal_pushes_per_day: 5, signal_max_hold_hours: 336,
       signal_cooldown_hours: 6, max_candidates_per_scan: 3, quiet_hours: { from: "23:00", to: "07:00" }, macro_events: [], deposit_usd: null,
-      fee_pct_per_side: 0.05, retention_days: 30, weekly_review_time: "12:00", playbook_min_days: 14, market_source: "auto",
+      fee_maker_pct: 0.02, fee_taker_pct: 0.05, retention_days: 30, weekly_review_time: "12:00", playbook_min_days: 14, market_source: "auto",
       watchlist: ["BTCUSDT", "ETHUSDT"], news_feeds: [{ source: "coindesk", url: "https://www.coindesk.com/arc/outboundfeeds/rss" }],
     };
     expect(validateSettings(defaults).errors).toEqual({});
     expect(SETTINGS.map((s) => s.key).sort()).toEqual(Object.keys(defaults).sort());
   });
 
-  it("правила сетапів: усі три й розумна довжина", () => {
+  it("правила сетапів: кожен активний сетап і розумна довжина", () => {
     const text = "x".repeat(60);
-    expect(validatePlaybook({ trend_pullback: text, breakout_retest: text, liquidity_sweep: text }).ok).toBe(true);
-    expect(validatePlaybook({ trend_pullback: text, breakout_retest: text })).toEqual({ ok: false, error: "liquidity_sweep: від 50 до 3000 символів" });
+    expect(validatePlaybook({ trend_breakout: text }).ok).toBe(true);
+    expect(validatePlaybook({ trend_pullback: text })).toEqual({ ok: false, error: "trend_breakout: від 50 до 3000 символів" });
     expect(validatePlaybook(null).ok).toBe(false);
   });
 });
