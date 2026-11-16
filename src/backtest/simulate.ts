@@ -3,7 +3,7 @@ import type { Candle } from "../worker/market/types";
 import { marketRegime, trend, type MarketMood, type SymbolRegime } from "../worker/regime";
 import { CANDLE_LIMIT } from "../worker/scan";
 import { detect } from "../worker/signals/detectors";
-import { candidateKey, reject, type Rejection } from "../worker/signals/filter";
+import { candidateKey, reject, shortlist, type Rejection } from "../worker/signals/filter";
 import { EXIT_BARS } from "../worker/signals/detectors";
 import { replay, type TrackResult } from "../worker/signals/track";
 import type { Candidate, SignalStatus } from "../worker/signals/types";
@@ -46,10 +46,10 @@ export interface BacktestConfig {
 /** Стартові налаштування, як у міграціях. */
 export const DEFAULT_CONFIG: Omit<BacktestConfig, "from" | "to"> = {
   minStopPct: 1,
-  maxActive: 6,
+  maxActive: 10,
   cooldownHours: 6,
-  maxCandidatesPerScan: 3,
-  maxHoldHours: 336,
+  maxCandidatesPerScan: 5,
+  maxHoldHours: 120,
   makerPct: 0.02,
   takerPct: 0.05,
   slippagePct: 0,
@@ -77,7 +77,7 @@ export interface Funnel {
   scans: number;
   detected: number;
   filtered: Partial<Record<Rejection, number>>;
-  /** Пройшли фільтр, але не потрапили в скан: другий напрям по тій самій монеті або понад ліміт кандидатів за скан. */
+  /** Пройшли фільтр, але не потрапили в скан: другий напрям по тій самій монеті або слабші за ліміт кандидатів за скан. */
   capped: number;
   published: number;
 }
@@ -223,8 +223,8 @@ export function backtest(
         else passed.push({ ...c, regime: s.regime });
       }
     }
-    // Як у рушії: один кандидат на монету в порядку списку монет, не більше ліміту за скан, ліміт відкритих перевіряється знову.
-    const chosen = passed.filter((c, i) => passed.findIndex((x) => x.symbol === c.symbol) === i).slice(0, cfg.maxCandidatesPerScan);
+    // Як у рушії: один кандидат на монету, спершу найсильніші пробої, не більше ліміту за скан; ліміт відкритих перевіряється знову.
+    const chosen = shortlist(passed, cfg.maxCandidatesPerScan);
     funnel.capped += passed.length - chosen.length;
     let openCount = open.length;
     for (const { regime, ...c } of chosen) {

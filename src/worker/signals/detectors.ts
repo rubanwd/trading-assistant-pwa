@@ -10,6 +10,10 @@ import type { Candidate } from "./types";
  *
  * Правило перевірено бектестом на трьох роках (2023-11 — 2026-10): у кожному році результат після комісій
  * не нижче нуля, тоді як попередні сетапи на 1h були збиткові в усіх трьох.
+ *
+ * Сила пробою (`quality`) рахується з тих самих вимірів: обсяг, розмах свічки й глибина пробою.
+ * На тих самих трьох роках найслабша п'ята частина кандидатів дала −0.07R на угоду, найсильніша +0.25R,
+ * тож за силою кандидати впорядковуються перед моделлю, а найслабші відсіює фільтр.
  */
 
 /** Пробій максимуму стількох попередніх свічок 4h за закриттям. */
@@ -20,6 +24,17 @@ export const EXIT_BARS = 10;
 export const STOP_ATR = 2;
 /** Лонг лише над EMA цього періоду на 4h, шорт лише під нею. */
 export const TREND_EMA = 200;
+
+const clamp = (v: number, max: number) => Math.min(max, Math.max(0, v)) / max;
+
+/**
+ * Сила пробою від 0 до 100: середнє трьох часток — обсяг свічки до середнього за 20 (до 4×),
+ * розмах свічки в ATR (до 3) і закриття за межею каналу в ATR (до 1.5). Більше означає сильніший пробій.
+ */
+export function quality(facts: Record<string, number>): number {
+  const parts = clamp(facts.volume_ratio ?? 0, 4) + clamp(facts.candle_range_atr ?? 0, 3) + clamp(facts.breakout_atr ?? 0, 1.5);
+  return Math.round((parts / 3) * 100);
+}
 
 const mirror = (candles: Candle[]): Candle[] =>
   candles.map((c) => ({ ...c, open: -c.open, high: -c.low, low: -c.high, close: -c.close }));
@@ -61,14 +76,8 @@ export function detect(symbol: string, c4h: Candle[]): Candidate[] {
     const sign = side === "long" ? 1 : -1;
     const raw = breakout(sign === 1 ? c4h : mirror(c4h));
     if (!raw) continue;
-    out.push({
-      symbol,
-      side,
-      setup: "trend_breakout",
-      entry: cur.close,
-      stop: price(sign * raw.stop),
-      facts: Object.fromEntries(Object.entries(raw.facts).map(([k, v]) => [k, Number(v.toFixed(2))])),
-    });
+    const facts = Object.fromEntries(Object.entries(raw.facts).map(([k, v]) => [k, Number(v.toFixed(2))]));
+    out.push({ symbol, side, setup: "trend_breakout", entry: cur.close, stop: price(sign * raw.stop), quality: quality(facts), facts });
   }
   return out;
 }

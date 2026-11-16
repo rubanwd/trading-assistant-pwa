@@ -3,8 +3,8 @@ import { entryMid, feeR, positionSize, riskReward } from "../src/shared/risk";
 import { DEFAULT_AI } from "../src/shared/ai";
 import { decideModel } from "../src/worker/llm";
 import { atr, last } from "../src/worker/indicators";
-import { detect, STOP_ATR } from "../src/worker/signals/detectors";
-import { candidateKey, minutesToMacro, reject, type FilterContext } from "../src/worker/signals/filter";
+import { detect, quality, STOP_ATR } from "../src/worker/signals/detectors";
+import { candidateKey, minutesToMacro, reject, shortlist, type FilterContext } from "../src/worker/signals/filter";
 import { ANALYST_SCHEMA, decide, PLAYBOOK_DEFAULT, reviewInput, sanitizeAnalyst, sanitizeSkeptic, SKEPTIC_SCHEMA } from "../src/worker/signals/review";
 import { exitLevel, replay, type TrackedSignal } from "../src/worker/signals/track";
 import type { Candidate } from "../src/worker/signals/types";
@@ -78,7 +78,7 @@ describe("детектор трендового пробою", () => {
 });
 
 describe("фільтр", () => {
-  const c: Candidate = { symbol: "ETHUSDT", side: "long", setup: "trend_breakout", entry: 100, stop: 96, facts: {} };
+  const c: Candidate = { symbol: "ETHUSDT", side: "long", setup: "trend_breakout", entry: 100, stop: 96, quality: 50, facts: {} };
   const ctx = (over: Partial<FilterContext> = {}): FilterContext => ({
     minStopPct: 1,
     openSymbols: new Set(),
@@ -108,6 +108,39 @@ describe("фільтр", () => {
     expect(reject(c, ctx({ minutesToMacro: 120 }))).toBe("macro");
     expect(reject(c, ctx({ minutesToMacro: 121 }))).toBeNull();
     expect(reject(c, ctx({ openCount: 3 }))).toBe("max_active");
+  });
+
+  it("відсіює слабкий пробій: обсяг нижче середнього або розмах свічки менше 1 ATR", () => {
+    const strong = { volume_ratio: 1, candle_range_atr: 1, ema200_distance_atr: 4 };
+    expect(reject({ ...c, facts: strong }, ctx())).toBeNull();
+    expect(reject({ ...c, facts: { ...strong, volume_ratio: 0.99 } }, ctx())).toBe("weak");
+    expect(reject({ ...c, facts: { ...strong, candle_range_atr: 0.99 } }, ctx())).toBe("weak");
+  });
+
+  it("відсіює вхід навздогін: 9 ATR і далі від EMA200, в обох напрямах", () => {
+    const facts = { volume_ratio: 2, candle_range_atr: 2, ema200_distance_atr: 8.99 };
+    expect(reject({ ...c, facts }, ctx())).toBeNull();
+    expect(reject({ ...c, facts: { ...facts, ema200_distance_atr: 9 } }, ctx())).toBe("extended");
+    expect(reject({ ...c, side: "short", stop: 104, facts: { ...facts, ema200_distance_atr: 11 } }, ctx())).toBe("extended");
+  });
+
+  it("сила пробою: від 0 до 100, росте з обсягом, розмахом і глибиною пробою", () => {
+    expect(quality({ volume_ratio: 0, candle_range_atr: 0, breakout_atr: 0 })).toBe(0);
+    expect(quality({ volume_ratio: 4, candle_range_atr: 3, breakout_atr: 1.5 })).toBe(100);
+    expect(quality({ volume_ratio: 40, candle_range_atr: 30, breakout_atr: 15 })).toBe(100);
+    expect(quality({ volume_ratio: 2, candle_range_atr: 1.5, breakout_atr: 0.75 })).toBe(50);
+    expect(quality({ volume_ratio: 2, candle_range_atr: 1.5, breakout_atr: 0.2 })).toBeLessThan(50);
+    expect(quality({})).toBe(0);
+  });
+
+  it("до моделі йдуть найсильніші: один на монету, не більше ліміту за скан", () => {
+    const of = (symbol: string, q: number, side: Candidate["side"] = "long"): Candidate => ({ ...c, symbol, side, quality: q });
+    const passed = [of("BTCUSDT", 30), of("ETHUSDT", 70), of("SOLUSDT", 55), of("ETHUSDT", 80, "short"), of("XRPUSDT", 10)];
+    expect(shortlist(passed, 3).map((x) => `${x.symbol} ${x.side} ${x.quality}`)).toEqual(["ETHUSDT short 80", "SOLUSDT long 55", "BTCUSDT long 30"]);
+    expect(shortlist(passed, 10)).toHaveLength(4);
+    expect(shortlist(passed, 0)).toEqual([]);
+    // Вхідний список не змінюється: рушій рахує за ним воронку.
+    expect(passed[0]!.symbol).toBe("BTCUSDT");
   });
 
   it("рахує хвилини до найближчої майбутньої макроподії", () => {
@@ -216,14 +249,14 @@ describe("супровід сигналу", () => {
 
 describe("вхід для моделі", () => {
   it("кандидат без цілі: вхід, стоп, рівень +1R і правило виходу", () => {
-    const candidate: Candidate = { symbol: "ETHUSDT", side: "short", setup: "trend_breakout", entry: 2000, stop: 2100, facts: { breakout_atr: 0.4 } };
+    const candidate: Candidate = { symbol: "ETHUSDT", side: "short", setup: "trend_breakout", entry: 2000, stop: 2100, quality: 40, facts: { breakout_atr: 0.4 } };
     const c = ohlc(trendBreakoutSeries());
     const snapshot = buildSnapshot({ symbol: "ETHUSDT", now: 1_800_000_000_000, candles: { "15m": c, "1h": c, "4h": c, "1d": c }, funding: null, openInterest: null });
     const input = reviewInput({
       candidate, rule: PLAYBOOK_DEFAULT.trend_breakout, snapshot, btc: null, news: [], minutesToMacro: null,
       market: { mood: "mixed", btcTrend: "range", breadth: 0.5, counted: 15 },
     });
-    expect(input.candidate).toMatchObject({ entry: 2000, stop: 2100, one_r_level: 1900, stop_distance_pct: 5, measurements: { breakout_atr: 0.4 } });
+    expect(input.candidate).toMatchObject({ entry: 2000, stop: 2100, one_r_level: 1900, stop_distance_pct: 5, breakout_quality: 40, measurements: { breakout_atr: 0.4 } });
     expect(input.candidate.exit_rule).toContain("максимумом 10");
     expect(Object.keys(input.candidate)).not.toContain("target_1");
   });
@@ -235,10 +268,10 @@ describe("аналітик і скептик", () => {
   const skeptic = (pct: number) => sanitizeSkeptic({ probability_pct: pct, strongest_risk: "r", arguments_against: ["x"] });
 
   it("публікує лише коли аналітик бере, а скептик не нижче порога", () => {
-    expect(decide(analyst(), skeptic(60), 0.6)).toEqual({ publish: true });
-    expect(decide(analyst(), skeptic(59), 0.6)).toEqual({ publish: false, by: "skeptic" });
-    expect(decide(analyst({ verdict: "skip" }), skeptic(90), 0.6)).toEqual({ publish: false, by: "analyst" });
-    expect(decide(analyst(), null, 0.6)).toEqual({ publish: false, by: "skeptic" });
+    expect(decide(analyst(), skeptic(45), 0.45)).toEqual({ publish: true });
+    expect(decide(analyst(), skeptic(44), 0.45)).toEqual({ publish: false, by: "skeptic" });
+    expect(decide(analyst({ verdict: "skip" }), skeptic(90), 0.45)).toEqual({ publish: false, by: "analyst" });
+    expect(decide(analyst(), null, 0.45)).toEqual({ publish: false, by: "skeptic" });
   });
 
   it("тримає ймовірність у межах і обрізає списки", () => {

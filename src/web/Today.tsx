@@ -4,7 +4,7 @@ import { fmtPrice, useLivePrice } from "./live";
 import { Push } from "./Push";
 import type { ReportCard } from "./Reports";
 import { OpenSignals } from "./Signals";
-import { api, c, card, coin, dim, h2, KIND, label, num, p, primary, secondary, time, tone } from "./ui";
+import { api, c, card, coin, day, dim, h2, KIND, label, num, p, primary, secondary, time, tone } from "./ui";
 import { Delta, Gauge, LiveDot, Meter, Pill, PriceChart, Ring, Segmented, Skeleton, Slider, Stat, useCandles } from "./viz";
 
 interface Target { name: string; ok: boolean; status: number | null; ms: number; note?: string }
@@ -23,6 +23,7 @@ interface Status {
   spend: { monthUsd: number; budgetUsd: number | null };
   btc: { price: number; at: string } | null;
   cycle: { at: string; steps: number; maxRequests: number; failed: number } | null;
+  search?: { at: string; detected: number; filtered: Record<string, number>; reviewed: number; published: number; rejected: number; notes: string[] } | null;
 }
 
 interface Tf { close: number; ema20: number | null; ema50: number | null; ema200: number | null; rsi14: number | null; atrPct: number | null; changePct: number | null; volumeRatio: number | null }
@@ -342,6 +343,34 @@ function ReportTeaser({ report, onOpen }: { report: ReportCard | null; onOpen: (
 
 // ───────────────────────── Пульс системи ─────────────────────────
 
+/** Останній пошук сетапів: скільки знайшов код, скільки відсіяв фільтр, що вирішили моделі. */
+function SearchSummary({ s }: { s: NonNullable<Status["search"]> }) {
+  const filtered = Object.values(s.filtered).reduce((a, b) => a + b, 0);
+  const steps: [string, number, string][] = [
+    ["знайдено", s.detected, c.blue],
+    ["відсіяв фільтр", filtered, c.orange],
+    ["оцінила модель", s.reviewed, c.violet],
+    ["опубліковано", s.published, c.up],
+  ];
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6, paddingTop: 10, borderTop: `1px solid ${c.line}` }}>
+      <span style={label}>Пошук сетапів о {time(s.at)}, {day(s.at)}</span>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 6, textAlign: "center" }}>
+        {steps.map(([name, v, color]) => (
+          <div key={name} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <span style={{ ...num, fontSize: 18, fontWeight: 700, color: v > 0 ? color : c.faint }}>{v}</span>
+            <span style={{ fontSize: 10, color: c.dim }}>{name}</span>
+          </div>
+        ))}
+      </div>
+      {s.rejected > 0 && <p style={{ ...dim, fontSize: 12 }}>Модель відхилила {s.rejected}: вони у вкладці «Сигнали» → «Відхилені».</p>}
+      {s.notes.map((n) => (
+        <p key={n} style={{ ...dim, fontSize: 12, color: c.orange, overflowWrap: "anywhere" }}>{n}</p>
+      ))}
+    </div>
+  );
+}
+
 function SystemPulse({ status, error, reload }: { status: Status | null; error: string | null; reload: () => Promise<void> }) {
   const [busy, setBusy] = useState(false);
   const [scanNote, setScanNote] = useState<string | null>(null);
@@ -442,6 +471,7 @@ function SystemPulse({ status, error, reload }: { status: Status | null; error: 
           Цикл о {time(status.cycle.at)}: {status.cycle.steps} кроків
         </p>
       )}
+      {status?.search && <SearchSummary s={status.search} />}
       {targets && (
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
           {targets.map((t) => (

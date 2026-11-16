@@ -38,7 +38,7 @@ app.get("/api/status", async (c) => {
   const db = c.env.DB;
   const now = new Date();
   const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
-  const [last, report, spent, budget, cycle, ctx] = await Promise.all([
+  const [last, report, spent, budget, cycle, ctx, search] = await Promise.all([
     db
       .prepare("SELECT kind, started_at, status, duration_ms, detail, error FROM runs WHERE kind IN ('scan', 'probe') ORDER BY id DESC LIMIT 1")
       .first<{ kind: string; started_at: string; status: string; duration_ms: number; detail: string | null; error: string | null }>(),
@@ -50,6 +50,10 @@ app.get("/api/status", async (c) => {
     db
       .prepare("SELECT json_extract(body, '$.context') AS context, created_at AS at FROM reports WHERE kind IN ('morning', 'evening') ORDER BY created_at DESC LIMIT 1")
       .first<{ context: string | null; at: string }>(),
+    // Останній пошук сетапів: шукаємо лише на свіжій свічці 4h, тож беремо останній запуск, де пошук справді був.
+    db
+      .prepare("SELECT started_at, detail FROM runs WHERE kind = 'signals' AND json_extract(detail, '$.detection') = 1 ORDER BY id DESC LIMIT 1")
+      .first<{ started_at: string; detail: string }>(),
   ]);
   // Запас до ліміту безкоштовного плану: найбільша кількість зовнішніх запитів за один крок циклу.
   const steps = cycle ? ((JSON.parse(cycle.detail) as { steps?: { requests: number; error?: string }[] }).steps ?? []) : [];
@@ -67,8 +71,23 @@ app.get("/api/status", async (c) => {
     cycle: cycle
       ? { at: cycle.started_at, steps: steps.length, maxRequests: Math.max(0, ...steps.map((x) => x.requests)), failed: steps.filter((x) => x.error).length }
       : null,
+    search: search ? searchCard(search.started_at, search.detail) : null,
   });
 });
+
+/** Підсумок пошуку сетапів для пульсу: де зупинились кандидати й що сказав рушій про помилки. */
+function searchCard(at: string, detail: string) {
+  const d = JSON.parse(detail) as { detected?: number; filtered?: Record<string, number>; reviewed?: number; published?: number; rejected?: number; notes?: string[] };
+  return {
+    at,
+    detected: d.detected ?? 0,
+    filtered: d.filtered ?? {},
+    reviewed: d.reviewed ?? 0,
+    published: d.published ?? 0,
+    rejected: d.rejected ?? 0,
+    notes: (d.notes ?? []).slice(0, 5),
+  };
+}
 
 interface ReportRow {
   id: number;

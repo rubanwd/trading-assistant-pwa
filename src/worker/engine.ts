@@ -33,7 +33,7 @@ import { CANDLE_LIMIT, CHUNK_SIZE, marketFromSnapshots, scanChunk, type ChunkRes
 import { CachedMarket, SqlCandleStorage } from "./market/cache";
 import { feeR, positionSize, stopDistancePct, type Fees } from "../shared/risk";
 import { detect, EXIT_BARS } from "./signals/detectors";
-import { candidateKey, minutesToMacro, reject, type Rejection } from "./signals/filter";
+import { candidateKey, minutesToMacro, reject, shortlist, type Rejection } from "./signals/filter";
 import {
   ANALYST_SCHEMA,
   ANALYST_SYSTEM,
@@ -885,7 +885,7 @@ export class Engine extends DurableObject<Env> {
   // ── Сигнали ──────────────────────────────────────────────────────────────
 
   /**
-   * Супровід відкритих сигналів, потім пошук нових сетапів на свіжій свічці 1h.
+   * Супровід відкритих сигналів, потім пошук нових сетапів на свіжій свічці 4h.
    * Кандидати, що пройшли фільтр, стають окремими кроками review: так виклики моделей
    * не збираються в один запуск і не впираються в його ліміти.
    */
@@ -907,7 +907,7 @@ export class Engine extends DurableObject<Env> {
     const open = await db
       .prepare("SELECT id, created_at, symbol, side, setup, entry_low, entry_high, stop, tp1, tp2, rr, status, expires_at, hit FROM signals WHERE status IN ('pending', 'active') ORDER BY id")
       .all<SignalRow>();
-    const maxHoldMs = (await this.setting("signal_max_hold_hours", 336)) * HOUR;
+    const maxHoldMs = (await this.setting("signal_max_hold_hours", 120)) * HOUR;
     const fees: Fees = { makerPct: await this.setting("fee_maker_pct", 0.02), takerPct: await this.setting("fee_taker_pct", 0.05) };
     let updated = 0;
     const market = await this.market();
@@ -996,11 +996,11 @@ export class Engine extends DurableObject<Env> {
 
     const [minStopPct, maxActive, blackout, macro, cooldown, perScan] = await Promise.all([
       this.setting("min_stop_pct", 1),
-      this.setting("max_active_signals", 6),
+      this.setting("max_active_signals", 10),
       this.setting("macro_blackout_hours", 2),
       this.setting<unknown>("macro_events", []),
       this.setting("signal_cooldown_hours", 6),
-      this.setting("max_candidates_per_scan", 3),
+      this.setting("max_candidates_per_scan", 5),
     ]);
     const [open, recent] = await Promise.all([
       db.prepare("SELECT symbol FROM signals WHERE status IN ('pending', 'active')").all<{ symbol: string }>(),
@@ -1033,8 +1033,8 @@ export class Engine extends DurableObject<Env> {
         else passed.push(candidate);
       }
     }
-    // Один кандидат на монету в порядку списку монет; до моделі йде обмежена кількість за скан. Так само рахує бектест.
-    return passed.filter((c, i) => passed.findIndex((x) => x.symbol === c.symbol) === i).slice(0, perScan);
+    // Один кандидат на монету, спершу найсильніші пробої; до моделі йде обмежена кількість за скан. Так само рахує бектест.
+    return shortlist(passed, perScan);
   }
 
   /** Аналітик → скептик → публікація для одного кандидата. Окремий крок циклу. */
@@ -1045,10 +1045,10 @@ export class Engine extends DurableObject<Env> {
     if (!candidate || !summary || !scan) return;
     const db = this.env.DB;
     const [maxActive, macro, threshold, maxHold] = await Promise.all([
-      this.setting("max_active_signals", 6),
+      this.setting("max_active_signals", 10),
       this.setting<unknown>("macro_events", []),
-      this.setting("skeptic_threshold", 0.6),
-      this.setting("signal_max_hold_hours", 336),
+      this.setting("skeptic_threshold", 0.45),
+      this.setting("signal_max_hold_hours", 120),
     ]);
     // Попередні кроки могли вже опублікувати сигнали: ліміт перевіряється заново.
     const open = await db.prepare("SELECT symbol FROM signals WHERE status IN ('pending', 'active')").all<{ symbol: string }>();
