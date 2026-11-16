@@ -38,7 +38,7 @@ app.get("/api/status", async (c) => {
   const db = c.env.DB;
   const now = new Date();
   const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
-  const [last, report, spent, budget, cycle] = await Promise.all([
+  const [last, report, spent, budget, cycle, ctx] = await Promise.all([
     db
       .prepare("SELECT kind, started_at, status, duration_ms, detail, error FROM runs WHERE kind IN ('scan', 'probe') ORDER BY id DESC LIMIT 1")
       .first<{ kind: string; started_at: string; status: string; duration_ms: number; detail: string | null; error: string | null }>(),
@@ -46,6 +46,10 @@ app.get("/api/status", async (c) => {
     db.prepare("SELECT COALESCE(SUM(cost_usd), 0) AS usd FROM llm_calls WHERE ts >= ?").bind(monthStart).first<{ usd: number }>(),
     db.prepare("SELECT value FROM settings WHERE key = 'llm_budget_usd'").first<{ value: string }>(),
     db.prepare("SELECT started_at, detail FROM runs WHERE kind = 'pipeline' ORDER BY id DESC LIMIT 1").first<{ started_at: string; detail: string }>(),
+    // Фон ринку (страх і жадібність, домінація BTC) з останнього звіту: рушій бере його лише для звітів.
+    db
+      .prepare("SELECT json_extract(body, '$.context') AS context, created_at AS at FROM reports WHERE kind IN ('morning', 'evening') ORDER BY created_at DESC LIMIT 1")
+      .first<{ context: string | null; at: string }>(),
   ]);
   // Запас до ліміту безкоштовного плану: найбільша кількість зовнішніх запитів за один крок циклу.
   const steps = cycle ? ((JSON.parse(cycle.detail) as { steps?: { requests: number; error?: string }[] }).steps ?? []) : [];
@@ -58,6 +62,7 @@ app.get("/api/status", async (c) => {
     btc,
     lastRun: last ? { ...last, detail: last.detail ? JSON.parse(last.detail) : null } : null,
     lastReport: report ? reportCard(report) : null,
+    context: ctx?.context ? { ...(JSON.parse(ctx.context) as object), at: ctx.at } : null,
     spend: { monthUsd: spent?.usd ?? 0, budgetUsd: budget ? Number(JSON.parse(budget.value)) : null },
     cycle: cycle
       ? { at: cycle.started_at, steps: steps.length, maxRequests: Math.max(0, ...steps.map((x) => x.requests)), failed: steps.filter((x) => x.error).length }

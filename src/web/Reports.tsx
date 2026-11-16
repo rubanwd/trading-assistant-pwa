@@ -1,7 +1,21 @@
 import { useCallback, useEffect, useState } from "react";
 import { SETUP } from "./Signals";
 import { StatsView, type Stats } from "./Stats";
-import { api, c, card, day, dim, h2, KIND, p, secondary, time } from "./ui";
+import { api, c, card, coin, day, dim, h2, KIND, label, num, p, secondary, time } from "./ui";
+import { Pill, Segmented } from "./viz";
+
+const KIND_ICON: Record<string, { icon: string; color: string }> = {
+  morning: { icon: "☀", color: c.yellow },
+  evening: { icon: "☾", color: c.violet },
+  weekly: { icon: "▦", color: c.blue },
+};
+function KindIcon({ kind, size = 32 }: { kind: string; size?: number }) {
+  const k = KIND_ICON[kind] ?? { icon: "•", color: c.dim };
+  return (
+    <span aria-hidden style={{ flex: "none", width: size, height: size, borderRadius: size / 3.5, display: "grid", placeItems: "center", background: `${k.color}22`, color: k.color, fontSize: size * 0.5 }}>{k.icon}</span>
+  );
+}
+const backBtn = { ...secondary, alignSelf: "flex-start", minHeight: 40, fontSize: 14 } as const;
 
 export interface ReportCard {
   id: number;
@@ -33,25 +47,69 @@ interface Report {
 
 const OUTCOME = { happened: "збулося", did_not_happen: "не збулося", pending: "ще відкритий" } as const;
 
-function Bar({ value }: { value: number }) {
+/** Колір сценарію за напрямком у назві: зростання, падіння або нейтральний. */
+function scenarioColor(title: string): string {
+  const t = title.toLowerCase();
+  if (/(бич|зрост|вгору|пробій вгору|ріст|відскок|ралі)/.test(t)) return c.up;
+  if (/(ведм|паді|вниз|злам|обвал|продаж)/.test(t)) return c.down;
+  return c.blue;
+}
+
+function Bar({ value, color = c.blue }: { value: number; color?: string }) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-      <div style={{ flex: 1, height: 6, borderRadius: 3, background: c.line }}>
-        <div style={{ width: `${Math.round(value * 100)}%`, height: 6, borderRadius: 3, background: c.blue }} />
+      <div style={{ flex: 1, height: 10, borderRadius: 5, background: c.line, overflow: "hidden" }}>
+        <div style={{ width: `${Math.round(value * 100)}%`, height: 10, borderRadius: 5, background: `linear-gradient(90deg, ${color}88, ${color})`, transition: "width 0.6s" }} />
       </div>
-      <span style={{ fontSize: 13, fontVariantNumeric: "tabular-nums", minWidth: 36, textAlign: "right" }}>{Math.round(value * 100)}%</span>
+      <span style={{ ...num, fontSize: 15, fontWeight: 700, minWidth: 40, textAlign: "right", color }}>{Math.round(value * 100)}%</span>
     </div>
   );
 }
 
-function List({ title, items }: { title: string; items: string[] }) {
+const OUTCOME_STYLE = {
+  happened: { icon: "✓", color: c.up },
+  did_not_happen: { icon: "✕", color: c.down },
+  pending: { icon: "…", color: c.dim },
+} as const;
+
+/** Рівні однієї монети на вертикальній шкалі: опори вгорі, підтримки внизу. */
+function LevelLadder({ symbol, items }: { symbol: string; items: Level[] }) {
+  const sorted = [...items].sort((a, b) => b.price - a.price);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      <span style={{ fontWeight: 700, fontSize: 14 }}>{coin(symbol)}</span>
+      <div style={{ display: "flex", flexDirection: "column", borderLeft: `2px solid ${c.line}`, marginLeft: 4 }}>
+        {sorted.map((l) => {
+          const color = l.kind === "support" ? c.up : c.down;
+          return (
+            <div key={`${l.price}-${l.kind}`} style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: "4px 0" }}>
+              <span aria-hidden style={{ width: 10, height: 2, background: color, marginTop: 9, marginLeft: -2, flex: "none" }} />
+              <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
+                <span style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <span style={{ ...num, fontWeight: 700, fontSize: 14 }}>{l.price}</span>
+                  <Pill color={color}>{l.kind === "support" ? "▼ підтримка" : "▲ опір"}</Pill>
+                </span>
+                {l.note && <span style={{ fontSize: 12, color: c.dim }}>{l.note}</span>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function List({ title, items, mark = "•", color = c.dim }: { title: string; items: string[]; mark?: string; color?: string }) {
   if (!items.length) return null;
   return (
-    <div>
-      <p style={{ ...dim, marginBottom: 4 }}>{title}</p>
-      <ul style={{ margin: 0, paddingLeft: 18, display: "flex", flexDirection: "column", gap: 4 }}>
-        {items.map((t) => <li key={t} style={p}>{t}</li>)}
-      </ul>
+    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      <span style={label}>{title}</span>
+      {items.map((t) => (
+        <div key={t} style={{ display: "flex", gap: 8, ...p }}>
+          <span aria-hidden style={{ flex: "none", width: 18, height: 18, borderRadius: 9, display: "grid", placeItems: "center", fontSize: 10, fontWeight: 800, background: `${color}26`, color, marginTop: 1 }}>{mark}</span>
+          <span>{t}</span>
+        </div>
+      ))}
     </div>
   );
 }
@@ -84,19 +142,22 @@ function WeeklyView({ report, onBack }: { report: WeeklyReport; onBack: () => vo
   const r = report.body.review;
   return (
     <>
-      <button type="button" style={{ ...secondary, alignSelf: "flex-start" }} onClick={onBack}>← Усі звіти</button>
+      <button type="button" className="press" style={backBtn} onClick={onBack}>← Усі звіти</button>
       <section style={card}>
-        <p style={dim}>Тижневий розбір · {day(report.created_at)}</p>
+        <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <KindIcon kind="weekly" size={28} />
+          <span style={label}>Тижневий розбір · {day(report.created_at)}</span>
+        </span>
         <h2 style={{ ...h2, fontSize: 18, lineHeight: 1.3 }}>{report.body.content.headline}</h2>
         {r ? <p style={p}>{r.summary}</p> : <p style={dim}>Розбору моделі немає: {report.body.reviewNote}. Цифри нижче порахував код.</p>}
       </section>
       {r && (
         <>
           <section style={card}>
-            <List title="Що працює" items={r.working} />
-            <List title="Що не працює" items={r.failing} />
+            <List title="Що працює" items={r.working} mark="+" color={c.up} />
+            <List title="Що не працює" items={r.failing} mark="−" color={c.down} />
             {r.calibration && <p style={p}>{r.calibration}</p>}
-            <List title="На що дивитися наступного тижня" items={r.nextWeek} />
+            <List title="На що дивитися наступного тижня" items={r.nextWeek} mark="→" color={c.blue} />
           </section>
           <section style={card}>
             <h2 style={h2}>Пропозиції змін</h2>
@@ -113,19 +174,7 @@ function WeeklyView({ report, onBack }: { report: WeeklyReport; onBack: () => vo
           </section>
         </>
       )}
-      <div style={{ display: "flex", gap: 8 }}>
-        {(["week", "allTime"] as const).map((k) => (
-          <button
-            key={k}
-            type="button"
-            aria-pressed={scope === k}
-            onClick={() => setScope(k)}
-            style={{ ...secondary, flex: 1, minHeight: 40, fontSize: 14, padding: 0, color: scope === k ? c.blue : c.dim, borderColor: scope === k ? c.blue : c.line }}
-          >
-            {k === "week" ? "Цей тиждень" : "Увесь час"}
-          </button>
-        ))}
-      </div>
+      <Segmented options={[["week", "Цей тиждень"], ["allTime", "Увесь час"]]} value={scope} onChange={setScope} />
       <StatsView stats={report.body[scope]} />
       <p style={dim}>
         Модель: {report.model ?? "—"}
@@ -149,30 +198,45 @@ function ReportView({ id, onBack }: { id: number; onBack: () => void }) {
   const r = report.body.content;
   return (
     <>
-      <button type="button" style={{ ...secondary, alignSelf: "flex-start" }} onClick={onBack}>← Усі звіти</button>
+      <button type="button" className="press" style={backBtn} onClick={onBack}>← Усі звіти</button>
       <section style={card}>
-        <p style={dim}>{KIND[report.kind] ?? report.kind} звіт · {day(report.created_at)}, {time(report.created_at)}</p>
-        <h2 style={{ ...h2, fontSize: 18, lineHeight: 1.3 }}>{r.headline}</h2>
-        <p style={p}>{r.regime}</p>
+        <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <KindIcon kind={report.kind} size={28} />
+          <span style={label}>{KIND[report.kind] ?? report.kind} звіт · {day(report.created_at)}, {time(report.created_at)}</span>
+        </span>
+        <h2 style={{ ...h2, fontSize: 19, lineHeight: 1.3, fontWeight: 700 }}>{r.headline}</h2>
+        <p style={{ ...p, color: "#C9CFD9" }}>{r.regime}</p>
       </section>
       {r.review && (
         <section style={card}>
           <h2 style={h2}>Що збулося</h2>
-          {report.body.prior.map((f) => (
-            <div key={f.statement} style={{ display: "flex", justifyContent: "space-between", gap: 12, fontSize: 13 }}>
-              <span>{f.title} · {f.probability_pct}%</span>
-              <span style={{ color: f.outcome === "happened" ? c.blue : f.outcome === "pending" ? c.dim : c.orange, whiteSpace: "nowrap" }}>{OUTCOME[f.outcome]}</span>
-            </div>
-          ))}
+          {report.body.prior.map((f) => {
+            const o = OUTCOME_STYLE[f.outcome];
+            return (
+              <div key={f.statement} style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 13 }}>
+                <span aria-hidden style={{ flex: "none", width: 22, height: 22, borderRadius: 11, display: "grid", placeItems: "center", background: `${o.color}26`, color: o.color, fontWeight: 800 }}>{o.icon}</span>
+                <span style={{ flex: 1, minWidth: 0 }}>{f.title}</span>
+                <span style={{ ...num, color: c.dim }}>{f.probability_pct}%</span>
+                <span style={{ color: o.color, whiteSpace: "nowrap", fontWeight: 600 }}>{OUTCOME[f.outcome]}</span>
+              </div>
+            );
+          })}
           <p style={p}>{r.review}</p>
         </section>
       )}
       <section style={card}>
         <h2 style={h2}>Сценарії</h2>
+        {r.scenarios.length > 1 && (
+          <div style={{ display: "flex", height: 12, borderRadius: 6, overflow: "hidden", gap: 2 }} role="img" aria-label="Розподіл ймовірностей сценаріїв">
+            {r.scenarios.map((s) => (
+              <div key={s.title} style={{ flex: s.probability, background: scenarioColor(s.title) }} title={`${s.title}: ${Math.round(s.probability * 100)}%`} />
+            ))}
+          </div>
+        )}
         {r.scenarios.map((s) => (
-          <div key={s.title} style={{ display: "flex", flexDirection: "column", gap: 4, paddingBottom: 8, borderBottom: `1px solid ${c.line}` }}>
-            <p style={{ ...p, fontWeight: 600 }}>{s.title}</p>
-            <Bar value={s.probability} />
+          <div key={s.title} style={{ display: "flex", flexDirection: "column", gap: 6, padding: 12, borderRadius: 12, background: c.bg, borderLeft: `3px solid ${scenarioColor(s.title)}` }}>
+            <p style={{ ...p, fontWeight: 700 }}>{s.title}</p>
+            <Bar value={s.probability} color={scenarioColor(s.title)} />
             <p style={p}>{s.description}</p>
             {s.statement && <p style={dim}>Перевірка: {s.statement}</p>}
             {s.invalidation && <p style={dim}>Скасування: {s.invalidation}</p>}
@@ -192,18 +256,15 @@ function ReportView({ id, onBack }: { id: number; onBack: () => void }) {
       {r.levels.length > 0 && (
         <section style={card}>
           <h2 style={h2}>Ключові рівні</h2>
-          {r.levels.map((l) => (
-            <div key={`${l.symbol}-${l.price}-${l.kind}`} style={{ display: "flex", justifyContent: "space-between", gap: 12, fontSize: 13 }}>
-              <span>{l.symbol.replace("USDT", "")} <span style={{ fontVariantNumeric: "tabular-nums" }}>{l.price}</span> · {l.kind === "support" ? "підтримка" : "опір"}</span>
-              <span style={{ color: c.dim, textAlign: "right" }}>{l.note}</span>
-            </div>
+          {[...new Set(r.levels.map((l) => l.symbol))].map((sym) => (
+            <LevelLadder key={sym} symbol={sym} items={r.levels.filter((l) => l.symbol === sym)} />
           ))}
         </section>
       )}
       <section style={card}>
         <h2 style={h2}>План</h2>
-        <List title="Що робити" items={r.plan.do} />
-        <List title="Чого не робити" items={r.plan.avoid} />
+        <List title="Що робити" items={r.plan.do} mark="✓" color={c.up} />
+        <List title="Чого не робити" items={r.plan.avoid} mark="✕" color={c.down} />
       </section>
       {report.news.length > 0 && (
         <section style={card}>
@@ -270,16 +331,20 @@ export function Reports({ openId, onOpen }: { openId: number | null; onOpen: (id
       {note && <p style={dim}>{note}</p>}
       {list?.length === 0 && <p style={dim}>Звітів ще немає. Перший з'явиться о 07:30 або 20:30 за Києвом, тижневий розбір у неділю.</p>}
       {list?.map((r) => (
-        <button key={r.id} type="button" onClick={() => onOpen(r.id)} style={{ ...card, color: c.ink, textAlign: "left", font: "inherit", cursor: "pointer" }}>
-          <span style={dim}>{KIND[r.kind] ?? r.kind} · {day(r.created_at)}, {time(r.created_at)}</span>
-          <span style={{ ...p, fontWeight: 600 }}>{r.headline}</span>
+        <button key={r.id} type="button" className="press rise" onClick={() => onOpen(r.id)} style={{ ...card, flexDirection: "row", alignItems: "flex-start", gap: 12, color: c.ink, textAlign: "left", font: "inherit", cursor: "pointer" }}>
+          <KindIcon kind={r.kind} />
+          <span style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 0, flex: 1 }}>
+            <span style={label}>{KIND[r.kind] ?? r.kind} · {day(r.created_at)}, {time(r.created_at)}</span>
+            <span style={{ ...p, fontWeight: 600 }}>{r.headline}</span>
+          </span>
+          <span aria-hidden style={{ color: c.faint, fontSize: 18, alignSelf: "center" }}>›</span>
         </button>
       ))}
       <div style={{ display: "flex", gap: 8 }}>
-        <button type="button" style={{ ...secondary, flex: 1 }} disabled={busy} onClick={() => run("morning")}>{busy ? "Складаю…" : "Скласти ранковий"}</button>
-        <button type="button" style={{ ...secondary, flex: 1 }} disabled={busy} onClick={() => run("evening")}>{busy ? "Складаю…" : "Скласти вечірній"}</button>
+        <button type="button" className="press" style={{ ...secondary, flex: 1, fontSize: 14 }} disabled={busy} onClick={() => run("morning")}>{busy ? "Складаю…" : "☀ Ранковий"}</button>
+        <button type="button" className="press" style={{ ...secondary, flex: 1, fontSize: 14 }} disabled={busy} onClick={() => run("evening")}>{busy ? "Складаю…" : "☾ Вечірній"}</button>
       </div>
-      <button type="button" style={secondary} disabled={busy} onClick={weekly}>Тижневий розбір зараз</button>
+      <button type="button" className="press" style={{ ...secondary, fontSize: 14 }} disabled={busy} onClick={weekly}>▦ Тижневий розбір зараз</button>
     </>
   );
 }

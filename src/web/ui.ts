@@ -1,6 +1,36 @@
-export const c = { bg: "#0E1116", card: "#171B22", line: "#262C36", ink: "#E8EBF0", dim: "#9AA3B2", blue: "#5B9DFF", orange: "#FF9F4A" };
-export const card = { background: c.card, border: `1px solid ${c.line}`, borderRadius: 14, padding: 16, display: "flex", flexDirection: "column", gap: 8 } as const;
+/**
+ * Палітра. up/down: напрямок ціни й результату (завжди разом зі стрілкою ▲▼ або знаком, не лише кольором);
+ * blue: акцент і нейтральні дані; orange: попередження й помилки; violet: оцінки моделі.
+ */
+export const c = {
+  bg: "#0B0E13",
+  card: "#151A22",
+  card2: "#1B212B",
+  line: "#262D39",
+  ink: "#E8EBF0",
+  dim: "#8E98A8",
+  faint: "#5C6676",
+  blue: "#5B9DFF",
+  orange: "#FF9F4A",
+  up: "#2EBD85",
+  down: "#F6465D",
+  violet: "#A88BFF",
+  yellow: "#F0B90B",
+};
+export const card = {
+  background: `linear-gradient(180deg, ${c.card2} 0%, ${c.card} 100%)`,
+  border: `1px solid ${c.line}`,
+  borderRadius: 16,
+  padding: 16,
+  display: "flex",
+  flexDirection: "column",
+  gap: 10,
+  minWidth: 0,
+} as const;
 export const h2 = { margin: 0, fontSize: 16, fontWeight: 600 } as const;
+/** Малий заголовок секції всередині картки. */
+export const label = { margin: 0, fontSize: 11, fontWeight: 600, letterSpacing: 0.6, textTransform: "uppercase", color: c.faint } as const;
+export const num = { fontVariantNumeric: "tabular-nums" } as const;
 export const p = { margin: 0, fontSize: 14, lineHeight: 1.45 } as const;
 export const dim = { ...p, fontSize: 13, color: c.dim } as const;
 const button = { minHeight: 48, borderRadius: 12, font: "600 15px Inter, system-ui, sans-serif", padding: "0 16px" } as const;
@@ -29,3 +59,6 @@ export const day = (iso: string) => new Date(iso).toLocaleDateString("uk-UA", { 
 export const coin = (s: string) => s.replace(/USDT$/, "");
 export const signed = (v: number, digits = 2) => `${v > 0 ? "+" : v < 0 ? "−" : ""}${Math.abs(v).toFixed(digits)}`;
 export const pct = (v: number | null | undefined) => (v === null || v === undefined ? "—" : `${Math.round(v * 100)}%`);
+/** Колір напрямку: зростання, падіння або нейтральний. */
+export const tone = (v: number | null | undefined) => (v === null || v === undefined || v === 0 ? c.dim : v > 0 ? c.up : c.down);
+export const arrow = (v: number | null | undefined) => (v === null || v === undefined || v === 0 ? "•" : v > 0 ? "▲" : "▼");

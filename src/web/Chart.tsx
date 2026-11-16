@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { fmtPrice } from "./live";
-import { api, c, dim } from "./ui";
+import { api, c, dim, num } from "./ui";
 
 interface Candle { openTime: number; closeTime: number; open: number; high: number; low: number; close: number }
 
@@ -26,13 +26,15 @@ const PAD = { left: 4, right: 62, top: 10, bottom: 18 };
 export function SignalChart({ symbol, levels, live }: { symbol: string; levels: ChartLevels; live: number | null }) {
   const [candles, setCandles] = useState<Candle[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [hover, setHover] = useState<number | null>(null);
+  const ref = useRef<SVGSVGElement>(null);
   const tf = levels.tp1 === null ? "4h" : "1h";
   useEffect(() => {
     api<{ candles: Candle[] }>(`/api/candles/${symbol}?tf=${tf}&limit=${tf === "4h" ? 60 : 72}`).then((d) => setCandles(d.candles), (e) => setError(String(e)));
   }, [symbol, tf]);
 
   if (error) return <p style={dim}>Графік недоступний: {error}</p>;
-  if (!candles?.length) return <p style={dim}>Завантажую графік…</p>;
+  if (!candles?.length) return <div className="skeleton" style={{ height: 220 }} aria-label="Завантажую графік" />;
 
   const prices = [
     ...candles.flatMap((k) => [k.high, k.low]),
@@ -56,10 +58,10 @@ export function SignalChart({ symbol, levels, live }: { symbol: string; levels: 
   // Підписи рівнів праворуч розсуваються, щоб не налазили один на одного.
   const mid = (levels.entryLow + levels.entryHigh) / 2;
   const marks = [
-    { price: levels.stop, color: c.orange, label: `стоп ${fmtPrice(levels.stop)}` },
-    ...(levels.tp1 !== null ? [{ price: levels.tp1, color: c.blue, label: `ціль ${fmtPrice(levels.tp1)}` }] : []),
-    ...(levels.tp2 !== null ? [{ price: levels.tp2, color: c.blue, label: `ціль 2 ${fmtPrice(levels.tp2)}`, dash: "4 3" }] : []),
-    { price: mid, color: c.dim, label: `вхід ${fmtPrice(mid)}`, dash: "1 3" },
+    { price: levels.stop, color: c.down, label: `стоп ${fmtPrice(levels.stop)}` },
+    ...(levels.tp1 !== null ? [{ price: levels.tp1, color: c.up, label: `ціль ${fmtPrice(levels.tp1)}` }] : []),
+    ...(levels.tp2 !== null ? [{ price: levels.tp2, color: c.up, label: `ціль 2 ${fmtPrice(levels.tp2)}`, dash: "4 3" }] : []),
+    { price: mid, color: c.blue, label: `вхід ${fmtPrice(mid)}`, dash: "1 3" },
     ...(live !== null ? [{ price: live, color: c.ink, label: fmtPrice(live), dash: "3 2" }] : []),
   ]
     .map((m) => ({ ...m, ly: y(m.price) }))
@@ -75,12 +77,51 @@ export function SignalChart({ symbol, levels, live }: { symbol: string; levels: 
     </g>
   );
 
+  // Зони ризику й прибутку: від входу до стопа червоним, від входу в бік угоди зеленим.
+  const long = levels.stop < mid;
+  const riskTop = Math.min(y(mid), y(levels.stop));
+  const rewardEdge = long ? PAD.top : H - PAD.bottom;
+  const zoneX = createdX ?? PAD.left;
+  const pick = (clientX: number) => {
+    const rect = ref.current?.getBoundingClientRect();
+    if (!rect) return;
+    const px = ((clientX - rect.left) / rect.width) * W;
+    setHover(Math.min(candles.length - 1, Math.max(0, Math.floor((px - PAD.left) / step))));
+  };
+  const hk = hover !== null ? candles[hover]! : null;
+
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} width="100%" role="img" aria-label={`Графік ${symbol} ${tf} з рівнями сигналу`} style={{ display: "block" }}>
+    <div>
+      <div style={{ ...num, minHeight: 18, fontSize: 11, color: c.dim, display: "flex", gap: 8, flexWrap: "wrap" }}>
+        {hk ? (
+          <>
+            <span style={{ color: c.ink }}>{new Date(hk.openTime).toLocaleString("uk-UA", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</span>
+            <span>В {fmtPrice(hk.open)}</span>
+            <span>М {fmtPrice(hk.high)}</span>
+            <span>Н {fmtPrice(hk.low)}</span>
+            <span style={{ color: hk.close >= hk.open ? c.up : c.down }}>З {fmtPrice(hk.close)}</span>
+          </>
+        ) : (
+          <span>Торкнись свічки, щоб побачити ціни</span>
+        )}
+      </div>
+    <svg
+      ref={ref}
+      viewBox={`0 0 ${W} ${H}`}
+      width="100%"
+      role="img"
+      aria-label={`Графік ${symbol} ${tf} з рівнями сигналу`}
+      style={{ display: "block", touchAction: "pan-y" }}
+      onPointerDown={(e) => pick(e.clientX)}
+      onPointerMove={(e) => (e.pointerType === "mouse" || e.buttons ? pick(e.clientX) : undefined)}
+      onPointerLeave={() => setHover(null)}
+    >
+      <rect x={zoneX} width={Math.max(0, PAD.left + plotW - zoneX)} y={riskTop} height={Math.abs(y(levels.stop) - y(mid))} fill={c.down} opacity={0.1} />
+      <rect x={zoneX} width={Math.max(0, PAD.left + plotW - zoneX)} y={Math.min(rewardEdge, y(mid))} height={Math.abs(y(mid) - rewardEdge)} fill={c.up} opacity={0.07} />
       <rect x={PAD.left} width={plotW} y={y(levels.entryHigh)} height={Math.max(1, y(levels.entryLow) - y(levels.entryHigh))} fill={c.blue} opacity={0.15} />
       {candles.map((k, i) => {
         const up = k.close >= k.open;
-        const color = up ? c.blue : c.orange;
+        const color = up ? c.up : c.down;
         const top = y(Math.max(k.open, k.close));
         return (
           <g key={k.openTime}>
@@ -93,6 +134,13 @@ export function SignalChart({ symbol, levels, live }: { symbol: string; levels: 
       {marks.map(line)}
       <text x={PAD.left} y={H - 4} fill={c.dim} fontSize={10}>{new Date(t0).toLocaleDateString("uk-UA", { day: "numeric", month: "short" })}</text>
       <text x={W - PAD.right} y={H - 4} fill={c.dim} fontSize={10} textAnchor="end">{tf} · {candles.length} свічок</text>
+      {hk && hover !== null && (
+        <g pointerEvents="none">
+          <rect x={x(hover) - step / 2} width={step} y={PAD.top} height={plotH} fill={c.ink} opacity={0.08} />
+          <line x1={x(hover)} x2={x(hover)} y1={PAD.top} y2={H - PAD.bottom} stroke={c.ink} strokeOpacity={0.5} strokeDasharray="2 2" />
+        </g>
+      )}
     </svg>
+    </div>
   );
 }

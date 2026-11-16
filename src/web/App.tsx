@@ -1,34 +1,51 @@
-import { useCallback, useEffect, useState } from "react";
-import { fmtPrice, useLivePrice } from "./live";
-import { Push } from "./Push";
-import { Reports, type ReportCard } from "./Reports";
+import { useEffect, useState, type ReactNode } from "react";
+import { Reports } from "./Reports";
 import { AiSettings } from "./Ai";
 import { Settings } from "./Settings";
-import { OpenSignals, Signals } from "./Signals";
+import { Signals } from "./Signals";
 import { Stats } from "./Stats";
-import { errorSummary } from "../shared/errors";
-import { api, c, card, dim, h2, KIND, OFFLINE_EVENT, p, primary, secondary, time } from "./ui";
+import { Today } from "./Today";
+import { c, OFFLINE_EVENT, p, time } from "./ui";
 
-interface Target { name: string; ok: boolean; status: number | null; ms: number; note?: string }
-interface ScanDetail {
-  source: string;
-  market: { mood: "risk_on" | "risk_off" | "mixed"; btcTrend: "up" | "down" | "range" | null; breadth: number | null };
-  symbols: number;
-  snapshots: number;
-}
-interface Status {
-  lastRun: { kind: string; started_at: string; status: string; detail: Target[] | ScanDetail | null; error: string | null } | null;
-  lastReport: ReportCard | null;
-  spend: { monthUsd: number; budgetUsd: number | null };
-  btc: { price: number; at: string } | null;
-  cycle: { at: string; steps: number; maxRequests: number; failed: number } | null;
-}
-
-const MOOD = { risk_on: "ризик-он", risk_off: "ризик-оф", mixed: "змішаний" } as const;
-const TREND = { up: "вгору", down: "вниз", range: "боковик" } as const;
 type Tab = "today" | "signals" | "reports" | "stats" | "settings" | "ai";
 const NAV: Exclude<Tab, "settings" | "ai">[] = ["today", "signals", "reports", "stats"];
 const TABS: Record<Tab, string> = { today: "Сьогодні", signals: "Сигнали", reports: "Звіти", stats: "Статистика", settings: "Налаштування", ai: "Моделі ШІ" };
+
+/** Іконки нижньої панелі: прості лінії, колір бере від тексту кнопки. */
+const ICON: Record<Exclude<Tab, "settings" | "ai">, ReactNode> = {
+  today: <path d="M3 12h3l3-8 4 16 3-8h5" />,
+  signals: (
+    <>
+      <circle cx="12" cy="12" r="8" />
+      <circle cx="12" cy="12" r="4" />
+      <circle cx="12" cy="12" r="0.5" />
+    </>
+  ),
+  reports: (
+    <>
+      <rect x="5" y="3" width="14" height="18" rx="2" />
+      <path d="M9 8h6M9 12h6M9 16h3" />
+    </>
+  ),
+  stats: <path d="M4 20V10M10 20V4M16 20v-7M22 20H2" />,
+};
+
+function HeaderButton({ onClick, label, children }: { onClick: () => void; label: string; children: ReactNode }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={label}
+      title={label}
+      className="press"
+      style={{ width: 40, height: 40, borderRadius: 12, border: `1px solid ${c.line}`, background: c.card, color: c.ink, display: "grid", placeItems: "center", padding: 0 }}
+    >
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+        {children}
+      </svg>
+    </button>
+  );
+}
 
 /** Банер «дані з кешу»: service worker віддав збережену відповідь, бо мережі немає. */
 function OfflineBanner() {
@@ -43,137 +60,6 @@ function OfflineBanner() {
     <p role="status" style={{ ...p, fontSize: 13, color: c.bg, background: c.orange, borderRadius: 10, padding: "8px 12px" }}>
       Немає зв'язку: показую збережені дані на {time(cachedAt)}.
     </p>
-  );
-}
-
-function Today({ onOpenReport, onOpenSignal }: { onOpenReport: (id: number) => void; onOpenSignal: (id: number) => void }) {
-  const [status, setStatus] = useState<Status | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-
-  const load = useCallback(async () => {
-    try {
-      setStatus(await api<Status>("/api/status"));
-      setError(null);
-    } catch (e) {
-      setError(String(e));
-    }
-  }, []);
-  useEffect(() => { void load(); }, [load]);
-
-  const post = async (path: string) => {
-    setBusy(true);
-    try {
-      await fetch(path, { method: "POST" });
-      await load();
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  /** Скан іде кроками у фоні: перечитуємо стан кілька разів, поки цикл не завершиться. */
-  const [scanNote, setScanNote] = useState<string | null>(null);
-  const startScan = async () => {
-    setBusy(true);
-    try {
-      const res = await fetch("/api/scan", { method: "POST" });
-      if (res.status === 409) {
-        setScanNote("Цикл уже триває, результат буде за хвилину.");
-        return;
-      }
-      setScanNote("Скан запущено: він іде кроками, результат з'явиться за хвилину.");
-      for (const delay of [8_000, 15_000, 30_000, 45_000]) {
-        await new Promise((r) => setTimeout(r, delay));
-        await load();
-      }
-      setScanNote(null);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const run = status?.lastRun;
-  const targets = Array.isArray(run?.detail) ? run.detail : null;
-  const scan = run?.detail && !Array.isArray(run.detail) ? run.detail : null;
-  const report = status?.lastReport;
-  const live = useLivePrice("BTCUSDT");
-  const btc = live ?? status?.btc?.price ?? null;
-
-  return (
-    <>
-      <section style={card}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12 }}>
-          <span style={{ fontSize: 22, fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>BTC {btc === null ? "—" : fmtPrice(btc)}</span>
-          <span style={dim}>{live !== null ? "наживо" : status?.btc ? `скан о ${time(status.btc.at)}` : ""}</span>
-        </div>
-        {scan && (
-          <p style={dim}>
-            Ринок {MOOD[scan.market.mood]}
-            {scan.market.btcTrend && ` · BTC 4h ${TREND[scan.market.btcTrend]}`}
-            {scan.market.breadth !== null && ` · вище EMA200: ${Math.round(scan.market.breadth * 100)}%`}
-          </p>
-        )}
-      </section>
-      {report ? (
-        <button type="button" onClick={() => onOpenReport(report.id)} style={{ ...card, color: c.ink, textAlign: "left", font: "inherit", cursor: "pointer" }}>
-          <span style={dim}>{KIND[report.kind] ?? report.kind} звіт · {time(report.created_at)}</span>
-          <span style={{ ...p, fontWeight: 600 }}>{report.headline}</span>
-          {report.theses.map((t) => <span key={t} style={p}>• {t}</span>)}
-        </button>
-      ) : (
-        <section style={card}>
-          <h2 style={h2}>Звіт</h2>
-          <p style={dim}>Звітів ще немає. Перший з'явиться о 07:30 або 20:30 за Києвом.</p>
-        </section>
-      )}
-      <OpenSignals onOpen={onOpenSignal} lastScan={run?.kind === "scan" ? run.started_at : null} />
-      <section style={card}>
-        <h2 style={h2}>Пульс системи</h2>
-        {error && <p style={{ ...p, color: c.orange }}>Немає зв'язку з API: {error}</p>}
-        {!error && !run && <p style={dim}>Запусків ще не було.</p>}
-        {run && (
-          <p style={{ ...p, color: run.status === "ok" ? c.ink : c.orange }}>
-            Останній запуск о {time(run.started_at)}: {run.status === "ok" ? "успішно" : `помилка. ${errorSummary(run.error)}`}
-          </p>
-        )}
-        {run?.status !== "ok" && run?.error && (
-          <details style={{ fontSize: 12, color: c.dim }}>
-            <summary style={{ cursor: "pointer", minHeight: 32, display: "flex", alignItems: "center" }}>Деталі помилки</summary>
-            <p style={{ ...dim, fontSize: 12, marginTop: 6 }}>{run.error}</p>
-          </details>
-        )}
-        {scan && (
-          <p style={dim}>
-            Скан: {scan.snapshots} із {scan.symbols} монет · джерело {scan.source}
-          </p>
-        )}
-        {targets?.map((t) => (
-          <div key={t.name} style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: c.dim }}>
-            <span>{t.name}</span>
-            <span style={{ color: t.ok ? c.blue : c.orange }}>{t.ok ? "доступний" : "недоступний"} · {t.status ?? "—"} · {t.ms} мс</span>
-          </div>
-        ))}
-        {status && (
-          <p style={dim}>
-            Витрати на моделі цього місяця: ${status.spend.monthUsd.toFixed(2)}
-            {status.spend.budgetUsd !== null && ` із $${status.spend.budgetUsd}`}
-          </p>
-        )}
-        <button type="button" onClick={() => post("/api/probe")} disabled={busy} style={{ ...primary, marginTop: 4 }}>
-          {busy ? "Працюю…" : "Перевірити джерела з ЄС"}
-        </button>
-        {status?.cycle && (
-          <p style={dim}>
-            Цикл о {time(status.cycle.at)}: {status.cycle.steps} кроків, до {status.cycle.maxRequests} зовнішніх запитів на крок із 50 дозволених
-            {status.cycle.failed > 0 && ` · з помилкою: ${status.cycle.failed}`}
-          </p>
-        )}
-        <button type="button" onClick={startScan} disabled={busy} style={secondary}>Запустити скан</button>
-        {scanNote && <p style={dim}>{scanNote}</p>}
-      </section>
-      <Push />
-      <p style={dim}>Скан раз на 30 хв, звіти о 07:30 і 20:30. Система пропонує, рішення за тобою.</p>
-    </>
   );
 }
 
@@ -213,16 +99,27 @@ export function App() {
           margin: "0 auto",
         }}
       >
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-          <h1 style={{ margin: 0, fontSize: 28, fontWeight: 600 }}>{TABS[tab]}</h1>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+          <div style={{ display: "flex", flexDirection: "column", minWidth: 0 }}>
+            {tab === "today" && (
+              <span style={{ fontSize: 13, color: c.dim, fontWeight: 500 }}>
+                {new Date().toLocaleDateString("uk-UA", { weekday: "long", day: "numeric", month: "long" })}
+              </span>
+            )}
+            <h1 style={{ margin: 0, fontSize: 28, fontWeight: 700, letterSpacing: -0.3 }}>{TABS[tab]}</h1>
+          </div>
           {tab === "today" && (
             <div style={{ display: "flex", gap: 8 }}>
-              <button type="button" onClick={() => go("ai")} style={{ ...secondary, minHeight: 40, fontSize: 14, padding: "0 12px", whiteSpace: "nowrap" }}>
-                Моделі ШІ
-              </button>
-              <button type="button" onClick={() => go("settings")} style={{ ...secondary, minHeight: 40, fontSize: 14, padding: "0 12px", whiteSpace: "nowrap" }}>
-                Налаштування
-              </button>
+              <HeaderButton onClick={() => go("ai")} label="Моделі ШІ">
+                <path d="M12 3v3M12 18v3M3 12h3M18 12h3" />
+                <rect x="7" y="7" width="10" height="10" rx="2" />
+                <path d="M10 10h4v4h-4z" />
+              </HeaderButton>
+              <HeaderButton onClick={() => go("settings")} label="Налаштування">
+                <path d="M4 7h10M18 7h2M4 17h4M12 17h8" />
+                <circle cx="16" cy="7" r="2" />
+                <circle cx="10" cy="17" r="2" />
+              </HeaderButton>
             </div>
           )}
         </div>
@@ -234,7 +131,19 @@ export function App() {
         {tab === "settings" && <Settings onBack={() => setTab("today")} onOpenAi={() => go("ai")} />}
         {tab === "ai" && <AiSettings onBack={() => setTab("today")} />}
       </main>
-      <nav style={{ position: "sticky", bottom: 0, display: "flex", background: c.card, borderTop: `1px solid ${c.line}`, paddingBottom: "env(safe-area-inset-bottom)" }}>
+      <nav
+        style={{
+          position: "sticky",
+          bottom: 0,
+          display: "flex",
+          background: "rgba(16, 20, 27, 0.86)",
+          backdropFilter: "blur(16px)",
+          WebkitBackdropFilter: "blur(16px)",
+          borderTop: `1px solid ${c.line}`,
+          paddingBottom: "env(safe-area-inset-bottom)",
+          zIndex: 10,
+        }}
+      >
         {NAV.map((t) => (
           <button
             key={t}
@@ -246,8 +155,25 @@ export function App() {
               if (t === "signals") setSignalId(null);
               if (t === "reports") setReportId(null);
             }}
-            style={{ flex: 1, minHeight: 56, border: 0, background: "transparent", color: tab === t ? c.blue : c.dim, font: "600 13px Inter, system-ui, sans-serif", padding: 0 }}
+            style={{
+              flex: 1,
+              minHeight: 58,
+              border: 0,
+              background: "transparent",
+              color: tab === t ? c.blue : c.dim,
+              font: "600 11px Inter, system-ui, sans-serif",
+              padding: "6px 0 4px",
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              gap: 4,
+              position: "relative",
+            }}
           >
+            {tab === t && <span aria-hidden style={{ position: "absolute", top: 0, width: 28, height: 3, borderRadius: 2, background: c.blue }} />}
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+              {ICON[t]}
+            </svg>
             {TABS[t]}
           </button>
         ))}
