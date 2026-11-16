@@ -166,7 +166,7 @@ const entryText = (s: SignalCard) => (s.entry_low === s.entry_high ? `${s.entry_
 function Votes({ s, size = 44 }: { s: SignalCard; size?: number }) {
   const vote = (name: string, v: number | null) => (
     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-      <Ring value={v} size={size} stroke={5} color={v === null ? c.faint : v >= 0.6 ? c.up : v >= 0.45 ? c.yellow : c.down} label={`${name}: ${pct(v)}`}>
+      <Ring value={v} size={size} stroke={5} color={v === null ? c.faint : v >= 0.55 ? c.up : v >= 0.45 ? c.yellow : c.down} label={`${name}: ${pct(v)}`}>
         <span style={{ ...num, fontSize: size * 0.27, fontWeight: 700 }}>{v === null ? "—" : Math.round(v * 100)}</span>
       </Ring>
       <span style={{ fontSize: 12, color: c.dim, lineHeight: 1.2 }}>{name}</span>
