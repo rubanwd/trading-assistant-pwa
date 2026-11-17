@@ -6,7 +6,7 @@ import type { ReportCard } from "./Reports";
 import { PickCard } from "./Pick";
 import { OpenSignals } from "./Signals";
 import { api, c, card, coin, day, dim, h2, KIND, label, num, p, primary, secondary, time, tone } from "./ui";
-import { Delta, Gauge, LiveDot, Meter, Pill, PriceChart, Ring, Segmented, Skeleton, Slider, Stat, useCandles } from "./viz";
+import { CHART_RANGE, CHART_RANGE_OPTIONS, Delta, Gauge, LiveDot, Meter, Pill, PriceChart, Ring, Segmented, Skeleton, Slider, Stat, useCandles, type ChartRange } from "./viz";
 
 interface Target { name: string; ok: boolean; status: number | null; ms: number; note?: string }
 type Trend = "up" | "down" | "range" | null;
@@ -62,17 +62,10 @@ const usdShort = (v: number) => (v >= 1e12 ? `$${(v / 1e12).toFixed(2)} трлн
 
 // ───────────────────────── BTC ─────────────────────────
 
-type Range = "1d" | "3d" | "10d";
-const RANGE: Record<Range, { tf: "1h" | "4h"; limit: number; text: string }> = {
-  "1d": { tf: "1h", limit: 24, text: "за 24 год" },
-  "3d": { tf: "1h", limit: 72, text: "за 3 дні" },
-  "10d": { tf: "4h", limit: 60, text: "за 10 днів" },
-};
-
 function BtcHero({ status, scan }: { status: Status | null; scan: ScanDetail | null }) {
-  const [range, setRange] = useState<Range>("1d");
+  const [range, setRange] = useState<ChartRange>("1d");
   const live = useLivePrice("BTCUSDT");
-  const { candles, error } = useCandles("BTCUSDT", RANGE[range].tf, RANGE[range].limit);
+  const { candles, error } = useCandles("BTCUSDT", CHART_RANGE[range].tf, CHART_RANGE[range].limit);
   const price = live ?? candles?.[candles.length - 1]?.close ?? status?.btc?.price ?? null;
   const base = candles?.[0]?.open ?? null;
   const change = price !== null && base ? ((price - base) / base) * 100 : null;
@@ -92,7 +85,7 @@ function BtcHero({ status, scan }: { status: Status | null; scan: ScanDetail | n
       <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
         <span style={{ ...num, fontSize: 34, fontWeight: 700, letterSpacing: -0.5 }}>{price === null ? "—" : fmtPrice(price)}</span>
         <Delta value={change} size={15} bg />
-        <span style={{ fontSize: 12, color: c.dim }}>{RANGE[range].text}</span>
+        <span style={{ fontSize: 12, color: c.dim }}>{CHART_RANGE[range].text}</span>
       </div>
       {scan && (
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
@@ -111,7 +104,7 @@ function BtcHero({ status, scan }: { status: Status | null; scan: ScanDetail | n
       ) : (
         <Skeleton height={190} />
       )}
-      <Segmented options={[["1d", "24 год"], ["3d", "3 дні"], ["10d", "10 днів"]]} value={range} onChange={setRange} size="sm" />
+      <Segmented options={CHART_RANGE_OPTIONS} value={range} onChange={setRange} size="sm" />
     </section>
   );
 }
