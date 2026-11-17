@@ -1,14 +1,14 @@
 import { useEffect, useState } from "react";
 import { fmtPrice, useLivePrice } from "./live";
-import { api, c, card, coin, dim, label, num, p, pct, signed, time } from "./ui";
+import { api, c, card, coin, dim, label, num, p, pct, secondary, signed, time } from "./ui";
 import { CHART_RANGE, CHART_RANGE_OPTIONS, LiveDot, Meter, Pill, PriceChart, Ring, Segmented, Skeleton, Stat, useCandles, type ChartRange } from "./viz";
 
-type Side = "long" | "short";
-type Status = "open" | "target" | "stop" | "expired" | "unfilled";
+export type Side = "long" | "short";
+export type Status = "open" | "target" | "stop" | "expired" | "unfilled";
 interface Levels { entry: number; stop: number; target: number; stopPct: number }
 interface Option { symbol: string; side: Side; score: number; factors: { points: number; note: string }[]; price: number; market: Levels; pullback: Levels | null; roomAtr: number | null }
 interface Ai { choice: number; entry: "market" | "pullback"; probability: number; summary: string; argumentsFor: string[]; argumentsAgainst: string[]; invalidation: string }
-interface Idea {
+export interface Idea {
   id: number;
   created_at: string;
   symbol: string;
@@ -28,26 +28,39 @@ interface Idea {
   body: { factors: Option["factors"]; options: Option[]; ai: Ai | null; note: string | null };
 }
 type Recent = Pick<Idea, "id" | "created_at" | "symbol" | "side" | "score" | "verdict" | "status" | "result_r">;
-interface Summary { ideas: number; open: number; target: number; stop: number; expired: number; unfilled: number; avgR: number | null }
-interface PickResponse { latest: Idea | null; recent: Recent[]; stats: { ai: Summary; other: Summary } }
+/** Підсумок групи ідей (як PickGroup у рушії): R після комісій. */
+export interface PickGroup {
+  ideas: number;
+  open: number;
+  unfilled: number;
+  wins: number;
+  losses: number;
+  target: number;
+  stop: number;
+  expired: number;
+  winRate: number | null;
+  avgR: number | null;
+  totalR: number;
+}
+interface PickResponse { latest: Idea | null; recent: Recent[]; stats: { ai: PickGroup; all: PickGroup } }
 
 /** Бал, нижче якого ідея слабка (як PICK_MIN_SCORE у рушії). */
 const MIN_SCORE = 60;
-const SIDE = { long: { text: "Лонг", icon: "▲", color: c.up }, short: { text: "Шорт", icon: "▼", color: c.down } } as const;
-const STATUS: Record<Status, { text: string; color: string }> = {
+export const SIDE = { long: { text: "Лонг", icon: "▲", color: c.up }, short: { text: "Шорт", icon: "▼", color: c.down } } as const;
+export const STATUS: Record<Status, { text: string; color: string }> = {
   open: { text: "відкрита", color: c.blue },
   target: { text: "ціль ✓", color: c.up },
   stop: { text: "стоп", color: c.down },
   expired: { text: "за часом", color: c.dim },
   unfilled: { text: "без входу", color: c.faint },
 };
-const VERDICT = {
+export const VERDICT = {
   pick: { text: "вибір ШІ", color: c.violet },
   pass: { text: "ШІ радить чекати", color: c.orange },
   none: { text: "лише технічний аналіз", color: c.dim },
 } as const;
 
-const distPct = (from: number, to: number) => ((to - from) / from) * 100;
+export const distPct = (from: number, to: number) => ((to - from) / from) * 100;
 
 function Factors({ factors }: { factors: Option["factors"] }) {
   return (
@@ -78,30 +91,80 @@ function Bullets({ items, color, mark }: { items: string[]; color: string; mark:
   );
 }
 
-function TrackRecord({ stats, recent }: { stats: PickResponse["stats"]; recent: Recent[] }) {
+function TrackRecord({ stats, recent, onOpenHistory }: { stats: PickResponse["stats"]; recent: Recent[]; onOpenHistory: () => void }) {
   const s = stats.ai;
-  const closed = s.target + s.stop + s.expired;
+  const closed = s.wins + s.losses;
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 6, paddingTop: 10, borderTop: `1px solid ${c.line}` }}>
       <span style={label}>Як спрацювали ідеї ШІ за 30 днів</span>
       {s.ideas === 0 ? (
-        <p style={{ ...dim, fontSize: 12 }}>Ще немає закритих ідей: результат рахує код за свічками 1h.</p>
+        <p style={{ ...dim, fontSize: 12 }}>Ще немає ідей: результат кожної рахує код за свічками 1h.</p>
       ) : (
         <p style={{ ...dim, fontSize: 12 }}>
-          {s.ideas} ідей · ціль <b style={{ color: c.up }}>{s.target}</b> · стоп <b style={{ color: c.down }}>{s.stop}</b> · за часом {s.expired} · без входу {s.unfilled}
+          {s.ideas} ідей · підтвердились <b style={{ color: c.up }}>{s.wins}</b> · програли <b style={{ color: c.down }}>{s.losses}</b>
+          {s.unfilled ? ` · без входу ${s.unfilled}` : ""}
           {s.open ? ` · відкриті ${s.open}` : ""}
           {closed > 0 && s.avgR !== null ? ` · середнє ${signed(s.avgR)}R` : ""}
         </p>
       )}
       <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-        {recent.slice(0, 8).map((r) => (
+        {recent.slice(0, 6).map((r) => (
           <Pill key={r.id} color={STATUS[r.status].color} style={{ fontSize: 11 }}>
             <span style={{ color: SIDE[r.side].color }}>{SIDE[r.side].icon}</span>
             {coin(r.symbol)} {time(r.created_at)} · {STATUS[r.status].text}
-            {r.result_r !== null && r.status !== "target" && r.status !== "stop" ? ` ${signed(r.result_r)}R` : ""}
+            {r.result_r !== null && r.status === "expired" ? ` ${signed(r.result_r)}R` : ""}
           </Pill>
         ))}
       </div>
+      <button type="button" className="press" onClick={onOpenHistory} style={{ ...secondary, minHeight: 40, fontSize: 14 }}>
+        Уся історія й облік ідей →
+      </button>
+    </div>
+  );
+}
+
+/** Пояснення ідеї: аргументи ШІ, з чого склався бал, інші варіанти. Спільне для картки й історії. */
+export function PickReasons({ pick }: { pick: Idea }) {
+  const ai = pick.body.ai;
+  const others = pick.body.options.filter((o) => o.symbol !== pick.symbol);
+  return (
+    <div className="rise" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      {ai && ai.argumentsFor.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <span style={label}>За</span>
+          <Bullets items={ai.argumentsFor} color={c.up} mark="+" />
+        </div>
+      )}
+      {ai && ai.argumentsAgainst.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <span style={label}>Проти</span>
+          <Bullets items={ai.argumentsAgainst} color={c.down} mark="−" />
+        </div>
+      )}
+      {ai?.invalidation && (
+        <p style={{ ...dim, fontSize: 13 }}>
+          <b style={{ color: c.ink }}>Скасує ідею:</b> {ai.invalidation}
+        </p>
+      )}
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        <span style={label}>З чого склався бал {pick.score} (старт 50)</span>
+        <Factors factors={pick.body.factors} />
+      </div>
+      {others.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <span style={label}>Інші варіанти</span>
+          {others.map((o) => (
+            <div key={o.symbol} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+              <span style={{ fontWeight: 700, width: 56 }}>{coin(o.symbol)}</span>
+              <span style={{ color: SIDE[o.side].color }}>
+                {SIDE[o.side].icon} {SIDE[o.side].text.toLowerCase()}
+              </span>
+              <span style={{ ...num, marginLeft: "auto", color: c.dim }}>бал {o.score}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {pick.model && <p style={{ ...dim, fontSize: 11 }}>Модель: {pick.model}</p>}
     </div>
   );
 }
@@ -110,7 +173,7 @@ function TrackRecord({ stats, recent }: { stats: PickResponse["stats"]; recent: 
  * Ідея скану: одна монета, напрямок і вхід щопів години. Бал, ціни, стоп і ціль рахує код,
  * ШІ вибирає один із найкращих варіантів і пояснює вибір. Це не сигнал.
  */
-export function PickCard() {
+export function PickCard({ onOpenHistory }: { onOpenHistory: () => void }) {
   const [data, setData] = useState<PickResponse | null>(null);
   const [failed, setFailed] = useState(false);
   const [open, setOpen] = useState(false);
@@ -137,7 +200,6 @@ export function PickCard() {
   const ai = pick.body.ai;
   const price = live ?? pick.price;
   const stale = Date.now() - Date.parse(pick.created_at) > 90 * 60_000;
-  const others = pick.body.options.filter((o) => o.symbol !== pick.symbol);
   const verdict = VERDICT[pick.verdict];
   const levels = [
     { price: pick.target, color: c.up, label: `ціль ${fmtPrice(pick.target)}` },
@@ -209,48 +271,9 @@ export function PickCard() {
       <button type="button" onClick={() => setOpen(!open)} style={{ background: "none", border: 0, color: c.blue, font: "600 13px Inter, system-ui, sans-serif", textAlign: "left", padding: 0, cursor: "pointer", minHeight: 32 }}>
         {open ? "Сховати деталі ▴" : "Чому саме ця монета ▾"}
       </button>
-      {open && (
-        <div className="rise" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          {ai && ai.argumentsFor.length > 0 && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              <span style={label}>За</span>
-              <Bullets items={ai.argumentsFor} color={c.up} mark="+" />
-            </div>
-          )}
-          {ai && ai.argumentsAgainst.length > 0 && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              <span style={label}>Проти</span>
-              <Bullets items={ai.argumentsAgainst} color={c.down} mark="−" />
-            </div>
-          )}
-          {ai?.invalidation && (
-            <p style={{ ...dim, fontSize: 13 }}>
-              <b style={{ color: c.ink }}>Скасує ідею:</b> {ai.invalidation}
-            </p>
-          )}
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            <span style={label}>З чого склався бал {pick.score} (старт 50)</span>
-            <Factors factors={pick.body.factors} />
-          </div>
-          {others.length > 0 && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              <span style={label}>Інші варіанти</span>
-              {others.map((o) => (
-                <div key={o.symbol} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
-                  <span style={{ fontWeight: 700, width: 56 }}>{coin(o.symbol)}</span>
-                  <span style={{ color: SIDE[o.side].color }}>
-                    {SIDE[o.side].icon} {SIDE[o.side].text.toLowerCase()}
-                  </span>
-                  <span style={{ ...num, marginLeft: "auto", color: c.dim }}>бал {o.score}</span>
-                </div>
-              ))}
-            </div>
-          )}
-          {pick.model && <p style={{ ...dim, fontSize: 11 }}>Модель: {pick.model}</p>}
-        </div>
-      )}
+      {open && <PickReasons pick={pick} />}
 
-      <TrackRecord stats={data.stats} recent={data.recent} />
+      <TrackRecord stats={data.stats} recent={data.recent} onOpenHistory={onOpenHistory} />
       <p style={{ ...dim, fontSize: 11 }}>Ідея, не сигнал: її не перевіряє скептик і про неї не приходять сповіщення. Ціни, стоп і ціль порахував код; розмір позиції бери від ризику на угоду.</p>
     </section>
   );

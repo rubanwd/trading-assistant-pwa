@@ -491,7 +491,7 @@ function SystemPulse({ status, error, reload }: { status: Status | null; error: 
   );
 }
 
-export function Today({ onOpenReport, onOpenSignal }: { onOpenReport: (id: number) => void; onOpenSignal: (id: number) => void }) {
+export function Today({ onOpenReport, onOpenSignal, onOpenPicks }: { onOpenReport: (id: number) => void; onOpenSignal: (id: number) => void; onOpenPicks: () => void }) {
   const [status, setStatus] = useState<Status | null>(null);
   const [error, setError] = useState<string | null>(null);
   const load = useCallback(async () => {
@@ -512,7 +512,7 @@ export function Today({ onOpenReport, onOpenSignal }: { onOpenReport: (id: numbe
   return (
     <>
       <BtcHero status={status} scan={scan} />
-      <PickCard />
+      <PickCard onOpenHistory={onOpenPicks} />
       <OpenSignals onOpen={onOpenSignal} lastScan={run?.kind === "scan" ? run.started_at : null} />
       <MarketGauges scan={scan} ctx={status?.context ?? null} />
       <CoinMap />

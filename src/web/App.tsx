@@ -1,18 +1,19 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { Reports } from "./Reports";
 import { AiSettings } from "./Ai";
+import { PickHistory } from "./PickHistory";
 import { Settings } from "./Settings";
 import { Signals } from "./Signals";
 import { Stats } from "./Stats";
 import { Today } from "./Today";
 import { c, OFFLINE_EVENT, p, time } from "./ui";
 
-type Tab = "today" | "signals" | "reports" | "stats" | "settings" | "ai";
-const NAV: Exclude<Tab, "settings" | "ai">[] = ["today", "signals", "reports", "stats"];
-const TABS: Record<Tab, string> = { today: "Сьогодні", signals: "Сигнали", reports: "Звіти", stats: "Статистика", settings: "Налаштування", ai: "Моделі ШІ" };
+type Tab = "today" | "signals" | "reports" | "stats" | "settings" | "ai" | "picks";
+const NAV: Exclude<Tab, "settings" | "ai" | "picks">[] = ["today", "signals", "reports", "stats"];
+const TABS: Record<Tab, string> = { today: "Сьогодні", signals: "Сигнали", reports: "Звіти", stats: "Статистика", settings: "Налаштування", ai: "Моделі ШІ", picks: "Історія ідей" };
 
 /** Іконки нижньої панелі: прості лінії, колір бере від тексту кнопки. */
-const ICON: Record<Exclude<Tab, "settings" | "ai">, ReactNode> = {
+const ICON: Record<Exclude<Tab, "settings" | "ai" | "picks">, ReactNode> = {
   today: <path d="M3 12h3l3-8 4 16 3-8h5" />,
   signals: (
     <>
@@ -124,10 +125,11 @@ export function App() {
           )}
         </div>
         <OfflineBanner />
-        {tab === "today" && <Today onOpenReport={(id) => open("report", id)} onOpenSignal={(id) => open("signal", id)} />}
+        {tab === "today" && <Today onOpenReport={(id) => open("report", id)} onOpenSignal={(id) => open("signal", id)} onOpenPicks={() => go("picks")} />}
         {tab === "signals" && <Signals openId={signalId} onOpen={(id) => open("signal", id)} />}
         {tab === "reports" && <Reports openId={reportId} onOpen={(id) => open("report", id)} />}
-        {tab === "stats" && <Stats />}
+        {tab === "stats" && <Stats onOpenPicks={() => go("picks")} />}
+        {tab === "picks" && <PickHistory onBack={() => go("today")} />}
         {tab === "settings" && <Settings onBack={() => setTab("today")} onOpenAi={() => go("ai")} />}
         {tab === "ai" && <AiSettings onBack={() => setTab("today")} />}
       </main>
