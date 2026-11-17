@@ -9,6 +9,15 @@ import { api, arrow, c, num, tone } from "./ui";
 export interface Candle { openTime: number; closeTime: number; open: number; high: number; low: number; close: number; volume?: number }
 
 /** Свічки через рушій (кеш у SQLite рушія, біржа докачує лише нові). */
+/** Проміжки графіка ціни: свічки 1h за добу й три дні, 4h за десять днів. */
+export type ChartRange = "1d" | "3d" | "10d";
+export const CHART_RANGE: Record<ChartRange, { tf: "1h" | "4h"; limit: number; text: string }> = {
+  "1d": { tf: "1h", limit: 24, text: "за 24 год" },
+  "3d": { tf: "1h", limit: 72, text: "за 3 дні" },
+  "10d": { tf: "4h", limit: 60, text: "за 10 днів" },
+};
+export const CHART_RANGE_OPTIONS: [ChartRange, string][] = [["1d", "24 год"], ["3d", "3 дні"], ["10d", "10 днів"]];
+
 export function useCandles(symbol: string | null, tf: "15m" | "1h" | "4h", limit: number) {
   const [candles, setCandles] = useState<Candle[] | null>(null);
   const [error, setError] = useState<string | null>(null);

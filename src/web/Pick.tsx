@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { fmtPrice, useLivePrice } from "./live";
 import { api, c, card, coin, dim, label, num, p, pct, signed, time } from "./ui";
-import { LiveDot, Meter, Pill, PriceChart, Ring, Skeleton, Stat, useCandles } from "./viz";
+import { CHART_RANGE, CHART_RANGE_OPTIONS, LiveDot, Meter, Pill, PriceChart, Ring, Segmented, Skeleton, Stat, useCandles, type ChartRange } from "./viz";
 
 type Side = "long" | "short";
 type Status = "open" | "target" | "stop" | "expired" | "unfilled";
@@ -114,12 +114,13 @@ export function PickCard() {
   const [data, setData] = useState<PickResponse | null>(null);
   const [failed, setFailed] = useState(false);
   const [open, setOpen] = useState(false);
+  const [range, setRange] = useState<ChartRange>("1d");
   useEffect(() => {
     api<PickResponse>("/api/pick").then(setData, () => setFailed(true));
   }, []);
   const pick = data?.latest ?? null;
   const live = useLivePrice(pick?.symbol ?? null);
-  const { candles } = useCandles(pick?.symbol ?? null, "1h", 48);
+  const { candles } = useCandles(pick?.symbol ?? null, CHART_RANGE[range].tf, CHART_RANGE[range].limit);
 
   if (failed) return null;
   if (!data) return <section style={card}><Skeleton height={140} /></section>;
@@ -172,6 +173,7 @@ export function PickCard() {
       {stale && pick.status === "open" && <p style={{ ...dim, fontSize: 12, color: c.orange }}>Ідея старша за півтори години: останній скан, схоже, не вдався.</p>}
 
       {candles?.length ? <PriceChart candles={candles} live={live} height={150} levels={levels} /> : <Skeleton height={170} />}
+      <Segmented options={CHART_RANGE_OPTIONS} value={range} onChange={setRange} size="sm" />
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 10 }}>
         <Stat
