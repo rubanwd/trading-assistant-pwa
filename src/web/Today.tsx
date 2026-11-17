@@ -3,6 +3,7 @@ import { errorSummary } from "../shared/errors";
 import { fmtPrice, useLivePrice } from "./live";
 import { Push } from "./Push";
 import type { ReportCard } from "./Reports";
+import { PickCard } from "./Pick";
 import { OpenSignals } from "./Signals";
 import { api, c, card, coin, day, dim, h2, KIND, label, num, p, primary, secondary, time, tone } from "./ui";
 import { Delta, Gauge, LiveDot, Meter, Pill, PriceChart, Ring, Segmented, Skeleton, Slider, Stat, useCandles } from "./viz";
@@ -518,6 +519,7 @@ export function Today({ onOpenReport, onOpenSignal }: { onOpenReport: (id: numbe
   return (
     <>
       <BtcHero status={status} scan={scan} />
+      <PickCard />
       <OpenSignals onOpen={onOpenSignal} lastScan={run?.kind === "scan" ? run.started_at : null} />
       <MarketGauges scan={scan} ctx={status?.context ?? null} />
       <CoinMap />

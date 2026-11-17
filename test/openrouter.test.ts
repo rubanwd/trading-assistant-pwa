@@ -125,7 +125,7 @@ describe("налаштування агентів", () => {
 
   it("стартові значення коректні й усі моделі є в каталозі", () => {
     expect(validateAi(DEFAULT_AI, known)).toEqual({ ok: true, config: DEFAULT_AI });
-    expect(AGENTS.map((a) => a.id)).toEqual(["news", "report", "analyst", "skeptic", "weekly"]);
+    expect(AGENTS.map((a) => a.id)).toEqual(["news", "report", "analyst", "skeptic", "pick", "weekly"]);
   });
 
   it("відхиляє невідому модель, збіг із запасною, поганий ліміт і рівень", () => {

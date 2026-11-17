@@ -7,7 +7,7 @@ import { callCost, type AgentConfig, type AgentId, type AiConfig, type Effort, t
 
 export const OPENROUTER = "https://openrouter.ai/api/v1";
 
-export type Pipeline = "news" | "morning_report" | "evening_report" | "analyst" | "skeptic" | "weekly_review" | "test";
+export type Pipeline = "news" | "morning_report" | "evening_report" | "analyst" | "skeptic" | "pick" | "weekly_review" | "test";
 
 /** Який агент обслуговує конвеєр. */
 export const PIPELINE_AGENT: Record<Exclude<Pipeline, "test">, AgentId> = {
@@ -16,6 +16,7 @@ export const PIPELINE_AGENT: Record<Exclude<Pipeline, "test">, AgentId> = {
   evening_report: "report",
   analyst: "analyst",
   skeptic: "skeptic",
+  pick: "pick",
   weekly_review: "weekly",
 };
 
@@ -46,7 +47,8 @@ export type BudgetDecision = { allowed: true; agent: AgentConfig } | { allowed: 
 
 /**
  * Перевірка стелі перед викликом. Поки стелю не вичерпано, працює модель агента.
- * Після стелі звіти пише запасна дешева модель; сортування новин, перевірка сигналів,
+ * Після стелі звіти пише запасна дешева модель; сортування новин, перевірка сигналів, ідея скану (лишається
+ * лише технічний аналіз коду),
  * тижневий розбір і пробні виклики зупиняються до наступного місяця.
  */
 export function decideModel(pipeline: Exclude<Pipeline, "test">, spentUsd: number, ai: AiConfig): BudgetDecision {

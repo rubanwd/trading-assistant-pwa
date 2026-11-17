@@ -17,6 +17,7 @@ import {
   type Pipeline,
   type Transport,
 } from "./llm";
+import { choosePick, PICK_SCHEMA, PICK_SYSTEM, pickInput, rankPicks, resolvePick, sanitizePick, type PickAi, type PickOption } from "./pick";
 import { loadStats } from "./stats";
 import { sanitizeWeekly, WEEKLY_SCHEMA, WEEKLY_SYSTEM, weeklyBody, weeklyInput, type WeeklyReview } from "./weekly";
 import { BinanceFutures } from "./market/binance";
@@ -70,7 +71,7 @@ interface PipelineState {
   startedAt: number;
   /** Список монет на момент планування: усі кроки скану працюють з тим самим списком. */
   symbols: string[];
-  /** Черга кроків: scan:N, scan:done, news, signals, review:N, forecasts, reports, weekly, cleanup. */
+  /** Черга кроків: scan:N, scan:done, news, signals, review:N, pick, forecasts, reports, weekly, cleanup. */
   steps: string[];
   log: { step: string; ms: number; requests: number; error?: string }[];
   scan?: { runId: number; market: MarketRegime };
@@ -105,6 +106,20 @@ export interface ReportBody {
   newsIds: number[];
   /** Прогнози попереднього звіту з результатами на момент складання. */
   prior: PriorForecast[];
+}
+
+/** Тіло ідеї скану в picks.body. */
+export interface PickBody {
+  v: 1;
+  /** З чого склався бал вибраного варіанта. */
+  factors: PickOption["factors"];
+  roomAtr: number | null;
+  /** Усі варіанти, які бачила модель, від найвищого балу. */
+  options: PickOption[];
+  ai: PickAi | null;
+  /** Чому модель не відповіла. */
+  note: string | null;
+  market: MarketRegime;
 }
 
 export interface SignalsSummary {
@@ -186,6 +201,7 @@ export class Engine extends DurableObject<Env> {
       "scan:done",
       "news",
       "signals",
+      "pick",
       "forecasts",
       "reports",
       "weekly",
@@ -232,6 +248,8 @@ export class Engine extends DurableObject<Env> {
         return this.runSignals(state, now);
       case "review":
         return this.reviewCandidate(state, Number(arg), now);
+      case "pick":
+        return this.runPick(state, now);
       case "forecasts":
         return this.resolveForecasts(now);
       case "reports":
@@ -1196,6 +1214,115 @@ export class Engine extends DurableObject<Env> {
       .run();
   }
 
+  // ── Ідея скану ───────────────────────────────────────────────────────────
+
+  /**
+   * Щопів години одна ідея: код рахує бал технічного аналізу для кожної монети й напрямку, ціни входу,
+   * стоп і ціль; агент «Ідея скану» вибирає один із кількох найкращих варіантів або жоден.
+   * Без моделі (стеля витрат, збій) ідея лишається технічною. Спершу код закриває попередні ідеї за свічками.
+   */
+  private async runPick(state: PipelineState, now: number): Promise<void> {
+    await this.resolvePicks(state, now);
+    if (!state.scan || (await this.setting("pick_enabled", "on")) === "off") return;
+    const db = this.env.DB;
+    const [minStopPct, horizonHours, macro] = await Promise.all([
+      this.setting("min_stop_pct", 1),
+      this.setting("pick_horizon_hours", 24),
+      this.setting<unknown>("macro_events", []),
+    ]);
+    const rows = await db.prepare("SELECT symbol, features FROM snapshots WHERE run_id = ?").bind(state.scan.runId).all<{ symbol: string; features: string }>();
+    const snapshots = new Map(rows.results.map((r) => [r.symbol, JSON.parse(r.features) as Snapshot]));
+    const options = rankPicks([...snapshots.values()], state.scan.market, { minStopPct });
+    if (!options.length) return;
+
+    const newsRows = await db
+      .prepare("SELECT ts, category, impact, sentiment, symbols, relevance FROM news WHERE ts >= ? AND relevance >= 0.4 ORDER BY relevance DESC, ts DESC LIMIT 30")
+      .bind(new Date(now - 12 * HOUR).toISOString())
+      .all<{ ts: string; category: string; impact: string; sentiment: string; symbols: string; relevance: number }>();
+    const news: NewsField[] = newsRows.results.map((n) => ({
+      category: n.category,
+      impact: n.impact,
+      sentiment: n.sentiment,
+      symbols: JSON.parse(n.symbols || "[]") as string[],
+      relevance: n.relevance,
+      age_hours: Math.round(((now - Date.parse(n.ts)) / HOUR) * 10) / 10,
+    }));
+
+    let ai: PickAi | null = null;
+    let model: string | null = null;
+    let note: string | null = null;
+    try {
+      const input = pickInput({
+        options,
+        snapshots,
+        btc: snapshots.get("BTCUSDT") ?? null,
+        market: state.scan.market,
+        news,
+        horizonHours,
+        minutesToMacro: minutesToMacro(macro, now),
+      });
+      const res = await this.llm("pick", { system: PICK_SYSTEM, user: JSON.stringify(input), schema: PICK_SCHEMA });
+      if (!res) note = "стелю витрат вичерпано: лише технічний аналіз";
+      else {
+        ai = sanitizePick(res.data, options);
+        model = res.model;
+      }
+    } catch (e) {
+      note = `модель не відповіла: ${e instanceof LlmError ? e.message : String(e)}`.slice(0, 300);
+    }
+    const choice = choosePick(options, ai)!;
+    const { option, levels } = choice;
+    const prev = await db.prepare("SELECT symbol, side, status FROM picks ORDER BY id DESC LIMIT 1").first<{ symbol: string; side: string; status: string }>();
+    const repeat = prev?.status === "open" && prev.symbol === option.symbol && prev.side === option.side;
+    const body: PickBody = { v: 1, factors: option.factors, roomAtr: option.roomAtr, options, ai, note, market: state.scan.market };
+    await db
+      .prepare(
+        `INSERT INTO picks (created_at, run_id, symbol, side, entry_kind, price, entry, stop, target, score, verdict, probability, model, horizon_hours, is_repeat, body)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(
+        new Date(now).toISOString(), state.scan.runId, option.symbol, option.side, choice.entryKind, option.price,
+        levels.entry, levels.stop, levels.target, option.score, choice.verdict, ai && ai.choice >= 0 ? ai.probability : null,
+        model, horizonHours, repeat ? 1 : 0, JSON.stringify(body),
+      )
+      .run();
+  }
+
+  /** Закриває відкриті ідеї: ціль, стоп, без входу або за часом. Свічки 1h з кешу. */
+  private async resolvePicks(state: PipelineState, now: number): Promise<void> {
+    const db = this.env.DB;
+    const open = await db
+      .prepare("SELECT id, created_at, symbol, side, entry_kind, entry, stop, target, horizon_hours FROM picks WHERE status = 'open' ORDER BY id LIMIT 150")
+      .all<{ id: number; created_at: string; symbol: string; side: "long" | "short"; entry_kind: "market" | "pullback"; entry: number; stop: number; target: number; horizon_hours: number }>();
+    if (!open.results.length) return;
+    const market = await this.market();
+    const watched = new Set(state.symbols);
+    const update = db.prepare("UPDATE picks SET status = ?, result_r = ?, filled_at = ?, resolved_at = ? WHERE id = ?");
+    const statements: D1PreparedStatement[] = [];
+    const iso = (t: number | null) => (t === null ? null : new Date(t).toISOString());
+    const bySymbol = new Map<string, typeof open.results>();
+    for (const row of open.results) bySymbol.set(row.symbol, [...(bySymbol.get(row.symbol) ?? []), row]);
+    for (const [symbol, list] of bySymbol) {
+      // Монету прибрали зі списку: свічок у кеші немає, тож прострочені ідеї закриваються без результату.
+      if (!watched.has(symbol)) {
+        for (const p of list) {
+          if (Date.parse(p.created_at) + p.horizon_hours * HOUR <= now) statements.push(update.bind("expired", null, null, new Date(now).toISOString(), p.id));
+        }
+        continue;
+      }
+      const h1 = await market.candles(symbol, "1h", CANDLE_LIMIT);
+      for (const p of list) {
+        const res = resolvePick(
+          { side: p.side, entryKind: p.entry_kind, entry: p.entry, stop: p.stop, target: p.target, createdAt: Date.parse(p.created_at), horizonMs: p.horizon_hours * HOUR },
+          h1,
+          now,
+        );
+        if (res.status !== "open" || res.filledAt !== null) statements.push(update.bind(res.status, res.resultR, iso(res.filledAt), iso(res.resolvedAt), p.id));
+      }
+    }
+    if (statements.length) await db.batch(statements);
+  }
+
   // ── Тижневий розбір ──────────────────────────────────────────────────────
 
   /**
@@ -1285,7 +1412,7 @@ export class Engine extends DurableObject<Env> {
     const days = await this.setting("retention_days", 30);
     const cutoff = new Date(now - days * 24 * HOUR).toISOString();
     const runsCutoff = new Date(now - Math.max(days, 90) * 24 * HOUR).toISOString();
-    const [snapshots, news, runs] = await db.batch<never>([
+    const [snapshots, news, picks, runs] = await db.batch<never>([
       db
         .prepare(
           `DELETE FROM snapshots WHERE id IN (
@@ -1295,6 +1422,7 @@ export class Engine extends DurableObject<Env> {
         )
         .bind(cutoff),
       db.prepare("DELETE FROM news WHERE id IN (SELECT id FROM news WHERE ts < ? LIMIT 20000)").bind(cutoff),
+      db.prepare("DELETE FROM picks WHERE id IN (SELECT id FROM picks WHERE created_at < ? AND status != 'open' LIMIT 20000)").bind(runsCutoff),
       db
         .prepare(
           `DELETE FROM runs WHERE id IN (
@@ -1303,7 +1431,7 @@ export class Engine extends DurableObject<Env> {
         )
         .bind(runsCutoff),
     ]);
-    await this.logRun("cleanup", started, { retentionDays: days, snapshots: snapshots!.meta.changes, news: news!.meta.changes, runs: runs!.meta.changes }, null);
+    await this.logRun("cleanup", started, { retentionDays: days, snapshots: snapshots!.meta.changes, news: news!.meta.changes, picks: picks!.meta.changes, runs: runs!.meta.changes }, null);
   }
 
   // ── Сповіщення ───────────────────────────────────────────────────────────

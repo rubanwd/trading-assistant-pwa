@@ -1,7 +1,7 @@
 // Service worker: встановлення PWA, офлайн-кеш і сповіщення Web Push.
 const CACHE = "assistant-v2";
 // Відповіді API, які варто показати без мережі. Запити зі зміною даних (POST, PUT) не кешуються.
-const API_CACHED = /^\/api\/(status|reports|signals|stats|candles|settings|playbook)(\/|\?|$)/;
+const API_CACHED = /^\/api\/(status|pick|reports|signals|stats|candles|settings|playbook)(\/|\?|$)/;
 
 self.addEventListener("install", (event) => {
   event.waitUntil(

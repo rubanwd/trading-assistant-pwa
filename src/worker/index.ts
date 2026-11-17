@@ -380,6 +380,71 @@ app.post("/api/ai/test", async (c) => {
   return c.json(await engineStub(c.env).testAgent(agent.id, override));
 });
 
+interface PickRow {
+  id: number;
+  created_at: string;
+  symbol: string;
+  side: "long" | "short";
+  entry_kind: "market" | "pullback";
+  price: number;
+  entry: number;
+  stop: number;
+  target: number;
+  score: number;
+  verdict: "pick" | "pass" | "none";
+  probability: number | null;
+  model: string | null;
+  horizon_hours: number;
+  is_repeat: number;
+  body: string;
+  status: "open" | "target" | "stop" | "expired" | "unfilled";
+  result_r: number | null;
+  filled_at: string | null;
+  resolved_at: string | null;
+}
+
+/**
+ * Ідея скану для екрана «Сьогодні»: остання ідея повністю, попередні коротко й підсумок результатів за 30 днів.
+ * У підсумок не йдуть повтори (та сама монета й напрямок, поки попередня ідея відкрита).
+ */
+app.get("/api/pick", async (c) => {
+  const db = c.env.DB;
+  const since = new Date(Date.now() - 30 * 24 * 3_600_000).toISOString();
+  const [latest, recent, summary] = await Promise.all([
+    db.prepare("SELECT * FROM picks ORDER BY id DESC LIMIT 1").first<PickRow>(),
+    db
+      .prepare("SELECT id, created_at, symbol, side, entry_kind, entry, score, verdict, probability, status, result_r FROM picks WHERE is_repeat = 0 ORDER BY id DESC LIMIT 12")
+      .all<Omit<PickRow, "body">>(),
+    db
+      .prepare(
+        `SELECT verdict, status, COUNT(*) AS n, COALESCE(SUM(result_r), 0) AS r FROM picks
+         WHERE is_repeat = 0 AND created_at >= ? GROUP BY verdict, status`,
+      )
+      .bind(since)
+      .all<{ verdict: string; status: string; n: number; r: number }>(),
+  ]);
+  const stats = (verdicts: string[]) => {
+    const rows = summary.results.filter((r) => verdicts.includes(r.verdict));
+    const count = (status: string) => rows.filter((r) => r.status === status).reduce((n, r) => n + r.n, 0);
+    const closed = rows.filter((r) => r.status === "target" || r.status === "stop" || r.status === "expired");
+    const n = closed.reduce((s, r) => s + r.n, 0);
+    return {
+      ideas: rows.reduce((s, r) => s + r.n, 0),
+      open: count("open"),
+      target: count("target"),
+      stop: count("stop"),
+      expired: count("expired"),
+      unfilled: count("unfilled"),
+      avgR: n ? Number((closed.reduce((s, r) => s + r.r, 0) / n).toFixed(2)) : null,
+    };
+  };
+  return c.json({
+    latest: latest ? { ...latest, body: JSON.parse(latest.body) } : null,
+    recent: recent.results,
+    stats: { ai: stats(["pick"]), other: stats(["pass", "none"]) },
+  });
+});
+
 /** Публічний ключ VAPID для підписки в браузері. */
 app.get("/api/push/key", (c) => c.json({ key: c.env.VAPID_PUBLIC_KEY ?? null }));
 

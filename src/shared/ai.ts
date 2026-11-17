@@ -4,7 +4,7 @@
  * Спільне для рушія (виклики), API (перевірка) і застосунку (форма).
  */
 
-export const AGENT_IDS = ["news", "report", "analyst", "skeptic", "weekly"] as const;
+export const AGENT_IDS = ["news", "report", "analyst", "skeptic", "pick", "weekly"] as const;
 export type AgentId = (typeof AGENT_IDS)[number];
 
 /** Рівні міркування OpenRouter. "default" означає не передавати параметр: модель вирішує сама. */
@@ -66,6 +66,16 @@ export const AGENTS: AgentSpec[] = [
     callsPerMonth: 120,
   },
   {
+    id: "pick",
+    name: "Ідея скану",
+    role: "Щопів години вибирає одну монету, напрямок і вхід серед найкращих за технічним аналізом варіантів, які порахував код, або радить не входити.",
+    defaultModel: "anthropic/claude-haiku-5.5",
+    defaultEffort: "low",
+    defaultMaxTokens: 4000,
+    typicalTokens: { input: 5000, output: 600 },
+    callsPerMonth: 1440,
+  },
+  {
     id: "weekly",
     name: "Тижневий розбір",
     role: "У неділю пояснює статистику тижня й пропонує зміни правил.",
@@ -89,7 +99,7 @@ export interface AiConfig {
   agents: Record<AgentId, AgentConfig>;
   /** Місячна стеля витрат, $. */
   budgetUsd: number;
-  /** Модель для звітів після стелі; сортування новин і перевірка сигналів тоді зупиняються. */
+  /** Модель для звітів після стелі; сортування новин, перевірка сигналів та ідея скану тоді зупиняються. */
   budgetFallbackModel: string;
   /** "deny": лише провайдери, що не зберігають дані запитів. */
   dataCollection: "allow" | "deny";
