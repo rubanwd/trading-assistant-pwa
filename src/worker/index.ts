@@ -8,6 +8,8 @@ import { AGENTS, AI_KEYS, aiFromSettings, DEFAULT_AI, validateAi, type AgentConf
 import { PIPELINE_AGENT } from "./llm";
 import { PLAYBOOK_DEFAULT } from "./signals/review";
 import { calibration, hit, loadStats } from "./stats";
+import { netR, outcome, summarize, type PickRecord } from "./pickStats";
+import type { Fees } from "../shared/risk";
 
 export { Engine } from "./engine";
 
@@ -403,46 +405,67 @@ interface PickRow {
   resolved_at: string | null;
 }
 
-/**
- * Ідея скану для екрана «Сьогодні»: остання ідея повністю, попередні коротко й підсумок результатів за 30 днів.
- * У підсумок не йдуть повтори (та сама монета й напрямок, поки попередня ідея відкрита).
- */
+/** Ідеї без повторів за період, кожна з кількістю повторів поспіль. */
+const PICK_LIST = `
+  SELECT p.id, p.created_at, p.symbol, p.side, p.entry_kind, p.entry, p.stop, p.target, p.score, p.verdict, p.probability,
+         p.status, p.result_r, p.resolved_at,
+         (SELECT COUNT(*) FROM picks r WHERE r.is_repeat = 1 AND r.id > p.id
+            AND r.id < COALESCE((SELECT MIN(n.id) FROM picks n WHERE n.is_repeat = 0 AND n.id > p.id), 9e18)) AS repeats
+  FROM picks p WHERE p.is_repeat = 0 AND p.created_at >= ? ORDER BY p.id DESC LIMIT ?`;
+
+async function pickFees(db: D1Database): Promise<Fees> {
+  const rows = await db.prepare("SELECT key, value FROM settings WHERE key IN ('fee_maker_pct', 'fee_taker_pct')").all<{ key: string; value: string }>();
+  const get = (key: string, fallback: number) => {
+    const v = Number(JSON.parse(rows.results.find((r) => r.key === key)?.value ?? "null"));
+    return Number.isFinite(v) && v >= 0 ? v : fallback;
+  };
+  return { makerPct: get("fee_maker_pct", 0.02), takerPct: get("fee_taker_pct", 0.05) };
+}
+
+/** Ідея скану для екрана «Сьогодні»: остання ідея повністю, попередні коротко й підсумок за 30 днів. */
 app.get("/api/pick", async (c) => {
   const db = c.env.DB;
   const since = new Date(Date.now() - 30 * 24 * 3_600_000).toISOString();
-  const [latest, recent, summary] = await Promise.all([
+  const [latest, list, fees] = await Promise.all([
     db.prepare("SELECT * FROM picks ORDER BY id DESC LIMIT 1").first<PickRow>(),
-    db
-      .prepare("SELECT id, created_at, symbol, side, entry_kind, entry, score, verdict, probability, status, result_r FROM picks WHERE is_repeat = 0 ORDER BY id DESC LIMIT 12")
-      .all<Omit<PickRow, "body">>(),
-    db
-      .prepare(
-        `SELECT verdict, status, COUNT(*) AS n, COALESCE(SUM(result_r), 0) AS r FROM picks
-         WHERE is_repeat = 0 AND created_at >= ? GROUP BY verdict, status`,
-      )
-      .bind(since)
-      .all<{ verdict: string; status: string; n: number; r: number }>(),
+    db.prepare(PICK_LIST).bind(since, 1000).all<PickRecord>(),
+    pickFees(db),
   ]);
-  const stats = (verdicts: string[]) => {
-    const rows = summary.results.filter((r) => verdicts.includes(r.verdict));
-    const count = (status: string) => rows.filter((r) => r.status === status).reduce((n, r) => n + r.n, 0);
-    const closed = rows.filter((r) => r.status === "target" || r.status === "stop" || r.status === "expired");
-    const n = closed.reduce((s, r) => s + r.n, 0);
-    return {
-      ideas: rows.reduce((s, r) => s + r.n, 0),
-      open: count("open"),
-      target: count("target"),
-      stop: count("stop"),
-      expired: count("expired"),
-      unfilled: count("unfilled"),
-      avgR: n ? Number((closed.reduce((s, r) => s + r.r, 0) / n).toFixed(2)) : null,
-    };
-  };
+  const summary = summarize(list.results, fees);
   return c.json({
     latest: latest ? { ...latest, body: JSON.parse(latest.body) } : null,
-    recent: recent.results,
-    stats: { ai: stats(["pick"]), other: stats(["pass", "none"]) },
+    recent: list.results.slice(0, 12),
+    stats: { ai: summary.byVerdict.pick, all: summary.all },
   });
+});
+
+/**
+ * Історія й облік ідей скану: кожна ідея з результатом (після комісій) і підсумки.
+ * period=all | 7 | 30 | 90 (днів), verdict=all | pick | pass | none. Повтори в окремі ідеї не йдуть.
+ */
+app.get("/api/picks", async (c) => {
+  const period = c.req.query("period") ?? "all";
+  const days = period === "all" ? null : Number(period);
+  if (days !== null && ![7, 30, 90].includes(days)) return c.json({ error: "period must be all, 7, 30 or 90" }, 400);
+  const db = c.env.DB;
+  const since = days === null ? "" : new Date(Date.now() - days * 86_400_000).toISOString();
+  const verdict = c.req.query("verdict") ?? "all";
+  if (!["all", "pick", "pass", "none"].includes(verdict)) return c.json({ error: "verdict must be all, pick, pass or none" }, 400);
+  const [list, fees] = await Promise.all([db.prepare(PICK_LIST).bind(since, 2000).all<PickRecord>(), pickFees(db)]);
+  const rows = verdict === "all" ? list.results : list.results.filter((r) => r.verdict === verdict);
+  return c.json({
+    from: since || null,
+    fees,
+    summary: summarize(rows, fees),
+    picks: rows.map((r) => ({ ...r, outcome: outcome(r), net_r: netR(r, fees) })),
+  });
+});
+
+/** Одна ідея з поясненням ШІ й ознаками балу. */
+app.get("/api/picks/:id{[0-9]+}", async (c) => {
+  const row = await c.env.DB.prepare("SELECT * FROM picks WHERE id = ?").bind(Number(c.req.param("id"))).first<PickRow>();
+  if (!row) return c.json({ error: "not found" }, 404);
+  return c.json({ ...row, body: JSON.parse(row.body) });
 });
 
 /** Публічний ключ VAPID для підписки в браузері. */

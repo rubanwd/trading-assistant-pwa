@@ -140,7 +140,7 @@ function VersusBars({ items }: { items: { name: string; value: number | null }[]
 }
 
 /** Крива капіталу в R із перехрестям: торкнись, щоб побачити угоду. */
-function EquityCurve({ trades }: { trades: { r: number; at: string; symbol: string }[] }) {
+export function EquityCurve({ trades, title = "Крива результату", unit = "угод" }: { trades: { r: number; at: string; symbol: string }[]; title?: string; unit?: string }) {
   const [hover, setHover] = useState<number | null>(null);
   const ref = useRef<SVGSVGElement>(null);
   if (trades.length < 2) return null;
@@ -171,17 +171,17 @@ function EquityCurve({ trades }: { trades: { r: number; at: string; symbol: stri
   return (
     <section style={card} className="rise">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8 }}>
-        <h2 style={h2}>Крива результату</h2>
+        <h2 style={h2}>{title}</h2>
         <span style={{ ...num, fontSize: 18, fontWeight: 700, color: col }}>{signed(last)}R</span>
       </div>
       <div style={{ ...num, fontSize: 12, color: c.dim, minHeight: 18 }}>
         {h !== null ? (
           <>
-            Угода {h}: {coin(trades[h - 1]!.symbol)} <span style={{ color: tone(trades[h - 1]!.r), fontWeight: 600 }}>{signed(trades[h - 1]!.r)}R</span> · разом{" "}
+            {unit === "угод" ? "Угода" : "Ідея"} {h}: {coin(trades[h - 1]!.symbol)} <span style={{ color: tone(trades[h - 1]!.r), fontWeight: 600 }}>{signed(trades[h - 1]!.r)}R</span> · разом{" "}
             <span style={{ color: tone(pts[h]!), fontWeight: 600 }}>{signed(pts[h]!)}R</span> · {day(trades[h - 1]!.at)}
           </>
         ) : (
-          <>Найбільша просадка <span style={{ color: c.down, fontWeight: 600 }}>{signed(dd)}R</span> · {trades.length} угод</>
+          <>Найбільша просадка <span style={{ color: c.down, fontWeight: 600 }}>{signed(dd)}R</span> · {trades.length} {unit}</>
         )}
       </div>
       <svg
@@ -190,7 +190,7 @@ function EquityCurve({ trades }: { trades: { r: number; at: string; symbol: stri
         width="100%"
         style={{ display: "block", touchAction: "pan-y" }}
         role="img"
-        aria-label={`Крива результату: ${signed(last)}R за ${trades.length} угод`}
+        aria-label={`${title}: ${signed(last)}R за ${trades.length} ${unit}`}
         onPointerDown={(e) => pick(e.clientX)}
         onPointerMove={(e) => (e.pointerType === "mouse" || e.buttons ? pick(e.clientX) : undefined)}
         onPointerLeave={() => setHover(null)}
@@ -361,7 +361,7 @@ export function StatsView({ stats }: { stats: Stats }) {
   );
 }
 
-export function Stats() {
+export function Stats({ onOpenPicks }: { onOpenPicks: () => void }) {
   const [period, setPeriod] = useState<Period>("all");
   const [stats, setStats] = useState<Stats | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -396,6 +396,13 @@ export function Stats() {
       )}
       {stats && <EquityCurve trades={trades} />}
       {stats && <StatsView stats={stats} />}
+      <button type="button" className="press" onClick={onOpenPicks} style={{ ...card, color: c.ink, textAlign: "left", font: "inherit", cursor: "pointer" }}>
+        <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={h2}>Ідеї скану</span>
+          <span style={{ marginLeft: "auto", color: c.blue, fontSize: 13, fontWeight: 600 }}>Історія й облік →</span>
+        </span>
+        <span style={{ ...dim, fontSize: 13 }}>Кожна рекомендація скану з результатом: скільки підтвердилось і скільки програло.</span>
+      </button>
     </>
   );
 }

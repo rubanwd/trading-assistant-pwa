@@ -1422,7 +1422,8 @@ export class Engine extends DurableObject<Env> {
         )
         .bind(cutoff),
       db.prepare("DELETE FROM news WHERE id IN (SELECT id FROM news WHERE ts < ? LIMIT 20000)").bind(cutoff),
-      db.prepare("DELETE FROM picks WHERE id IN (SELECT id FROM picks WHERE created_at < ? AND status != 'open' LIMIT 20000)").bind(runsCutoff),
+      // Ідеї лишаються назавжди (історія й облік); видаляються лише старі повтори, які в облік не йдуть.
+      db.prepare("DELETE FROM picks WHERE id IN (SELECT id FROM picks WHERE is_repeat = 1 AND created_at < ? AND status != 'open' LIMIT 20000)").bind(runsCutoff),
       db
         .prepare(
           `DELETE FROM runs WHERE id IN (

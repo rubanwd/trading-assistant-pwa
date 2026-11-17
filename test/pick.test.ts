@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { choosePick, PICK_SCHEMA, pickInput, pickLevels, rankPicks, resolvePick, sanitizePick, scoreSide, type PickOption } from "../src/worker/pick";
 import type { MarketRegime } from "../src/worker/regime";
+import { netR, outcome, summarize, type PickRecord } from "../src/worker/pickStats";
 import { buildSnapshot, type Snapshot } from "../src/worker/snapshot";
 import { flip, ohlc, path, uptrend } from "./fixtures";
 
@@ -137,5 +138,48 @@ describe("результат ідеї", () => {
   it("шорт дзеркально", () => {
     const short = { ...trade, side: "short" as const, stop: 103, target: 94 };
     expect(resolvePick(short, after([[100, 101, 93.5, 94]]), created + 2 * H)).toMatchObject({ status: "target", resultR: 2 });
+  });
+});
+
+describe("облік ідей", () => {
+  const fees = { makerPct: 0.02, takerPct: 0.05 };
+  const base: PickRecord = {
+    id: 1, created_at: "2026-11-17T10:00:00.000Z", symbol: "SOLUSDT", side: "long", entry_kind: "market", entry: 100, stop: 97, target: 106,
+    score: 70, verdict: "pick", probability: 0.4, status: "target", result_r: 2, resolved_at: "2026-11-17T15:00:00.000Z", repeats: 0,
+  };
+
+  it("підтвердилась: ціль або закриття за часом у плюсі; програла: стоп або за часом у мінусі", () => {
+    expect(outcome(base)).toBe("win");
+    expect(outcome({ ...base, status: "stop", result_r: -1 })).toBe("loss");
+    expect(outcome({ ...base, status: "expired", result_r: 0.4 })).toBe("win");
+    expect(outcome({ ...base, status: "expired", result_r: -0.3 })).toBe("loss");
+    expect(outcome({ ...base, status: "open", result_r: null })).toBe("open");
+    expect(outcome({ ...base, status: "unfilled", result_r: null })).toBe("none");
+  });
+
+  it("результат після комісій: вхід за ринком taker, ціль maker, стоп taker", () => {
+    // (100 × 0.05% + 106 × 0.02%) / 3 = 0.0237R
+    expect(netR(base, fees)).toBe(1.98);
+    // (100 × 0.05% + 97 × 0.05%) / 3 = 0.0328R
+    expect(netR({ ...base, status: "stop", result_r: -1 }, fees)).toBe(-1.03);
+    expect(netR({ ...base, status: "open", result_r: null }, fees)).toBeNull();
+  });
+
+  it("підсумок і розріз", () => {
+    const rows: PickRecord[] = [
+      base,
+      { ...base, id: 2, status: "stop", result_r: -1 },
+      { ...base, id: 3, side: "short", stop: 103, target: 94, status: "expired", result_r: -0.5, verdict: "pass", probability: null },
+      { ...base, id: 4, status: "open", result_r: null },
+      { ...base, id: 5, entry_kind: "pullback", status: "unfilled", result_r: null },
+    ];
+    const s = summarize(rows, fees);
+    expect(s.all).toMatchObject({ ideas: 5, open: 1, unfilled: 1, wins: 1, losses: 2, target: 1, stop: 1, expired: 1 });
+    expect(s.all.winRate).toBeCloseTo(1 / 3);
+    expect(s.all.totalR).toBeCloseTo(1.98 - 1.03 - 0.53, 2);
+    expect(s.byVerdict.pick).toMatchObject({ ideas: 4, wins: 1, losses: 1 });
+    expect(s.bySide.short).toMatchObject({ ideas: 1, losses: 1 });
+    expect(s.byEntry.pullback).toMatchObject({ ideas: 1, unfilled: 1 });
+    expect(s.calibration).toEqual({ n: 2, predicted: 0.4, actual: 0.5 });
   });
 });
