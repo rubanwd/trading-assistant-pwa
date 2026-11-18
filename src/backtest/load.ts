@@ -47,7 +47,7 @@ async function fetchMonth(symbol: string, tf: Timeframe, month: string, latest: 
   }
 }
 
-async function pool<T>(tasks: (() => Promise<T>)[], size: number): Promise<T[]> {
+export async function pool<T>(tasks: (() => Promise<T>)[], size: number): Promise<T[]> {
   const out = new Array<T>(tasks.length);
   let next = 0;
   await Promise.all(
@@ -63,10 +63,19 @@ async function pool<T>(tasks: (() => Promise<T>)[], size: number): Promise<T[]> 
 
 const TIMEFRAMES: Timeframe[] = ["15m", "1h", "4h", "1d"];
 
-/** Свічки всіх таймфреймів для монет за місяці from..to разом із розгоном індикаторів. */
-export async function loadSymbols(symbols: string[], from: string, to: string, log: (line: string) => void = () => {}): Promise<SymbolCandles[]> {
+/**
+ * Свічки всіх таймфреймів для монет за місяці from..to разом із розгоном індикаторів.
+ * `timeframes` обмежує завантаження; таймфрейми поза списком лишаються порожніми.
+ */
+export async function loadSymbols(
+  symbols: string[],
+  from: string,
+  to: string,
+  log: (line: string) => void = () => {},
+  timeframes: Timeframe[] = TIMEFRAMES,
+): Promise<SymbolCandles[]> {
   const jobs = symbols.flatMap((symbol) =>
-    TIMEFRAMES.flatMap((tf) => months(shiftMonth(from, -WARMUP[tf]), to).map((month) => ({ symbol, tf, month }))),
+    timeframes.flatMap((tf) => months(shiftMonth(from, -WARMUP[tf]), to).map((month) => ({ symbol, tf, month }))),
   );
   let done = 0;
   log(`Завантаження свічок: ${jobs.length} місячних файлів (кеш у ${ROOT}/cache)`);

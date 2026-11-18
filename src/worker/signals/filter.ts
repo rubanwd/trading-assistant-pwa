@@ -1,7 +1,7 @@
 import { stopDistancePct } from "../../shared/risk";
 import type { Candidate } from "./types";
 
-export const REJECTIONS = ["weak", "extended", "stop", "duplicate", "cooldown", "macro", "max_active"] as const;
+export const REJECTIONS = ["weak", "extended", "volatile", "stop", "duplicate", "cooldown", "macro", "max_active"] as const;
 export type Rejection = (typeof REJECTIONS)[number];
 
 export interface FilterContext {
@@ -27,11 +27,16 @@ export interface FilterContext {
  * - свічка пробою з обсягом нижче середнього або розмахом менше 1 ATR: −0.10R на угоду (решта +0.13R),
  *   мінус в обох половинах періоду;
  * - ціна далі ніж 9 ATR від EMA200: −0.32R, для шортів −0.60R в обох половинах. Це вхід навздогін
- *   після довгого руху, коли стоп уже далеко, а відкат близько.
+ *   після довгого руху, коли стоп уже далеко, а відкат близько;
+ * - пробій у розгойданому ринку: ATR 4h у верхніх 20% свого вікна (498 свічок, ~80 днів), `atr_rank` > 0.8.
+ *   Такі угоди дали −0.11R (2022-01 — 2023-10) і −0.03R (2023-11 — 2026-10) проти +0.2R у решти; без них на основному періоді
+ *   +0.22R на угоду замість +0.17R, сума R на 12% більша, просадка 74R замість 82R, сигналів 1.59 на добу замість 1.84.
+ *   Знайдено дослідженням закономірностей (`npm run patterns`) на 2022–2024 і підтверджено на 2025–2026.
  */
 export const MIN_VOLUME_RATIO = 1;
 export const MIN_CANDLE_RANGE_ATR = 1;
 export const MAX_EMA200_DISTANCE_ATR = 9;
+export const MAX_ATR_RANK = 0.8;
 
 export const candidateKey = (c: Pick<Candidate, "symbol" | "setup" | "side">) => `${c.symbol}|${c.setup}|${c.side}`;
 
@@ -44,6 +49,7 @@ export function reject(c: Candidate, ctx: FilterContext): Rejection | null {
   const f = c.facts;
   if ((f.volume_ratio ?? Infinity) < MIN_VOLUME_RATIO || (f.candle_range_atr ?? Infinity) < MIN_CANDLE_RANGE_ATR) return "weak";
   if ((f.ema200_distance_atr ?? 0) >= MAX_EMA200_DISTANCE_ATR) return "extended";
+  if ((f.atr_rank ?? 0) > MAX_ATR_RANK) return "volatile";
   if (stopDistancePct(c.entry, c.stop) < ctx.minStopPct) return "stop";
   if (ctx.openSymbols.has(c.symbol)) return "duplicate";
   if (ctx.recent.has(candidateKey(c))) return "cooldown";
