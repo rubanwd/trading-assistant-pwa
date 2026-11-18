@@ -4,5 +4,5 @@
     "strict": true, "skipLibCheck": true, "noEmit": true,
     "lib": ["ES2022", "DOM"], "types": ["node"]
   },
-  "include": ["scripts", "src/backtest", "test/backtest.test.ts"]
+  "include": ["scripts", "src/backtest", "src/research", "test/backtest.test.ts", "test/research.test.ts"]
 }
