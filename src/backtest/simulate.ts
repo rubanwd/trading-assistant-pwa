@@ -41,6 +41,8 @@ export interface BacktestConfig {
   takerPct: number;
   /** Проковзування, % від ціни на кожному виконанні (вхід і вихід): стрес-тест, у рушії не рахується. */
   slippagePct: number;
+  /** Для досліджень: додатковий відсів кандидатів до фільтра (кандидат пропускається, ніби детектор його не знайшов). */
+  experiment?: { skip?: (c: Candidate) => boolean };
 }
 
 /** Стартові налаштування, як у міграціях. */
@@ -218,6 +220,7 @@ export function backtest(
           openCount: open.length,
           maxActive: cfg.maxActive,
         });
+        if (cfg.experiment?.skip?.(c)) continue;
         onCandidate?.(c, { t, mood, regime: s.regime, h1: s.h1.window(t), h4, d1: s.d1.window(t), m15: s.data["15m"], rejection: reason });
         if (reason) funnel.filtered[reason] = (funnel.filtered[reason] ?? 0) + 1;
         else passed.push({ ...c, regime: s.regime });

@@ -46,6 +46,8 @@ describe("детектор трендового пробою", () => {
     expect(s!.facts.breakout_atr).toBeGreaterThan(0);
     expect(s!.facts.ema200_distance_atr).toBeGreaterThan(0);
     expect(Object.keys(s!)).not.toContain("tp1");
+    expect(s!.facts.atr_rank).toBeGreaterThanOrEqual(0);
+    expect(s!.facts.atr_rank).toBeLessThanOrEqual(1);
   });
 
   it("шорт є точним дзеркалом лонга", () => {
@@ -115,6 +117,12 @@ describe("фільтр", () => {
     expect(reject({ ...c, facts: strong }, ctx())).toBeNull();
     expect(reject({ ...c, facts: { ...strong, volume_ratio: 0.99 } }, ctx())).toBe("weak");
     expect(reject({ ...c, facts: { ...strong, candle_range_atr: 0.99 } }, ctx())).toBe("weak");
+  });
+
+  it("відсіює пробій у розгойданому ринку: ATR у верхніх 20% вікна", () => {
+    const facts = { volume_ratio: 2, candle_range_atr: 2, ema200_distance_atr: 4, atr_rank: 0.8 };
+    expect(reject({ ...c, facts }, ctx())).toBeNull();
+    expect(reject({ ...c, facts: { ...facts, atr_rank: 0.81 } }, ctx())).toBe("volatile");
   });
 
   it("відсіює вхід навздогін: 9 ATR і далі від EMA200, в обох напрямах", () => {

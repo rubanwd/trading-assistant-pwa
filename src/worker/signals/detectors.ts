@@ -1,5 +1,5 @@
 import type { Side } from "../../shared/risk";
-import { atr, ema, last, sma } from "../indicators";
+import { atr, ema, last, percentileOfLast, sma } from "../indicators";
 import type { Candle } from "../market/types";
 import type { Candidate } from "./types";
 
@@ -14,6 +14,7 @@ import type { Candidate } from "./types";
  * Сила пробою (`quality`) рахується з тих самих вимірів: обсяг, розмах свічки й глибина пробою.
  * На тих самих трьох роках найслабша п'ята частина кандидатів дала −0.07R на угоду, найсильніша +0.25R,
  * тож за силою кандидати впорядковуються перед моделлю, а найслабші відсіює фільтр.
+ * `atr_rank` (волатильність відносно ~80 днів) у силу не входить: порядок за ним бектест не покращив, тож він діє лише як фільтр.
  */
 
 /** Пробій максимуму стількох попередніх свічок 4h за закриттям. */
@@ -48,7 +49,8 @@ export function breakout(c: Candle[]): { stop: number; facts: Record<string, num
   const high = Math.max(...channel.map((x) => x.high));
   const low = Math.min(...channel.map((x) => x.low));
   const trend = last(ema(c.map((x) => x.close), TREND_EMA));
-  const a = last(atr(c, 14));
+  const atrSeries = atr(c, 14);
+  const a = last(atrSeries);
   const vol = last(sma(c.map((x) => x.volume), 20));
   if (trend === null || a === null || a <= 0) return null;
   if (!(cur.close > high && cur.close > trend)) return null;
@@ -60,6 +62,9 @@ export function breakout(c: Candle[]): { stop: number; facts: Record<string, num
       ema200_distance_atr: (cur.close - trend) / a,
       candle_range_atr: (cur.high - cur.low) / a,
       volume_ratio: vol ? cur.volume / vol : 0,
+      // Волатильність відносно історії монети: частка свічок у вікні з ATR у відсотках від ціни не вищим за поточний (0..1).
+      // Ціна береться за модулем: шорт рахується на дзеркальних (від'ємних) цінах.
+      atr_rank: percentileOfLast(atrSeries.map((v, i) => v / Math.abs(c[i]!.close)), c.length) ?? 0.5,
     },
   };
 }

@@ -3,17 +3,18 @@ import type { MarketRegime } from "../regime";
 import { compactSymbol, type NewsField } from "../report/input";
 import type { Snapshot } from "../snapshot";
 import { ENTRY_BARS, EXIT_BARS, STOP_ATR } from "./detectors";
-import { MAX_EMA200_DISTANCE_ATR, MIN_CANDLE_RANGE_ATR, MIN_VOLUME_RATIO } from "./filter";
+import { MAX_ATR_RANK, MAX_EMA200_DISTANCE_ATR, MIN_CANDLE_RANGE_ATR, MIN_VOLUME_RATIO } from "./filter";
 import { SETUP_NAME, type Candidate, type SetupId } from "./types";
 
 /** Правила сетапів за замовчуванням. Лягають у playbook_versions; нові версії вмикає людина. */
 export const PLAYBOOK_DEFAULT: Record<SetupId, string> = {
   trend_breakout:
     `Трендовий пробій 4h. Свічка 4h закрилась вище максимуму ${ENTRY_BARS} попередніх свічок і вище EMA200 4h (для шорта дзеркально). ` +
-    `Код уже відсіяв слабкі пробої (обсяг свічки нижчий за ${MIN_VOLUME_RATIO}× середнього або розмах менший за ${MIN_CANDLE_RANGE_ATR} ATR) і входи навздогін (ціна далі ніж ${MAX_EMA200_DISTANCE_ATR} ATR від EMA200). ` +
+    `Код уже відсіяв слабкі пробої (обсяг свічки нижчий за ${MIN_VOLUME_RATIO}× середнього або розмах менший за ${MIN_CANDLE_RANGE_ATR} ATR) входи навздогін (ціна далі ніж ${MAX_EMA200_DISTANCE_ATR} ATR від EMA200) і пробої в розгойданому ринку (atr_rank, частка свічок за ~80 днів з ATR не вищим за поточний, більше ${MAX_ATR_RANK}). ` +
     `Вхід за ринком після закриття, початковий стоп ${STOP_ATR} ATR(14) 4h від входу, цілі немає: позицію закриває стоп, закриття 4h нижче мінімуму ${EXIT_BARS} попередніх свічок або ліміт часу. ` +
     "Більшість угод закривається невеликим збитком, результат дають рідкі довгі тренди. " +
     "У бектесті на трьох роках сильніші пробої (більший обсяг, розмах свічки й глибина пробою, тобто вища breakout_quality) давали кращий результат; лонги в середньому +0.3R на угоду, шорти близько нуля, тож шорт потребує чистішого контексту. " +
+    "Пробій зі спокійного ринку (atr_rank до 0.2) давав у середньому близько +0.5R, тоді як решта близько +0.1R. " +
     "Слабкі ознаки: ціна далі ніж 7 ATR від EMA200 після тривалого руху, перегрітий фандинг у бік угоди, відкритий інтерес падає, тренд 1d і BTC проти угоди, новини високого впливу проти угоди.",
 };
 
