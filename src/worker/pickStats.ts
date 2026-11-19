@@ -121,3 +121,108 @@ export function summarize(rows: PickRecord[], fees: Fees): PickSummary {
     },
   };
 }
+
+/** День за Києвом (YYYY-MM-DD): ідеї одного дня бачать той самий ринок і мають спільне майбутнє. */
+export const kyivDay = (iso: string) => new Date(iso).toLocaleDateString("sv-SE", { timeZone: "Europe/Kyiv" });
+
+export interface PickDay {
+  /** YYYY-MM-DD за Києвом, день появи ідеї. */
+  day: string;
+  closed: number;
+  wins: number;
+  losses: number;
+  long: number;
+  short: number;
+  /** Після комісій. */
+  totalR: number;
+}
+
+export interface PickReliability {
+  /** Закриті ідеї з входом. */
+  closed: number;
+  /** Скільки різних днів (незалежних відрізків ринку) за ними стоїть. */
+  days: number;
+  /** 95% інтервал середнього R після комісій; null, поки днів менше MIN_DAYS. */
+  ci: [number, number] | null;
+  /** Частка закритих ідей у переважному напрямку, 0..1, і сам напрямок. */
+  sideShare: number | null;
+  side: Side | null;
+  /** Частка найбільшого за модулем дня в сумі модулів денних результатів, 0..1; null без закритих ідей. */
+  topDayShare: number | null;
+  byDay: PickDay[];
+}
+
+/** Мінімум днів для інтервалу: з одного-двох днів бутстреп нічого не каже. */
+export const MIN_DAYS = 3;
+/** Закритих ідей, після яких підсумку можна вірити (як 100 сигналів у форвард-тесті). */
+export const ENOUGH_CLOSED = 100;
+
+/** Детермінований генератор: однакові дані дають однаковий інтервал. */
+function mulberry32(seed: number) {
+  return () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = seed;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * 95% інтервал середнього з бутстрепом за кластерами: вибираються цілі дні, а не окремі ідеї.
+ * Ідеї одного дня рухаються разом із ринком, тож звичайний бутстреп дав би оманливо вузький інтервал.
+ */
+export function clusterMeanCi(clusters: { sum: number; n: number }[], iterations = 1000, seed = 42): [number, number] | null {
+  const g = clusters.length;
+  if (g < MIN_DAYS) return null;
+  const rand = mulberry32(seed);
+  const means: number[] = [];
+  for (let i = 0; i < iterations; i++) {
+    let sum = 0;
+    let n = 0;
+    for (let j = 0; j < g; j++) {
+      const c = clusters[Math.floor(rand() * g)]!;
+      sum += c.sum;
+      n += c.n;
+    }
+    means.push(sum / n);
+  }
+  means.sort((a, b) => a - b);
+  const at = (q: number) => Number(means[Math.min(iterations - 1, Math.floor(iterations * q))]!.toFixed(2));
+  return [at(0.025), at(0.975)];
+}
+
+/** Наскільки можна вірити підсумку: інтервал за днями, розбивка за днями й зосередженість в одному напрямку. */
+export function reliability(rows: PickRecord[], fees: Fees): PickReliability {
+  const days = new Map<string, PickDay>();
+  let closed = 0;
+  let long = 0;
+  for (const r of rows) {
+    const net = netR(r, fees);
+    if (net === null) continue;
+    closed++;
+    if (r.side === "long") long++;
+    const key = kyivDay(r.created_at);
+    const d = days.get(key) ?? { day: key, closed: 0, wins: 0, losses: 0, long: 0, short: 0, totalR: 0 };
+    d.closed++;
+    if (outcome(r) === "win") d.wins++;
+    else d.losses++;
+    d[r.side]++;
+    d.totalR += net;
+    days.set(key, d);
+  }
+  const byDay = [...days.values()].sort((a, b) => b.day.localeCompare(a.day));
+  const absTotal = byDay.reduce((s, d) => s + Math.abs(d.totalR), 0);
+  const top = byDay.reduce((m, d) => Math.max(m, Math.abs(d.totalR)), 0);
+  for (const d of byDay) d.totalR = Number(d.totalR.toFixed(2));
+  const short = closed - long;
+  return {
+    closed,
+    days: byDay.length,
+    ci: clusterMeanCi(byDay.map((d) => ({ sum: d.totalR, n: d.closed }))),
+    sideShare: closed ? Math.max(long, short) / closed : null,
+    side: closed ? (long >= short ? "long" : "short") : null,
+    topDayShare: absTotal > 0 ? top / absTotal : null,
+    byDay,
+  };
+}

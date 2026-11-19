@@ -8,7 +8,7 @@ import { AGENTS, AI_KEYS, aiFromSettings, DEFAULT_AI, validateAi, type AgentConf
 import { PIPELINE_AGENT } from "./llm";
 import { PLAYBOOK_DEFAULT } from "./signals/review";
 import { calibration, hit, loadStats } from "./stats";
-import { netR, outcome, summarize, type PickRecord } from "./pickStats";
+import { netR, outcome, reliability, summarize, type PickRecord } from "./pickStats";
 import type { Fees } from "../shared/risk";
 
 export { Engine } from "./engine";
@@ -457,6 +457,7 @@ app.get("/api/picks", async (c) => {
     from: since || null,
     fees,
     summary: summarize(rows, fees),
+    reliability: reliability(rows, fees),
     picks: rows.map((r) => ({ ...r, outcome: outcome(r), net_r: netR(r, fees) })),
   });
 });

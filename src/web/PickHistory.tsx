@@ -3,7 +3,7 @@ import { fmtPrice } from "./live";
 import { PickReasons, SIDE, VERDICT, distPct, type Idea, type PickGroup, type Side, type Status } from "./Pick";
 import { EquityCurve } from "./Stats";
 import { api, c, card, coin, day, dim, h2, label, num, p, pct, secondary, signed, time, tone } from "./ui";
-import { Pill, Ring, Segmented, Skeleton, Stat } from "./viz";
+import { Meter, Pill, Ring, Segmented, Skeleton, Stat } from "./viz";
 
 type Verdict = Idea["verdict"];
 type Outcome = "win" | "loss" | "open" | "none";
@@ -34,7 +34,22 @@ interface Summary {
   byEntry: Record<"market" | "pullback", PickGroup>;
   calibration: { n: number; predicted: number | null; actual: number | null };
 }
-interface Response { from: string | null; summary: Summary; picks: Row[] }
+interface Day { day: string; closed: number; wins: number; losses: number; long: number; short: number; totalR: number }
+/** Як PickReliability у рушії. */
+interface Reliability {
+  closed: number;
+  days: number;
+  ci: [number, number] | null;
+  sideShare: number | null;
+  side: Side | null;
+  topDayShare: number | null;
+  byDay: Day[];
+}
+interface Response { from: string | null; summary: Summary; reliability: Reliability; picks: Row[] }
+
+/** Як ENOUGH_CLOSED і MIN_DAYS у рушії. */
+const ENOUGH_CLOSED = 100;
+const MIN_DAYS = 3;
 
 type Period = "all" | "30" | "7";
 type Filter = "all" | Verdict;
@@ -107,6 +122,96 @@ function SummaryCard({ s, filter }: { s: Summary; filter: Filter }) {
           Чесність ШІ: у середньому обіцяв <b style={{ color: c.violet }}>{pct(cal.predicted)}</b> на ціль, дійшло до цілі{" "}
           <b style={{ color: cal.actual >= cal.predicted ? c.up : c.orange }}>{pct(cal.actual)}</b> ({cal.n} закритих ідей ШІ).
         </p>
+      )}
+    </section>
+  );
+}
+
+/** Висновок: чи результат уже щось доводить. */
+function verdict(rel: Reliability, avgR: number | null): { text: string; color: string } {
+  const { ci, closed, days } = rel;
+  if (!closed) return { text: "Ще жодної закритої ідеї.", color: c.dim };
+  if (!ci) return { text: `Замало даних: ${closed} закритих ідей за ${days} дн. Інтервал з'явиться від ${MIN_DAYS} днів.`, color: c.orange };
+  if (ci[1] < 0) return { text: "Ідеї в мінусі навіть з урахуванням випадковості.", color: c.down };
+  if (ci[0] <= 0) return { text: `Перевага не доведена: інтервал перетинає 0R, тож ${avgR !== null && avgR > 0 ? "плюс" : "результат"} може бути випадковим.`, color: c.orange };
+  if (closed < ENOUGH_CLOSED) return { text: `Поки в плюсі, але ${closed} закритих замало для висновку: потрібно ${ENOUGH_CLOSED}.`, color: c.orange };
+  return { text: "Перевага тримається: інтервал вище 0R на достатній вибірці.", color: c.up };
+}
+
+/** Інтервал на шкалі з нулем і середнім. */
+function CiBar({ ci, mean }: { ci: [number, number]; mean: number | null }) {
+  const lo = Math.min(ci[0], -0.5);
+  const hi = Math.max(ci[1], 0.5);
+  const x = (v: number) => `${((v - lo) / (hi - lo)) * 100}%`;
+  const color = ci[0] > 0 ? c.up : ci[1] < 0 ? c.down : c.orange;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      <div style={{ position: "relative", height: 14 }} aria-hidden>
+        <div style={{ position: "absolute", left: 0, right: 0, top: 6, height: 2, background: c.line }} />
+        <div style={{ position: "absolute", left: x(ci[0]), width: `calc(${x(ci[1])} - ${x(ci[0])})`, top: 4, height: 6, borderRadius: 3, background: `${color}AA` }} />
+        <div style={{ position: "absolute", left: `calc(${x(0)} - 1px)`, top: 0, width: 2, height: 14, background: c.dim }} />
+        {mean !== null && <div style={{ position: "absolute", left: `calc(${x(mean)} - 4px)`, top: 3, width: 8, height: 8, borderRadius: 4, background: c.ink }} />}
+      </div>
+      <div style={{ ...num, display: "flex", justifyContent: "space-between", fontSize: 11, color: c.faint }}>
+        <span>{signed(lo, 1)}R</span>
+        <span>0R</span>
+        <span>{signed(hi, 1)}R</span>
+      </div>
+    </div>
+  );
+}
+
+/** Чи можна вірити підсумку: інтервал за днями, кількість закритих, зосередженість у напрямку й одному дні. */
+function TrustCard({ rel, avgR }: { rel: Reliability; avgR: number | null }) {
+  const v = verdict(rel, avgR);
+  const warnings: string[] = [];
+  if (rel.closed >= 4 && rel.sideShare !== null && rel.sideShare >= 0.75 && rel.side)
+    warnings.push(`${pct(rel.sideShare)} закритих ідей — ${rel.side === "long" ? "▲ лонги" : "▼ шорти"}: результат залежить від того, куди йшов ринок.`);
+  if (rel.days > 1 && rel.topDayShare !== null && rel.topDayShare >= 0.5) warnings.push(`Один день дав ${pct(rel.topDayShare)} результату (за модулем).`);
+  if (rel.days === 1 && rel.closed > 1) warnings.push("Усі закриті ідеї з одного дня: це одна ставка на рух ринку, а не окремі угоди.");
+  return (
+    <section style={card}>
+      <h2 style={h2}>Чи можна цьому вірити</h2>
+      <p style={{ ...p, color: v.color, fontWeight: 600 }}>{v.text}</p>
+      {rel.ci && (
+        <>
+          <span style={{ ...num, fontSize: 13, color: c.dim }}>
+            95% інтервал середнього: <b style={{ color: c.ink }}>{signed(rel.ci[0])}R … {signed(rel.ci[1])}R</b>
+            {avgR !== null && <> · середнє {signed(avgR)}R</>}
+          </span>
+          <CiBar ci={rel.ci} mean={avgR} />
+        </>
+      )}
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <Meter value={rel.closed / ENOUGH_CLOSED} color={rel.closed >= ENOUGH_CLOSED ? c.up : c.blue} />
+        <span style={{ ...num, fontSize: 12, color: c.dim, flex: "none" }}>
+          {rel.closed} / {ENOUGH_CLOSED} закритих · {rel.days} дн.
+        </span>
+      </div>
+      {warnings.map((w) => (
+        <p key={w} style={{ ...dim, fontSize: 12, color: c.orange }}>
+          ⚠ {w}
+        </p>
+      ))}
+      <p style={{ ...dim, fontSize: 12 }}>
+        Ідеї одного дня бачать той самий ринок і рухаються разом, тож інтервал рахується бутстрепом за днями, а не за окремими ідеями. Він вужчає з кількістю днів, а не ідей.
+      </p>
+      {rel.byDay.length > 0 && (
+        <>
+          <span style={{ ...label, marginTop: 4 }}>За днями появи</span>
+          {rel.byDay.map((d) => (
+            <div key={d.day} style={{ ...num, display: "flex", alignItems: "center", gap: 10, padding: "6px 0", borderBottom: `1px solid ${c.line}`, fontSize: 13 }}>
+              <span style={{ minWidth: 86 }}>{day(`${d.day}T12:00:00`)}</span>
+              <span style={{ color: c.dim, fontSize: 12 }}>
+                <span style={{ color: c.up }}>▲{d.long}</span> <span style={{ color: c.down }}>▼{d.short}</span>
+              </span>
+              <span style={{ color: c.dim, fontSize: 12 }}>
+                ✓{d.wins} ✗{d.losses}
+              </span>
+              <span style={{ marginLeft: "auto", fontWeight: 700, color: tone(d.totalR) }}>{signed(d.totalR)}R</span>
+            </div>
+          ))}
+        </>
       )}
     </section>
   );
@@ -286,6 +391,7 @@ export function PickHistory({ onBack }: { onBack: () => void }) {
       {data && (
         <>
           <SummaryCard s={data.summary} filter={filter} />
+          <TrustCard rel={data.reliability} avgR={data.summary.all.avgR} />
           <EquityCurve trades={curve} title="Крива результату ідей" unit="ідей" />
           <Breakdown s={data.summary} filter={filter} />
           <IdeaList rows={data.picks} />

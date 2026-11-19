@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { choosePick, PICK_SCHEMA, pickInput, pickLevels, rankPicks, resolvePick, sanitizePick, scoreSide, type PickOption } from "../src/worker/pick";
 import type { MarketRegime } from "../src/worker/regime";
-import { netR, outcome, summarize, type PickRecord } from "../src/worker/pickStats";
+import { clusterMeanCi, kyivDay, netR, outcome, reliability, summarize, type PickRecord } from "../src/worker/pickStats";
 import { buildSnapshot, type Snapshot } from "../src/worker/snapshot";
 import { flip, ohlc, path, uptrend } from "./fixtures";
 
@@ -181,5 +181,36 @@ describe("облік ідей", () => {
     expect(s.bySide.short).toMatchObject({ ideas: 1, losses: 1 });
     expect(s.byEntry.pullback).toMatchObject({ ideas: 1, unfilled: 1 });
     expect(s.calibration).toEqual({ n: 2, predicted: 0.4, actual: 0.5 });
+  });
+
+  it("надійність: розбивка за днями Києва, напрямок і інтервал лише від 3 днів", () => {
+    const at = (iso: string, extra: Partial<PickRecord>): PickRecord => ({ ...base, created_at: iso, status: "expired", result_r: 0.5, ...extra });
+    // 22:30 UTC 1 листопада — це вже 2 листопада за Києвом.
+    expect(kyivDay("2026-11-01T22:30:00Z")).toBe("2026-11-02");
+    const twoDays = [
+      at("2026-11-01T10:00:00Z", { id: 1, side: "short", stop: 103, target: 94 }),
+      at("2026-11-01T22:30:00Z", { id: 2, side: "short", stop: 103, target: 94 }),
+      at("2026-11-02T10:00:00Z", { id: 3, side: "short", stop: 103, target: 94, result_r: -0.4 }),
+      { ...base, id: 4, status: "open" as const, result_r: null },
+    ];
+    const r = reliability(twoDays, fees);
+    expect(r).toMatchObject({ closed: 3, days: 2, ci: null, side: "short", sideShare: 1 });
+    expect(r.byDay.map((d) => [d.day, d.closed, d.wins, d.losses, d.short])).toEqual([
+      ["2026-11-02", 2, 1, 1, 2],
+      ["2026-11-01", 1, 1, 0, 1],
+    ]);
+    const three = reliability([...twoDays, at("2026-11-05T10:00:00Z", { id: 5, result_r: 1 })], fees);
+    expect(three.days).toBe(3);
+    expect(three.ci![0]).toBeLessThanOrEqual(three.ci![1]);
+  });
+
+  it("інтервал за днями ширший, ніж якби ідеї були незалежні", () => {
+    // Три дні: у кожному 10 однакових ідей. Бутстреп за днями бачить лише 3 точки.
+    const ci = clusterMeanCi([{ sum: 10, n: 10 }, { sum: -10, n: 10 }, { sum: 5, n: 10 }])!;
+    expect(ci[0]).toBeLessThan(0);
+    expect(ci[1]).toBeGreaterThan(0);
+    expect(clusterMeanCi([{ sum: 1, n: 1 }, { sum: 2, n: 1 }])).toBeNull();
+    // Детермінований: ті самі дані — той самий інтервал.
+    expect(clusterMeanCi([{ sum: 10, n: 10 }, { sum: -10, n: 10 }, { sum: 5, n: 10 }])).toEqual(ci);
   });
 });
