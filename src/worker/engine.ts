@@ -1232,7 +1232,10 @@ export class Engine extends DurableObject<Env> {
     ]);
     const rows = await db.prepare("SELECT symbol, features FROM snapshots WHERE run_id = ?").bind(state.scan.runId).all<{ symbol: string; features: string }>();
     const snapshots = new Map(rows.results.map((r) => [r.symbol, JSON.parse(r.features) as Snapshot]));
-    const options = rankPicks([...snapshots.values()], state.scan.market, { minStopPct });
+    // Монета з відкритою ідеєю (ще чекає входу або в позиції) не береться знову, поки та не закриється.
+    const busy = await db.prepare("SELECT DISTINCT symbol FROM picks WHERE status = 'open'").all<{ symbol: string }>();
+    const exclude = new Set(busy.results.map((r) => r.symbol));
+    const options = rankPicks([...snapshots.values()], state.scan.market, { minStopPct, exclude });
     if (!options.length) return;
 
     const newsRows = await db
@@ -1272,8 +1275,6 @@ export class Engine extends DurableObject<Env> {
     }
     const choice = choosePick(options, ai)!;
     const { option, levels } = choice;
-    const prev = await db.prepare("SELECT symbol, side, status FROM picks ORDER BY id DESC LIMIT 1").first<{ symbol: string; side: string; status: string }>();
-    const repeat = prev?.status === "open" && prev.symbol === option.symbol && prev.side === option.side;
     const body: PickBody = { v: 1, factors: option.factors, roomAtr: option.roomAtr, options, ai, note, market: state.scan.market };
     await db
       .prepare(
@@ -1283,7 +1284,7 @@ export class Engine extends DurableObject<Env> {
       .bind(
         new Date(now).toISOString(), state.scan.runId, option.symbol, option.side, choice.entryKind, option.price,
         levels.entry, levels.stop, levels.target, option.score, choice.verdict, ai && ai.choice >= 0 ? ai.probability : null,
-        model, horizonHours, repeat ? 1 : 0, JSON.stringify(body),
+        model, horizonHours, 0, JSON.stringify(body),
       )
       .run();
   }

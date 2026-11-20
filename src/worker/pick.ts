@@ -157,10 +157,18 @@ export function scoreSide(s: Snapshot, side: Side, market: MarketRegime): { scor
   return { score, factors: factors.sort((a, b) => Math.abs(b.points) - Math.abs(a.points)), roomAtr };
 }
 
-/** Найкращий напрямок для кожної монети, від найвищого балу. Монети без ATR 4h не беруться. */
-export function rankPicks(snapshots: Snapshot[], market: MarketRegime, opts: { minStopPct: number; top?: number }): PickOption[] {
+/**
+ * Найкращий напрямок для кожної монети, від найвищого балу. Монети без ATR 4h не беруться,
+ * як і монети з `exclude` (по них уже є відкрита ідея: нова чекає, поки та закриється).
+ */
+export function rankPicks(
+  snapshots: Snapshot[],
+  market: MarketRegime,
+  opts: { minStopPct: number; top?: number; exclude?: ReadonlySet<string> },
+): PickOption[] {
   const out: PickOption[] = [];
   for (const s of snapshots) {
+    if (opts.exclude?.has(s.symbol)) continue;
     const atr4h = s.tf["4h"].atr14;
     if (!atr4h || atr4h <= 0 || !(s.price > 0)) continue;
     const sides = (["long", "short"] as const).map((side) => ({ side, ...scoreSide(s, side, market) }));
