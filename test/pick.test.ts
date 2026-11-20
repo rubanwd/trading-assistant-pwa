@@ -49,6 +49,12 @@ describe("бал технічного аналізу", () => {
     expect(ranked.find((o) => o.symbol === "SOLUSDT")!.side).toBe("short");
     expect(rankPicks([down, up], riskOn, { minStopPct: 1, top: 1 })).toHaveLength(1);
   });
+
+  it("монета з відкритою ідеєю не береться знову", () => {
+    const ranked = rankPicks([down, up], riskOn, { minStopPct: 1, exclude: new Set(["ETHUSDT"]) });
+    expect(ranked.map((o) => o.symbol)).toEqual(["SOLUSDT"]);
+    expect(rankPicks([down, up], riskOn, { minStopPct: 1, exclude: new Set(["ETHUSDT", "SOLUSDT"]) })).toEqual([]);
+  });
 });
 
 describe("рівні ідеї", () => {
