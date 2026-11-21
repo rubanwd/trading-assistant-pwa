@@ -42,7 +42,7 @@ export interface SymbolRegime {
 
 export interface MarketRegime {
   mood: MarketMood;
-  /** Тренд BTC на 4h. */
+  /** Тренд орієнтира ринку на 4h: BTC для крипто, ETF індексу для акцій (назва поля лишилась з часів лише крипто). */
   btcTrend: Trend | null;
   /** Частка монет із ціною вище EMA200 на 4h (0..1); null, якщо даних немає. */
   breadth: number | null;

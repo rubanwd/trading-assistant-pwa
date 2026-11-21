@@ -7,10 +7,10 @@ export type Check = (v: unknown) => { ok: true; value: unknown } | { ok: false; 
 
 export interface SettingSpec {
   key: string;
-  group: "Ризик" | "Сигнали" | "Звіти й сповіщення" | "Ринок" | "Модель і дані";
+  group: "Ризик" | "Сигнали" | "Звіти й сповіщення" | "Ринок" | "Акції" | "Модель і дані";
   label: string;
   help?: string;
-  kind: "number" | "nullable-number" | "clock" | "quiet" | "report-times" | "symbols" | "macro" | "feeds" | "enum" | "timezone";
+  kind: "number" | "nullable-number" | "clock" | "quiet" | "report-times" | "symbols" | "symbol" | "macro" | "feeds" | "enum" | "timezone";
   options?: string[];
   check: Check;
 }
@@ -34,6 +34,42 @@ const clock: Check = (v) => (typeof v === "string" && CLOCK.test(v) ? ok(v) : fa
 
 const SYMBOL = /^[A-Z0-9]{2,20}USDT$/;
 
+const onOff: Check = (v) => (v === "on" || v === "off" ? ok(v) : fail("on або off"));
+
+const reportTimes: Check = (v) => {
+  const t = v as { morning?: unknown; evening?: unknown } | null;
+  if (!t || !clock(t.morning).ok || !clock(t.evening).ok) return fail("ранок і вечір у форматі ГГ:ХХ");
+  return ok({ morning: t.morning, evening: t.evening });
+};
+
+const symbols = (what: string): Check => (v) => {
+  if (!Array.isArray(v) || v.length === 0 || v.length > 30) return fail(`від 1 до 30 ${what}`);
+  const list = [...new Set(v.map((s) => (typeof s === "string" ? s.trim().toUpperCase() : "")))];
+  const bad = list.find((s) => !SYMBOL.test(s));
+  return bad !== undefined ? fail(`невідомий формат: ${bad || "порожньо"}`) : ok(list);
+};
+
+const symbol: Check = (v) => {
+  const s = typeof v === "string" ? v.trim().toUpperCase() : "";
+  return SYMBOL.test(s) ? ok(s) : fail("символ контракту, наприклад SPYUSDT");
+};
+
+const feeds: Check = (v) => {
+  if (!Array.isArray(v) || v.length > 10) return fail("до 10 стрічок");
+  const out: { source: string; url: string }[] = [];
+  for (const f of v) {
+    const { source, url } = (f ?? {}) as { source?: unknown; url?: unknown };
+    if (typeof source !== "string" || !/^[\w.-]{1,40}$/.test(source)) return fail("назва стрічки: латиниця, цифри, до 40 символів");
+    try {
+      if (typeof url !== "string" || new URL(url).protocol !== "https:") throw new Error();
+    } catch {
+      return fail(`адреса має починатися з https: ${String(url)}`);
+    }
+    out.push({ source, url });
+  }
+  return ok(out);
+};
+
 export const SETTINGS: SettingSpec[] = [
   { key: "deposit_usd", group: "Ризик", label: "Депозит, $", help: "Для розміру позиції в сповіщеннях; порожньо, якщо не потрібно.", kind: "nullable-number", check: nullable(num(1, 100_000_000)) },
   { key: "risk_per_trade_pct", group: "Ризик", label: "Ризик на угоду, % депозиту", kind: "number", check: num(0.1, 5) },
@@ -44,7 +80,7 @@ export const SETTINGS: SettingSpec[] = [
   { key: "max_active_signals", group: "Сигнали", label: "Відкритих сигналів не більше", help: "Що більше місць, то частіше сигнали, але й більший ризик одночасно: 10 відкритих по 0.5% депозиту — це 5%.", kind: "number", check: num(1, 15, true) },
   { key: "max_candidates_per_scan", group: "Сигнали", label: "Кандидатів до моделі за скан", help: "Якщо пробоїв більше, до моделі йдуть найсильніші.", kind: "number", check: num(1, 10, true) },
   { key: "signal_max_hold_hours", group: "Сигнали", label: "Найдовше тримати позицію, год", help: "Позицію закриває стоп, вихід за каналом 4h або цей ліміт. Коротший ліміт швидше звільняє місце для нових сигналів: у бектесті 120 год дали більше сигналів без втрати середнього результату. Не більше 480 год: супровід іде за свічками 1h, а кеш тримає ~20 днів.", kind: "number", check: num(4, 480) },
-  { key: "pick_enabled", group: "Сигнали", label: "Ідея скану", help: "Щопів години одна монета, напрямок і вхід, найкращі за технічним аналізом і на думку агента «Ідея скану». Це не сигнал: без скептика й сповіщень.", kind: "enum", options: ["on", "off"], check: (v) => (v === "on" || v === "off" ? ok(v) : fail("on або off")) },
+  { key: "pick_enabled", group: "Сигнали", label: "Ідея скану", help: "Щопів години одна монета, напрямок і вхід, найкращі за технічним аналізом і на думку агента «Ідея скану». Це не сигнал: без скептика й сповіщень.", kind: "enum", options: ["on", "off"], check: onOff },
   { key: "pick_horizon_hours", group: "Сигнали", label: "Горизонт ідеї скану, год", help: "За цей час ціна має дійти до цілі 2R раніше за стоп; інакше ідея закривається за часом. Лімітний вхід, що не виконався за цей час, скасовується.", kind: "number", check: num(4, 96) },
   { key: "signal_cooldown_hours", group: "Сигнали", label: "Пауза для того самого сетапу по монеті, год", kind: "number", check: num(0, 72) },
   { key: "macro_blackout_hours", group: "Сигнали", label: "Без нових сигналів до макроподії, год", kind: "number", check: num(0, 24) },
@@ -67,17 +103,7 @@ export const SETTINGS: SettingSpec[] = [
       return ok(out.sort((a, b) => a.at.localeCompare(b.at)));
     },
   },
-  {
-    key: "report_times",
-    group: "Звіти й сповіщення",
-    label: "Час звітів",
-    kind: "report-times",
-    check: (v) => {
-      const t = v as { morning?: unknown; evening?: unknown } | null;
-      if (!t || !clock(t.morning).ok || !clock(t.evening).ok) return fail("ранок і вечір у форматі ГГ:ХХ");
-      return ok({ morning: t.morning, evening: t.evening });
-    },
-  },
+  { key: "report_times", group: "Звіти й сповіщення", label: "Час звітів", help: "Крипто. Час звітів по акціях — у групі «Акції».", kind: "report-times", check: reportTimes },
   { key: "weekly_review_time", group: "Звіти й сповіщення", label: "Тижневий розбір, неділя о", kind: "clock", check: clock },
   {
     key: "quiet_hours",
@@ -108,42 +134,22 @@ export const SETTINGS: SettingSpec[] = [
       }
     },
   },
-  {
-    key: "watchlist",
-    group: "Ринок",
-    label: "Монети",
-    help: "Ф'ючерси USDT через кому, до 30.",
-    kind: "symbols",
-    check: (v) => {
-      if (!Array.isArray(v) || v.length === 0 || v.length > 30) return fail("від 1 до 30 монет");
-      const list = [...new Set(v.map((s) => (typeof s === "string" ? s.trim().toUpperCase() : "")))];
-      const bad = list.find((s) => !SYMBOL.test(s));
-      return bad !== undefined ? fail(`невідомий формат: ${bad || "порожньо"}`) : ok(list);
-    },
-  },
+  { key: "watchlist", group: "Ринок", label: "Монети", help: "Ф'ючерси USDT через кому, до 30.", kind: "symbols", check: symbols("монет") },
   { key: "market_source", group: "Ринок", label: "Джерело даних", help: "auto: Binance, а якщо він недоступний з ЄС, то Bybit.", kind: "enum", options: ["auto", "binance", "bybit"], check: (v) => (v === "auto" || v === "binance" || v === "bybit" ? ok(v) : fail("auto, binance або bybit")) },
   {
-    key: "news_feeds",
-    group: "Модель і дані",
-    label: "Стрічки новин",
-    help: "Рядок на стрічку: назва, потім адреса https.",
-    kind: "feeds",
-    check: (v) => {
-      if (!Array.isArray(v) || v.length > 10) return fail("до 10 стрічок");
-      const out: { source: string; url: string }[] = [];
-      for (const f of v) {
-        const { source, url } = (f ?? {}) as { source?: unknown; url?: unknown };
-        if (typeof source !== "string" || !/^[\w.-]{1,40}$/.test(source)) return fail("назва стрічки: латиниця, цифри, до 40 символів");
-        try {
-          if (typeof url !== "string" || new URL(url).protocol !== "https:") throw new Error();
-        } catch {
-          return fail(`адреса має починатися з https: ${String(url)}`);
-        }
-        out.push({ source, url });
-      }
-      return ok(out);
-    },
+    key: "stocks_enabled",
+    group: "Акції",
+    label: "Режим акцій",
+    help: "Безстрокові USDT-контракти Bybit на акції та ETF США: свій скан, сигнали, ідеї, новини й звіти. Нові сигнали й ідеї лише в основну сесію NYSE (9:30–16:00 за Нью-Йорком). Ризик, пороги й ліміти спільні з крипто, місця для сигналів рахуються окремо.",
+    kind: "enum",
+    options: ["on", "off"],
+    check: onOff,
   },
+  { key: "stocks_watchlist", group: "Акції", label: "Акції", help: "Контракти Bybit через кому, до 30: AAPLUSDT, NVDAUSDT, ETF SPYUSDT… Символу без контракту на Bybit скан не знайде й напише про це в пульсі.", kind: "symbols", check: symbols("акцій") },
+  { key: "stocks_benchmark", group: "Акції", label: "Орієнтир ринку", help: "Замість BTC: його тренд 4h разом із часткою акцій вище EMA200 визначає настрій ринку. Скан бере його завжди, навіть якщо його немає в списку.", kind: "symbol", check: symbol },
+  { key: "stocks_report_times", group: "Акції", label: "Час звітів по акціях", help: "Лише в торгові дні США. Стартово 16:00 перед відкриттям і 23:15 після закриття за Києвом.", kind: "report-times", check: reportTimes },
+  { key: "stocks_news_feeds", group: "Акції", label: "Стрічки новин фондового ринку", help: "Рядок на стрічку: назва, потім адреса https.", kind: "feeds", check: feeds },
+  { key: "news_feeds", group: "Модель і дані", label: "Стрічки новин", help: "Крипто. Рядок на стрічку: назва, потім адреса https.", kind: "feeds", check: feeds },
   { key: "retention_days", group: "Модель і дані", label: "Зберігати знімки й новини, днів", kind: "number", check: num(7, 365, true) },
   { key: "playbook_min_days", group: "Модель і дані", label: "Нова версія правил не частіше ніж раз на, днів", kind: "number", check: num(0, 60, true) },
 ];

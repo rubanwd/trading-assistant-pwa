@@ -8,7 +8,7 @@ interface Bin { from: number; to: number; n: number; predicted: number; actual: 
 interface Calibration { n: number; brier: number | null; bins: Bin[] }
 export interface Stats {
   from: string | null;
-  summary: Group & { published: number; open: number; avgFeeR: number | null; riskPct: number; equityPct: number; btcHoldPct: number | null; target: number };
+  summary: Group & { published: number; open: number; avgFeeR: number | null; riskPct: number; equityPct: number; btcHoldPct: number | null; holdSymbol?: string; target: number };
   bySetup: (Group & { setup: string; published: number })[];
   byVersion: (Group & { version: number | null })[];
   journal: Record<"taken" | "skipped" | "none", Group>;
@@ -23,7 +23,7 @@ const PIPELINE: Record<string, string> = {
   analyst: "Аналітик", skeptic: "Скептик", weekly_review: "Тижневий розбір", test: "Пробні виклики",
 };
 const FILTER: Record<string, string> = {
-  rr: "R:R нижче порога", stop: "стоп надто близько", regime: "проти режиму", market: "проти настрою ринку", duplicate: "уже є сигнал по монеті",
+  rr: "R:R нижче порога", stop: "стоп надто близько", regime: "проти режиму", market: "проти настрою ринку", duplicate: "уже є сигнал по інструменту",
   cooldown: "пауза після сетапу", macro: "перед макроподією", max_active: "ліміт відкритих",
   weak: "слабкий пробій (обсяг або розмах свічки)", extended: "надто далеко від EMA200",
   volatile: "ринок надто розгойданий (ATR у верхніх 20%)",
@@ -226,6 +226,7 @@ const PERIOD: Record<Period, string> = { all: "Увесь час", "30": "30 д�
 export function StatsView({ stats }: { stats: Stats }) {
   const s = stats.summary;
   const beats = s.btcHoldPct === null ? null : s.equityPct > s.btcHoldPct;
+  const hold = coin(s.holdSymbol ?? "BTCUSDT");
   const f = stats.funnel;
   const funnel = [
     { name: "Сканів зі свіжою 4h", v: f.scans, color: c.faint },
@@ -265,11 +266,11 @@ export function StatsView({ stats }: { stats: Stats }) {
 
       <section style={card}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8 }}>
-          <h2 style={h2}>Проти утримання BTC</h2>
+          <h2 style={h2}>Проти утримання {hold}</h2>
           {beats !== null && s.closed > 0 && <Pill color={beats ? c.up : c.down}>{beats ? "▲ краще" : "▼ гірше"}</Pill>}
         </div>
-        <VersusBars items={[{ name: `Депозит, ризик ${s.riskPct}%`, value: s.equityPct }, { name: "Утримання BTC", value: s.btcHoldPct }]} />
-        <p style={{ ...dim, fontSize: 12 }}>Усі R після комісій. Задум підтверджено, якщо після 100 закритих середній результат вищий за 0R і кращий за BTC.</p>
+        <VersusBars items={[{ name: `Депозит, ризик ${s.riskPct}%`, value: s.equityPct }, { name: `Утримання ${hold}`, value: s.btcHoldPct }]} />
+        <p style={{ ...dim, fontSize: 12 }}>Усі R після комісій. Задум підтверджено, якщо після 100 закритих середній результат вищий за 0R і кращий за {hold}.</p>
       </section>
 
       <section style={card}>

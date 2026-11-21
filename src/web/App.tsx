@@ -6,7 +6,8 @@ import { Settings } from "./Settings";
 import { Signals } from "./Signals";
 import { Stats } from "./Stats";
 import { Today } from "./Today";
-import { c, OFFLINE_EVENT, p, time } from "./ui";
+import { c, DeskContext, getDesk, OFFLINE_EVENT, p, setDesk as storeDesk, time } from "./ui";
+import { DESK_LABEL, DESKS, type Desk } from "../shared/desk";
 
 type Tab = "today" | "signals" | "reports" | "stats" | "settings" | "ai" | "picks";
 const NAV: Exclude<Tab, "settings" | "ai" | "picks">[] = ["today", "signals", "reports", "stats"];
@@ -48,6 +49,39 @@ function HeaderButton({ onClick, label, children }: { onClick: () => void; label
   );
 }
 
+/** Перемикач режиму: крипто або акції. Кожен режим має свої сигнали, ідеї, звіти й статистику. */
+function DeskSwitch({ desk, onChange }: { desk: Desk; onChange: (d: Desk) => void }) {
+  return (
+    <div role="tablist" aria-label="Ринок" style={{ display: "flex", gap: 4, padding: 4, borderRadius: 12, background: c.card, border: `1px solid ${c.line}` }}>
+      {DESKS.map((d) => {
+        const on = d === desk;
+        return (
+          <button
+            key={d}
+            type="button"
+            role="tab"
+            aria-selected={on}
+            onClick={() => onChange(d)}
+            className="press"
+            style={{
+              flex: 1,
+              minHeight: 36,
+              borderRadius: 9,
+              border: 0,
+              background: on ? c.card2 : "transparent",
+              boxShadow: on ? `inset 0 0 0 1px ${c.line}` : "none",
+              color: on ? c.ink : c.dim,
+              font: "600 14px Inter, system-ui, sans-serif",
+            }}
+          >
+            {DESK_LABEL[d]}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 /** Банер «дані з кешу»: service worker віддав збережену відповідь, бо мережі немає. */
 function OfflineBanner() {
   const [cachedAt, setCachedAt] = useState<string | null>(null);
@@ -72,6 +106,16 @@ export function App() {
   const [tab, setTab] = useState<Tab>(initialSignal ? "signals" : initialReport ? "reports" : "today");
   const [reportId, setReportId] = useState<number | null>(initialReport);
   const [signalId, setSignalId] = useState<number | null>(initialSignal);
+  const [desk, setDeskState] = useState<Desk>(getDesk);
+
+  const switchDesk = (d: Desk) => {
+    if (d === desk) return;
+    storeDesk(d);
+    setDeskState(d);
+    setSignalId(null);
+    setReportId(null);
+    history.replaceState(null, "", "/");
+  };
 
   const open = (kind: "report" | "signal", id: number | null) => {
     (kind === "report" ? setReportId : setSignalId)(id);
@@ -124,12 +168,16 @@ export function App() {
             </div>
           )}
         </div>
+        {tab !== "settings" && tab !== "ai" && <DeskSwitch desk={desk} onChange={switchDesk} />}
         <OfflineBanner />
-        {tab === "today" && <Today onOpenReport={(id) => open("report", id)} onOpenSignal={(id) => open("signal", id)} onOpenPicks={() => go("picks")} />}
-        {tab === "signals" && <Signals openId={signalId} onOpen={(id) => open("signal", id)} />}
-        {tab === "reports" && <Reports openId={reportId} onOpen={(id) => open("report", id)} />}
-        {tab === "stats" && <Stats onOpenPicks={() => go("picks")} />}
-        {tab === "picks" && <PickHistory onBack={() => go("today")} />}
+        {/* key: при зміні режиму екрани монтуються заново й беруть дані нового режиму. */}
+        <DeskContext.Provider value={desk} key={desk}>
+          {tab === "today" && <Today onOpenReport={(id) => open("report", id)} onOpenSignal={(id) => open("signal", id)} onOpenPicks={() => go("picks")} />}
+          {tab === "signals" && <Signals openId={signalId} onOpen={(id) => open("signal", id)} />}
+          {tab === "reports" && <Reports openId={reportId} onOpen={(id) => open("report", id)} />}
+          {tab === "stats" && <Stats onOpenPicks={() => go("picks")} />}
+          {tab === "picks" && <PickHistory onBack={() => go("today")} />}
+        </DeskContext.Provider>
         {tab === "settings" && <Settings onBack={() => setTab("today")} onOpenAi={() => go("ai")} />}
         {tab === "ai" && <AiSettings onBack={() => setTab("today")} />}
       </main>

@@ -10,6 +10,7 @@ import { PLAYBOOK_DEFAULT } from "./signals/review";
 import { calibration, hit, loadStats } from "./stats";
 import { netR, outcome, summarize, type PickRecord } from "./pickStats";
 import type { Fees } from "../shared/risk";
+import { CRYPTO_LEADER, parseDesk, STOCKS_LEADER_DEFAULT, type Desk } from "../shared/desk";
 
 export { Engine } from "./engine";
 
@@ -35,37 +36,66 @@ app.use("/api/*", async (c, next) => {
 
 app.get("/api/health", (c) => c.json({ ok: true }));
 
+/** Режим із запиту: ?desk=crypto | stocks; без нього — крипто. */
+const deskOf = (c: { req: { query: (k: string) => string | undefined } }): Desk => parseDesk(c.req.query("desk"));
+
+/** Значення налаштувань одним запитом. */
+async function settingValues(db: D1Database, keys: string[]): Promise<Record<string, unknown>> {
+  const rows = await db
+    .prepare(`SELECT key, value FROM settings WHERE key IN (${keys.map(() => "?").join(",")})`)
+    .bind(...keys)
+    .all<{ key: string; value: string }>();
+  return Object.fromEntries(rows.results.map((r) => [r.key, JSON.parse(r.value) as unknown]));
+}
+
+/** Орієнтир ринку режиму: BTC або ETF індексу для акцій. */
+async function leaderOf(db: D1Database, desk: Desk): Promise<string> {
+  if (desk === "crypto") return CRYPTO_LEADER;
+  const v = (await settingValues(db, ["stocks_benchmark"])).stocks_benchmark;
+  return typeof v === "string" ? v : STOCKS_LEADER_DEFAULT;
+}
+
 /** Пульс системи для екрана «Сьогодні»: останній скан, останній звіт, витрати за місяць. */
 app.get("/api/status", async (c) => {
   const db = c.env.DB;
+  const desk = deskOf(c);
   const now = new Date();
   const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
-  const [last, report, spent, budget, cycle, ctx, search] = await Promise.all([
+  const [last, report, spent, budget, cycle, ctx, search, opts] = await Promise.all([
     db
-      .prepare("SELECT kind, started_at, status, duration_ms, detail, error FROM runs WHERE kind IN ('scan', 'probe') ORDER BY id DESC LIMIT 1")
+      .prepare("SELECT kind, started_at, status, duration_ms, detail, error FROM runs WHERE (kind = 'scan' AND desk = ?) OR kind = 'probe' ORDER BY id DESC LIMIT 1")
+      .bind(desk)
       .first<{ kind: string; started_at: string; status: string; duration_ms: number; detail: string | null; error: string | null }>(),
-    db.prepare("SELECT id, kind, date, body, created_at FROM reports ORDER BY created_at DESC LIMIT 1").first<ReportRow>(),
+    db.prepare("SELECT id, kind, date, body, created_at FROM reports WHERE desk = ? ORDER BY created_at DESC LIMIT 1").bind(desk).first<ReportRow>(),
     db.prepare("SELECT COALESCE(SUM(cost_usd), 0) AS usd FROM llm_calls WHERE ts >= ?").bind(monthStart).first<{ usd: number }>(),
     db.prepare("SELECT value FROM settings WHERE key = 'llm_budget_usd'").first<{ value: string }>(),
     db.prepare("SELECT started_at, detail FROM runs WHERE kind = 'pipeline' ORDER BY id DESC LIMIT 1").first<{ started_at: string; detail: string }>(),
-    // Фон ринку (страх і жадібність, домінація BTC) з останнього звіту: рушій бере його лише для звітів.
-    db
-      .prepare("SELECT json_extract(body, '$.context') AS context, created_at AS at FROM reports WHERE kind IN ('morning', 'evening') ORDER BY created_at DESC LIMIT 1")
-      .first<{ context: string | null; at: string }>(),
+    // Фон ринку крипто (страх і жадібність, домінація BTC) з останнього звіту: рушій бере його лише для звітів.
+    desk === "crypto"
+      ? db
+          .prepare("SELECT json_extract(body, '$.context') AS context, created_at AS at FROM reports WHERE desk = 'crypto' AND kind IN ('morning', 'evening') ORDER BY created_at DESC LIMIT 1")
+          .first<{ context: string | null; at: string }>()
+      : Promise.resolve(null),
     // Останній пошук сетапів: шукаємо лише на свіжій свічці 4h, тож беремо останній запуск, де пошук справді був.
     db
-      .prepare("SELECT started_at, detail FROM runs WHERE kind = 'signals' AND json_extract(detail, '$.detection') = 1 ORDER BY id DESC LIMIT 1")
+      .prepare("SELECT started_at, detail FROM runs WHERE kind = 'signals' AND desk = ? AND json_extract(detail, '$.detection') = 1 ORDER BY id DESC LIMIT 1")
+      .bind(desk)
       .first<{ started_at: string; detail: string }>(),
+    settingValues(db, ["stocks_enabled", "stocks_benchmark"]),
   ]);
+  const leader = desk === "crypto" ? CRYPTO_LEADER : typeof opts.stocks_benchmark === "string" ? opts.stocks_benchmark : STOCKS_LEADER_DEFAULT;
   // Запас до ліміту безкоштовного плану: найбільша кількість зовнішніх запитів за один крок циклу.
   const steps = cycle ? ((JSON.parse(cycle.detail) as { steps?: { requests: number; error?: string }[] }).steps ?? []) : [];
-  const btc = await db
+  const price = await db
     .prepare(
-      "SELECT json_extract(s.features, '$.price') AS price, r.started_at AS at FROM snapshots s JOIN runs r ON r.id = s.run_id WHERE s.symbol = 'BTCUSDT' ORDER BY s.id DESC LIMIT 1",
+      "SELECT json_extract(s.features, '$.price') AS price, r.started_at AS at FROM snapshots s JOIN runs r ON r.id = s.run_id WHERE s.symbol = ? ORDER BY s.id DESC LIMIT 1",
     )
+    .bind(leader)
     .first<{ price: number; at: string }>();
   return c.json({
-    btc,
+    desk,
+    enabled: desk === "crypto" || opts.stocks_enabled !== "off",
+    leader: { symbol: leader, price: price?.price ?? null, at: price?.at ?? null },
     lastRun: last ? { ...last, detail: last.detail ? JSON.parse(last.detail) : null } : null,
     lastReport: report ? reportCard(report) : null,
     context: ctx?.context ? { ...(JSON.parse(ctx.context) as object), at: ctx.at } : null,
@@ -106,7 +136,9 @@ function reportCard(r: ReportRow) {
 
 /** Стрічка звітів, від нових. */
 app.get("/api/reports", async (c) => {
-  const rows = await c.env.DB.prepare("SELECT id, kind, date, body, created_at FROM reports ORDER BY created_at DESC LIMIT 30").all<ReportRow>();
+  const rows = await c.env.DB.prepare("SELECT id, kind, date, body, created_at FROM reports WHERE desk = ? ORDER BY created_at DESC LIMIT 30")
+    .bind(deskOf(c))
+    .all<ReportRow>();
   return c.json({ reports: rows.results.map(reportCard) });
 });
 
@@ -115,7 +147,7 @@ app.get("/api/reports/:id{[0-9]+}", async (c) => {
   const id = Number(c.req.param("id"));
   const db = c.env.DB;
   const row = await db
-    .prepare("SELECT id, kind, date, body, model, cost_usd, created_at FROM reports WHERE id = ?")
+    .prepare("SELECT id, desk, kind, date, body, model, cost_usd, created_at FROM reports WHERE id = ?")
     .bind(id)
     .first<ReportRow & { model: string | null; cost_usd: number | null }>();
   if (!row) return c.json({ error: "not found" }, 404);
@@ -137,18 +169,19 @@ app.get("/api/reports/:id{[0-9]+}", async (c) => {
 /** Ручний запуск звіту. 409, якщо рушій зайнятий або звіт за сьогодні вже є. */
 app.post("/api/reports/run", async (c) => {
   const { kind } = await c.req.json<{ kind?: string }>().catch(() => ({ kind: undefined }));
+  const desk = deskOf(c);
   if (kind === "weekly") {
-    const res = await engineStub(c.env).weeklyNow();
+    const res = await engineStub(c.env).weeklyNow(desk);
     return res === null ? c.json({ error: "engine busy" }, 409) : c.json(res);
   }
   if (kind !== "morning" && kind !== "evening") return c.json({ error: "kind must be morning, evening or weekly" }, 400);
-  const res = await engineStub(c.env).reportNow(kind);
+  const res = await engineStub(c.env).reportNow(kind, desk);
   if (res === null) return c.json({ error: "engine busy" }, 409);
   return "error" in res ? c.json(res, 409) : c.json(res);
 });
 
 const SIGNAL_COLUMNS =
-  "id, created_at, symbol, side, setup, entry_low, entry_high, stop, tp1, tp2, rr, p_analyst, p_skeptic, status, expires_at, result_r, fee_r, resolved_at, shadow_status, shadow_r, hit, shadow_hit";
+  "id, desk, created_at, symbol, side, setup, entry_low, entry_high, stop, tp1, tp2, rr, p_analyst, p_skeptic, status, expires_at, result_r, fee_r, resolved_at, shadow_status, shadow_r, hit, shadow_hit";
 
 /** Сигнали: open (позиція відкрита), closed (із результатом), rejected (відхилені моделлю). */
 app.get("/api/signals", async (c) => {
@@ -161,8 +194,10 @@ app.get("/api/signals", async (c) => {
   if (!where[scope]) return c.json({ error: "scope must be open, closed or rejected" }, 400);
   const rows = await c.env.DB.prepare(
     `SELECT ${SIGNAL_COLUMNS}, (SELECT action FROM journal WHERE signal_id = signals.id ORDER BY id DESC LIMIT 1) AS action
-     FROM signals WHERE ${where[scope]} ORDER BY created_at DESC LIMIT 50`,
-  ).all();
+     FROM signals WHERE desk = ? AND ${where[scope]} ORDER BY created_at DESC LIMIT 50`,
+  )
+    .bind(deskOf(c))
+    .all();
   return c.json({ signals: rows.results });
 });
 
@@ -183,8 +218,8 @@ app.get("/api/signals/:id{[0-9]+}", async (c) => {
   };
   // «Кожне число пояснює себе»: як часто збувались сигнали з такою самою оцінкою.
   const history = await db
-    .prepare("SELECT p_analyst, p_skeptic, status, hit, shadow_hit FROM signals WHERE id != ? AND (p_analyst IS NOT NULL OR p_skeptic IS NOT NULL)")
-    .bind(id)
+    .prepare("SELECT p_analyst, p_skeptic, status, hit, shadow_hit FROM signals WHERE id != ? AND desk = ? AND (p_analyst IS NOT NULL OR p_skeptic IS NOT NULL)")
+    .bind(id, row.desk)
     .all<{ p_analyst: number | null; p_skeptic: number | null; status: string; hit: number | null; shadow_hit: number | null }>();
   const similar = (key: "p_analyst" | "p_skeptic") => {
     const p = row[key] as number | null;
@@ -227,7 +262,10 @@ app.get("/api/stats", async (c) => {
   const days = period === "all" ? null : Number(period);
   if (days !== null && ![7, 30, 90].includes(days)) return c.json({ error: "period must be all, 7, 30 or 90" }, 400);
   const now = Date.now();
-  return c.json(await loadStats(c.env.DB, { from: days === null ? null : new Date(now - days * 86_400_000).toISOString(), now }));
+  const desk = deskOf(c);
+  return c.json(
+    await loadStats(c.env.DB, { from: days === null ? null : new Date(now - days * 86_400_000).toISOString(), now, desk, leader: await leaderOf(c.env.DB, desk) }),
+  );
 });
 
 /** Свічки для графіка сигналу: бере рушій (зі скану в пам'яті або з біржі). */
@@ -235,7 +273,7 @@ app.get("/api/candles/:symbol{[A-Z0-9]{2,20}USDT}", async (c) => {
   const tf = c.req.query("tf") ?? "1h";
   if (tf !== "15m" && tf !== "1h" && tf !== "4h") return c.json({ error: "tf must be 15m, 1h or 4h" }, 400);
   try {
-    const candles = await engineStub(c.env).candles(c.req.param("symbol"), tf, Number(c.req.query("limit") ?? 96));
+    const candles = await engineStub(c.env).candles(c.req.param("symbol"), tf, Number(c.req.query("limit") ?? 96), deskOf(c));
     return c.json({ candles });
   } catch (e) {
     return c.json({ error: String(e) }, 502);
@@ -246,9 +284,14 @@ app.get("/api/candles/:symbol{[A-Z0-9]{2,20}USDT}", async (c) => {
 app.get("/api/settings", async (c) => {
   const rows = await c.env.DB.prepare("SELECT key, value FROM settings").all<{ key: string; value: string }>();
   const values = Object.fromEntries(rows.results.map((r) => [r.key, JSON.parse(r.value)]));
+  // Контракти Bybit на акції: щоб у формі було видно, які символи справді є. Збій не заважає формі.
+  const stockSymbols = await engineStub(c.env)
+    .stockSymbols()
+    .catch((e) => (console.error("контракти на акції:", e), null));
   return c.json({
     values,
     schema: SETTINGS.map(({ check: _check, ...spec }) => spec),
+    stockSymbols,
   });
 });
 
@@ -411,7 +454,7 @@ const PICK_LIST = `
          p.status, p.result_r, p.resolved_at,
          (SELECT COUNT(*) FROM picks r WHERE r.is_repeat = 1 AND r.id > p.id
             AND r.id < COALESCE((SELECT MIN(n.id) FROM picks n WHERE n.is_repeat = 0 AND n.id > p.id), 9e18)) AS repeats
-  FROM picks p WHERE p.is_repeat = 0 AND p.created_at >= ? ORDER BY p.id DESC LIMIT ?`;
+  FROM picks p WHERE p.desk = ? AND p.is_repeat = 0 AND p.created_at >= ? ORDER BY p.id DESC LIMIT ?`;
 
 async function pickFees(db: D1Database): Promise<Fees> {
   const rows = await db.prepare("SELECT key, value FROM settings WHERE key IN ('fee_maker_pct', 'fee_taker_pct')").all<{ key: string; value: string }>();
@@ -425,10 +468,11 @@ async function pickFees(db: D1Database): Promise<Fees> {
 /** Ідея скану для екрана «Сьогодні»: остання ідея повністю, попередні коротко й підсумок за 30 днів. */
 app.get("/api/pick", async (c) => {
   const db = c.env.DB;
+  const desk = deskOf(c);
   const since = new Date(Date.now() - 30 * 24 * 3_600_000).toISOString();
   const [latest, list, fees] = await Promise.all([
-    db.prepare("SELECT * FROM picks ORDER BY id DESC LIMIT 1").first<PickRow>(),
-    db.prepare(PICK_LIST).bind(since, 1000).all<PickRecord>(),
+    db.prepare("SELECT * FROM picks WHERE desk = ? ORDER BY id DESC LIMIT 1").bind(desk).first<PickRow>(),
+    db.prepare(PICK_LIST).bind(desk, since, 1000).all<PickRecord>(),
     pickFees(db),
   ]);
   const summary = summarize(list.results, fees);
@@ -451,7 +495,7 @@ app.get("/api/picks", async (c) => {
   const since = days === null ? "" : new Date(Date.now() - days * 86_400_000).toISOString();
   const verdict = c.req.query("verdict") ?? "all";
   if (!["all", "pick", "pass", "none"].includes(verdict)) return c.json({ error: "verdict must be all, pick, pass or none" }, 400);
-  const [list, fees] = await Promise.all([db.prepare(PICK_LIST).bind(since, 2000).all<PickRecord>(), pickFees(db)]);
+  const [list, fees] = await Promise.all([db.prepare(PICK_LIST).bind(deskOf(c), since, 2000).all<PickRecord>(), pickFees(db)]);
   const rows = verdict === "all" ? list.results : list.results.filter((r) => r.verdict === verdict);
   return c.json({
     from: since || null,
@@ -504,8 +548,10 @@ app.post("/api/scan", async (c) => {
 /** Знімки ознак останнього скану. */
 app.get("/api/snapshots/latest", async (c) => {
   const run = await c.env.DB.prepare(
-    "SELECT id, started_at, status, detail FROM runs WHERE kind = 'scan' ORDER BY id DESC LIMIT 1",
-  ).first<{ id: number; started_at: string; status: string; detail: string | null }>();
+    "SELECT id, started_at, status, detail FROM runs WHERE kind = 'scan' AND desk = ? ORDER BY id DESC LIMIT 1",
+  )
+    .bind(deskOf(c))
+    .first<{ id: number; started_at: string; status: string; detail: string | null }>();
   if (!run) return c.json({ run: null, snapshots: [] });
   const rows = await c.env.DB.prepare("SELECT features FROM snapshots WHERE run_id = ? ORDER BY id")
     .bind(run.id)

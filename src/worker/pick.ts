@@ -84,7 +84,7 @@ export function pullbackEntry(s: Snapshot, side: Side): number | null {
  * Бал технічного аналізу для одного напрямку. Старт 50; кожна ознака додає або віднімає бали,
  * і кожна записується з поясненням: застосунок і модель бачать, з чого склався бал.
  */
-export function scoreSide(s: Snapshot, side: Side, market: MarketRegime): { score: number; factors: PickFactor[]; roomAtr: number | null } {
+export function scoreSide(s: Snapshot, side: Side, market: MarketRegime, leader = "BTCUSDT"): { score: number; factors: PickFactor[]; roomAtr: number | null } {
   const dir = side === "long" ? 1 : -1;
   const factors: PickFactor[] = [];
   const add = (points: number, note: string) => {
@@ -94,7 +94,7 @@ export function scoreSide(s: Snapshot, side: Side, market: MarketRegime): { scor
 
   // Загальний ринок.
   if (market.mood !== "mixed") add(market.mood === "risk_on" ? 10 * dir : -10 * dir, `ринок ${MOOD_NAME[market.mood]}`);
-  if (market.btcTrend && market.btcTrend !== "range" && s.symbol !== "BTCUSDT") add(trendPoints(market.btcTrend, 5), `BTC 4h ${TREND_NAME[market.btcTrend]}`);
+  if (market.btcTrend && market.btcTrend !== "range" && s.symbol !== leader) add(trendPoints(market.btcTrend, 5), `${leader.replace(/USDT$/, "")} 4h ${TREND_NAME[market.btcTrend]}`);
 
   // Тренд монети на трьох таймфреймах.
   const t1h = trend(s.tf["1h"]);
@@ -164,14 +164,14 @@ export function scoreSide(s: Snapshot, side: Side, market: MarketRegime): { scor
 export function rankPicks(
   snapshots: Snapshot[],
   market: MarketRegime,
-  opts: { minStopPct: number; top?: number; exclude?: ReadonlySet<string> },
+  opts: { minStopPct: number; top?: number; exclude?: ReadonlySet<string>; leader?: string },
 ): PickOption[] {
   const out: PickOption[] = [];
   for (const s of snapshots) {
     if (opts.exclude?.has(s.symbol)) continue;
     const atr4h = s.tf["4h"].atr14;
     if (!atr4h || atr4h <= 0 || !(s.price > 0)) continue;
-    const sides = (["long", "short"] as const).map((side) => ({ side, ...scoreSide(s, side, market) }));
+    const sides = (["long", "short"] as const).map((side) => ({ side, ...scoreSide(s, side, market, opts.leader) }));
     const best = sides[0]!.score >= sides[1]!.score ? sides[0]! : sides[1]!;
     const pb = pullbackEntry(s, best.side);
     out.push({
@@ -222,7 +222,7 @@ export function pickInput(a: PickInputArgs) {
         room_to_level_atr_4h: o.roomAtr,
         entry_market: levelsOut(o.market),
         entry_pullback: o.pullback ? levelsOut(o.pullback) : null,
-        snapshot: snap && o.symbol !== "BTCUSDT" ? compactSymbol(snap) : null,
+        snapshot: snap && o.symbol !== a.btc?.symbol ? compactSymbol(snap) : null,
         news_last_12h: a.news.filter((n) => n.symbols.includes(o.symbol)).slice(0, 4),
       };
     }),

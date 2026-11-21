@@ -60,7 +60,8 @@ export interface ReportInputArgs {
   localDate: string;
   localClock: string;
   market: MarketRegime;
-  context: MarketContext;
+  /** Фон ринку крипто; null у режимі акцій. */
+  context: MarketContext | null;
   snapshots: Snapshot[];
   news: NewsField[];
   priorForecasts: PriorForecast[];
@@ -80,9 +81,13 @@ export function reportInput(a: ReportInputArgs) {
       mood: a.market.mood,
       btc_trend_4h: a.market.btcTrend,
       share_above_ema200_4h: a.market.breadth,
-      btc_dominance_pct: a.context.btcDominancePct,
-      market_cap_change_24h_pct: a.context.marketCapChange24hPct,
-      fear_greed_0_100: a.context.fearGreed,
+      ...(a.context
+        ? {
+            btc_dominance_pct: a.context.btcDominancePct,
+            market_cap_change_24h_pct: a.context.marketCapChange24hPct,
+            fear_greed_0_100: a.context.fearGreed,
+          }
+        : {}),
     },
     symbols: a.snapshots.map(compactSymbol),
     news_last_12h: a.news,
