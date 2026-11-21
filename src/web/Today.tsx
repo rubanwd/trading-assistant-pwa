@@ -5,7 +5,8 @@ import { Push } from "./Push";
 import type { ReportCard } from "./Reports";
 import { PickCard } from "./Pick";
 import { OpenSignals } from "./Signals";
-import { api, c, card, coin, day, dim, h2, KIND, label, num, p, primary, secondary, time, tone } from "./ui";
+import { api, c, card, coin, day, dim, h2, KIND, label, num, p, primary, secondary, time, tone, unit, useDesk } from "./ui";
+import { usSessionOpen, usTradingDay } from "../shared/desk";
 import { CHART_RANGE, CHART_RANGE_OPTIONS, Delta, Gauge, LiveDot, Meter, Pill, PriceChart, Ring, Segmented, Skeleton, Slider, Stat, useCandles, type ChartRange } from "./viz";
 
 interface Target { name: string; ok: boolean; status: number | null; ms: number; note?: string }
@@ -22,7 +23,11 @@ interface Status {
   lastReport: ReportCard | null;
   context: MarketContext | null;
   spend: { monthUsd: number; budgetUsd: number | null };
-  btc: { price: number; at: string } | null;
+  desk: "crypto" | "stocks";
+  /** Чи працює режим (акції можна вимкнути в налаштуваннях). */
+  enabled: boolean;
+  /** Орієнтир ринку режиму: BTCUSDT або ETF індексу. */
+  leader: { symbol: string; price: number | null; at: string | null };
   cycle: { at: string; steps: number; maxRequests: number; failed: number } | null;
   search?: { at: string; detected: number; filtered: Record<string, number>; reviewed: number; published: number; rejected: number; notes: string[] } | null;
 }
@@ -60,26 +65,38 @@ function fearText(v: number): string {
 
 const usdShort = (v: number) => (v >= 1e12 ? `$${(v / 1e12).toFixed(2)} трлн` : v >= 1e9 ? `$${(v / 1e9).toFixed(1)} млрд` : `$${Math.round(v / 1e6)} млн`);
 
-// ───────────────────────── BTC ─────────────────────────
+// ───────────────────────── Орієнтир ринку ─────────────────────────
 
-function BtcHero({ status, scan }: { status: Status | null; scan: ScanDetail | null }) {
+/** Назви відомих орієнтирів акцій; інші показуються тикером. */
+const LEADER_NAME: Record<string, string> = { BTCUSDT: "Bitcoin", SPYUSDT: "S&P 500 · SPY", QQQUSDT: "Nasdaq 100 · QQQ", DIAUSDT: "Dow Jones · DIA", IWMUSDT: "Russell 2000 · IWM" };
+
+function LeaderHero({ status, scan, symbol }: { status: Status | null; scan: ScanDetail | null; symbol: string }) {
+  const desk = useDesk();
   const [range, setRange] = useState<ChartRange>("1d");
-  const live = useLivePrice("BTCUSDT");
-  const { candles, error } = useCandles("BTCUSDT", CHART_RANGE[range].tf, CHART_RANGE[range].limit);
-  const price = live ?? candles?.[candles.length - 1]?.close ?? status?.btc?.price ?? null;
+  const live = useLivePrice(symbol);
+  const { candles, error } = useCandles(symbol, CHART_RANGE[range].tf, CHART_RANGE[range].limit);
+  const scanPrice = status?.leader.price ?? null;
+  const price = live ?? candles?.[candles.length - 1]?.close ?? scanPrice;
   const base = candles?.[0]?.open ?? null;
   const change = price !== null && base ? ((price - base) / base) * 100 : null;
   return (
     <section style={{ ...card, gap: 8 }} className="rise">
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        <span aria-hidden style={{ width: 34, height: 34, borderRadius: 17, background: "#F7931A", color: "#fff", display: "grid", placeItems: "center", fontWeight: 800, fontSize: 18 }}>₿</span>
+        <span
+          aria-hidden
+          style={{ width: 34, height: 34, borderRadius: 17, background: desk === "crypto" ? "#F7931A" : c.blue, color: "#fff", display: "grid", placeItems: "center", fontWeight: 800, fontSize: desk === "crypto" ? 18 : 11 }}
+        >
+          {desk === "crypto" ? "₿" : coin(symbol).slice(0, 4)}
+        </span>
         <div style={{ display: "flex", flexDirection: "column", minWidth: 0 }}>
-          <span style={{ fontWeight: 700, fontSize: 15 }}>Bitcoin</span>
-          <span style={{ fontSize: 12, color: c.dim }}>BTCUSDT · ф'ючерс</span>
+          <span style={{ fontWeight: 700, fontSize: 15 }}>{LEADER_NAME[symbol] ?? coin(symbol)}</span>
+          <span style={{ fontSize: 12, color: c.dim }}>
+            {symbol} · {desk === "crypto" ? unit(desk).kind : "орієнтир ринку"}
+          </span>
         </div>
-        <span style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12, color: c.dim }}>
+        <span style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12, color: c.dim, whiteSpace: "nowrap" }}>
           <LiveDot on={live !== null} />
-          {live !== null ? "наживо" : status?.btc ? `скан о ${time(status.btc.at)}` : ""}
+          {live !== null ? "наживо" : status?.leader.at ? `скан о ${time(status.leader.at)}` : ""}
         </span>
       </div>
       <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
@@ -111,7 +128,28 @@ function BtcHero({ status, scan }: { status: Status | null; scan: ScanDetail | n
 
 // ───────────────────────── Ринок ─────────────────────────
 
+/** Сесія NYSE за годинником пристрою: відкрита, премаркет/після закриття або вихідний. */
+function UsSession() {
+  const now = Date.now();
+  const open = usSessionOpen(now);
+  const tradingDay = usTradingDay(now);
+  const text = open ? "Сесія NYSE відкрита" : tradingDay ? "Поза основною сесією" : "Вихідний на біржі США";
+  const sub = open
+    ? "До 16:00 за Нью-Йорком. Нові сигнали й ідеї шукаються зараз."
+    : "Ліквідність низька. Нові сигнали й ідеї — з 9:30 за Нью-Йорком.";
+  return (
+    <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 6, padding: 10, borderRadius: 12, background: open ? `${c.up}14` : c.bg, border: `1px solid ${open ? `${c.up}40` : c.line}` }}>
+      <span style={{ display: "inline-flex", alignItems: "center", gap: 6, fontWeight: 600, fontSize: 14 }}>
+        <LiveDot on={open} />
+        {text}
+      </span>
+      <span style={{ ...dim, fontSize: 12 }}>{sub}</span>
+    </div>
+  );
+}
+
 function MarketGauges({ scan, ctx }: { scan: ScanDetail | null; ctx: MarketContext | null }) {
+  const desk = useDesk();
   const breadth = scan?.market.breadth ?? null;
   const fg = ctx?.fearGreed ?? null;
   return (
@@ -120,9 +158,13 @@ function MarketGauges({ scan, ctx }: { scan: ScanDetail | null; ctx: MarketConte
         <h2 style={h2}>Настрій ринку</h2>
         {ctx && <span style={{ fontSize: 11, color: c.faint }}>фон зі звіту о {time(ctx.at)}</span>}
       </div>
-      <div style={{ display: "flex", gap: 12 }}>
-        <Gauge value={fg === null ? null : fg / 100} display={fg === null ? "—" : String(Math.round(fg))} caption={fg === null ? "Страх і жадібність" : `Страх і жадібність · ${fearText(fg)}`} />
-        <Gauge value={breadth} display={breadth === null ? "—" : `${Math.round(breadth * 100)}%`} caption="Монет вище EMA200 на 4h" />
+      <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+        {desk === "crypto" ? (
+          <Gauge value={fg === null ? null : fg / 100} display={fg === null ? "—" : String(Math.round(fg))} caption={fg === null ? "Страх і жадібність" : `Страх і жадібність · ${fearText(fg)}`} />
+        ) : (
+          <UsSession />
+        )}
+        <Gauge value={breadth} display={breadth === null ? "—" : `${Math.round(breadth * 100)}%`} caption={`${unit(desk).many} вище EMA200 на 4h`} />
       </div>
       {ctx && (ctx.btcDominancePct !== null || ctx.marketCapChange24hPct !== null) && (
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, paddingTop: 10, borderTop: `1px solid ${c.line}` }}>
@@ -156,7 +198,7 @@ const METRIC: Record<Metric, { name: string; scale: number; center?: number; get
     scale: 10,
     get: (s) => (s.tf["4h"].ema200 ? ((s.price - s.tf["4h"].ema200) / s.tf["4h"].ema200) * 100 : null),
     fmt: (v) => `${v > 0 ? "+" : ""}${v.toFixed(1)}%`,
-    hint: "Відстань ціни від EMA200 на 4h: вище нуля — монета в бичачій зоні.",
+    hint: "Відстань ціни від EMA200 на 4h: вище нуля — бичача зона.",
   },
   rsi: { name: "RSI", scale: 25, center: 50, get: (s) => s.tf["4h"].rsi14, fmt: (v) => v.toFixed(0), hint: "RSI 14 на 4h: вище 70 перекупленість, нижче 30 перепроданість." },
   funding: { name: "Фандинг", scale: 0.03, get: (s) => (s.funding ? s.funding.rate * 100 : null), fmt: (v) => `${v.toFixed(3)}%`, hint: "Ставка фінансування: плюс — лонги платять шортам." },
@@ -234,6 +276,7 @@ function CoinDetail({ s }: { s: Snapshot }) {
 }
 
 function CoinMap() {
+  const desk = useDesk();
   const [data, setData] = useState<{ at: string; snapshots: Snapshot[] } | null>(null);
   const [metric, setMetric] = useState<Metric>("4h");
   const [selected, setSelected] = useState<string | null>(null);
@@ -254,7 +297,7 @@ function CoinMap() {
   return (
     <section style={card} className="rise">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8 }}>
-        <h2 style={h2}>Монети</h2>
+        <h2 style={h2}>{unit(desk).many}</h2>
         <span style={{ fontSize: 12, color: c.dim }}>
           <span style={{ color: c.up }}>▲ {up}</span> · <span style={{ color: c.down }}>▼ {sorted.length - up}</span> · скан о {time(data.at)}
         </span>
@@ -296,7 +339,7 @@ function CoinMap() {
           );
         })}
       </div>
-      <p style={{ ...dim, fontSize: 12 }}>{m.hint} Стрілка в куті — тренд 4h. Торкнись монети, щоб побачити графік і деталі.</p>
+      <p style={{ ...dim, fontSize: 12 }}>{m.hint} Стрілка в куті — тренд 4h. Торкнись плитки, щоб побачити графік і деталі.</p>
       {sel && <CoinDetail key={sel.symbol} s={sel} />}
     </section>
   );
@@ -305,11 +348,15 @@ function CoinMap() {
 // ───────────────────────── Звіт ─────────────────────────
 
 function ReportTeaser({ report, onOpen }: { report: ReportCard | null; onOpen: (id: number) => void }) {
+  const desk = useDesk();
   if (!report) {
     return (
       <section style={card}>
         <h2 style={h2}>Звіт</h2>
-        <p style={dim}>Звітів ще немає. Перший з'явиться о 07:30 або 20:30 за Києвом.</p>
+        <p style={dim}>
+          Звітів ще немає.{" "}
+          {desk === "crypto" ? "Перший з'явиться о 07:30 або 20:30 за Києвом." : "Звіти по акціях виходять у торгові дні США: стартово о 16:00 перед відкриттям і о 23:15 після закриття за Києвом."}
+        </p>
       </section>
     );
   }
@@ -366,6 +413,7 @@ function SearchSummary({ s }: { s: NonNullable<Status["search"]> }) {
 }
 
 function SystemPulse({ status, error, reload }: { status: Status | null; error: string | null; reload: () => Promise<void> }) {
+  const desk = useDesk();
   const [busy, setBusy] = useState(false);
   const [scanNote, setScanNote] = useState<string | null>(null);
   const run = status?.lastRun;
@@ -432,11 +480,13 @@ function SystemPulse({ status, error, reload }: { status: Status | null; error: 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8, justifyItems: "center", textAlign: "center" }}>
         {scan && (
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
-            <Ring value={scan.symbols ? scan.snapshots / scan.symbols : null} color={scan.snapshots === scan.symbols ? c.up : c.orange} label={`Скан: ${scan.snapshots} із ${scan.symbols} монет`}>
+            <Ring value={scan.symbols ? scan.snapshots / scan.symbols : null} color={scan.snapshots === scan.symbols ? c.up : c.orange} label={`Скан: ${scan.snapshots} із ${scan.symbols} ${unit(desk).gen}`}>
               <span style={{ ...num, fontSize: 16, fontWeight: 700 }}>{scan.snapshots}</span>
               <span style={{ fontSize: 10, color: c.dim }}>із {scan.symbols}</span>
             </Ring>
-            <span style={{ fontSize: 11, color: c.dim }}>монет · {scan.source}</span>
+            <span style={{ fontSize: 11, color: c.dim }}>
+              {unit(desk).gen} · {scan.source}
+            </span>
           </div>
         )}
         {status && (
@@ -506,12 +556,20 @@ export function Today({ onOpenReport, onOpenSignal, onOpenPicks }: { onOpenRepor
     void load();
   }, [load]);
 
+  const desk = useDesk();
   const run = status?.lastRun;
   const scan = run?.detail && !Array.isArray(run.detail) ? run.detail : null;
+  const leader = status?.leader.symbol ?? (desk === "crypto" ? "BTCUSDT" : null);
 
   return (
     <>
-      <BtcHero status={status} scan={scan} />
+      {status && !status.enabled && (
+        <section style={{ ...card, borderColor: `${c.orange}66` }}>
+          <h2 style={h2}>Режим акцій вимкнено</h2>
+          <p style={dim}>Увімкни «Режим акцій» у Налаштуваннях → Акції: рушій почне сканувати контракти Bybit на акції США з наступного циклу.</p>
+        </section>
+      )}
+      {leader && <LeaderHero key={leader} status={status} scan={scan} symbol={leader} />}
       <PickCard onOpenHistory={onOpenPicks} />
       <OpenSignals onOpen={onOpenSignal} lastScan={run?.kind === "scan" ? run.started_at : null} />
       <MarketGauges scan={scan} ctx={status?.context ?? null} />
@@ -519,7 +577,11 @@ export function Today({ onOpenReport, onOpenSignal, onOpenPicks }: { onOpenRepor
       <ReportTeaser report={status?.lastReport ?? null} onOpen={onOpenReport} />
       <SystemPulse status={status} error={error} reload={load} />
       <Push />
-      <p style={{ ...dim, textAlign: "center", fontSize: 12 }}>Скан раз на 30 хв, звіти о 07:30 і 20:30. Система пропонує, рішення за тобою.</p>
+      <p style={{ ...dim, textAlign: "center", fontSize: 12 }}>
+        {desk === "crypto"
+          ? "Скан раз на 30 хв, звіти о 07:30 і 20:30. Система пропонує, рішення за тобою."
+          : "Скан раз на 30 хв; сигнали й ідеї лише в сесію NYSE. Система пропонує, рішення за тобою."}
+      </p>
     </>
   );
 }

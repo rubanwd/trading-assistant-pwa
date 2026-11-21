@@ -93,6 +93,19 @@ export class BybitLinear implements MarketData {
       .sort((a, b) => a.ts - b.ts);
   }
 
+  /**
+   * Символи лінійних контрактів одного типу, що зараз торгуються: stock (акції США), ETF тощо.
+   * Режим акцій бере stock і ETF, щоб відсіяти зі списку символи без контракту.
+   */
+  async instruments(symbolType: "stock" | "ETF"): Promise<string[]> {
+    const res = await this.get<{ list: { symbol: string; status: string }[] }>("/v5/market/instruments-info", {
+      category: "linear",
+      symbolType,
+      limit: "1000",
+    });
+    return res.list.filter((i) => i.status === "Trading").map((i) => i.symbol);
+  }
+
   private async get<T>(path: string, params: Record<string, string>): Promise<T> {
     const url = `${this.base}${path}?${new URLSearchParams(params)}`;
     let res: Response;

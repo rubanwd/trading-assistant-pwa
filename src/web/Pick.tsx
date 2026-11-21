@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { fmtPrice, useLivePrice } from "./live";
-import { api, c, card, coin, dim, label, num, p, pct, secondary, signed, time } from "./ui";
+import { api, c, card, coin, dim, label, num, p, pct, secondary, signed, time, useDesk } from "./ui";
 import { CHART_RANGE, CHART_RANGE_OPTIONS, LiveDot, Meter, Pill, PriceChart, Ring, Segmented, Skeleton, Stat, useCandles, type ChartRange } from "./viz";
 
 export type Side = "long" | "short";
@@ -174,6 +174,7 @@ export function PickReasons({ pick }: { pick: Idea }) {
  * ШІ вибирає один із найкращих варіантів і пояснює вибір. Це не сигнал.
  */
 export function PickCard({ onOpenHistory }: { onOpenHistory: () => void }) {
+  const desk = useDesk();
   const [data, setData] = useState<PickResponse | null>(null);
   const [failed, setFailed] = useState(false);
   const [open, setOpen] = useState(false);
@@ -191,7 +192,7 @@ export function PickCard({ onOpenHistory }: { onOpenHistory: () => void }) {
     return (
       <section style={card} className="rise">
         <span style={label}>Ідея скану</span>
-        <p style={dim}>Перша ідея з'явиться після найближчого скану: код вибере найкращі за технічним аналізом монети, ШІ — одну з них.</p>
+        <p style={dim}>Перша ідея з'явиться після найближчого скану: код вибере найкращі за технічним аналізом інструменти, ШІ — один із них.{desk === "stocks" && " Для акцій ідеї з'являються лише в основну сесію NYSE."}</p>
       </section>
     );
   }
@@ -269,7 +270,7 @@ export function PickCard({ onOpenHistory }: { onOpenHistory: () => void }) {
       {pick.body.note && <p style={{ ...dim, fontSize: 12, color: c.orange }}>{pick.body.note}</p>}
 
       <button type="button" onClick={() => setOpen(!open)} style={{ background: "none", border: 0, color: c.blue, font: "600 13px Inter, system-ui, sans-serif", textAlign: "left", padding: 0, cursor: "pointer", minHeight: 32 }}>
-        {open ? "Сховати деталі ▴" : "Чому саме ця монета ▾"}
+        {open ? "Сховати деталі ▴" : "Чому саме цей вибір ▾"}
       </button>
       {open && <PickReasons pick={pick} />}
 

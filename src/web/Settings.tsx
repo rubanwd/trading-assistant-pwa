@@ -1,4 +1,4 @@
-import { useEffect, useState, type CSSProperties } from "react";
+import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import { SETUP } from "./Signals";
 import { SETUP_KEYS } from "../shared/settings";
 import { api, c, card, day, dim, h2, p, primary, secondary } from "./ui";
@@ -8,7 +8,7 @@ interface Spec {
   group: string;
   label: string;
   help?: string;
-  kind: "number" | "nullable-number" | "clock" | "quiet" | "report-times" | "symbols" | "macro" | "feeds" | "enum" | "timezone";
+  kind: "number" | "nullable-number" | "clock" | "quiet" | "report-times" | "symbols" | "symbol" | "macro" | "feeds" | "enum" | "timezone";
   options?: string[];
 }
 
@@ -93,7 +93,7 @@ function fromText(kind: Spec["kind"], t: string): unknown {
   }
 }
 
-function Field({ spec, value, error, onChange }: { spec: Spec; value: string; error?: string; onChange: (v: string) => void }) {
+function Field({ spec, value, error, onChange, extra }: { spec: Spec; value: string; error?: string; onChange: (v: string) => void; extra?: ReactNode }) {
   const id = `s-${spec.key}`;
   let control;
   if (spec.kind === "enum") {
@@ -125,7 +125,8 @@ function Field({ spec, value, error, onChange }: { spec: Spec; value: string; er
     control = (
       <input
         id={id}
-        inputMode={spec.kind === "timezone" ? "text" : "decimal"}
+        inputMode={spec.kind === "timezone" || spec.kind === "symbol" ? "text" : "decimal"}
+        autoCapitalize={spec.kind === "symbol" ? "characters" : undefined}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         style={input}
@@ -137,8 +138,25 @@ function Field({ spec, value, error, onChange }: { spec: Spec; value: string; er
       <label htmlFor={id} style={{ fontSize: 14 }}>{spec.label}</label>
       {control}
       {spec.help && <span style={dim}>{spec.help}</span>}
+      {extra}
       {error && <span style={{ ...dim, color: c.orange }}>{error}</span>}
     </div>
+  );
+}
+
+/** Контракти Bybit на акції та ETF, що зараз торгуються; символи зі списку без контракту позначено. */
+function StockSymbols({ symbols, value }: { symbols: string[] | null; value: string }) {
+  if (!symbols) return <span style={{ ...dim, fontSize: 12 }}>Список контрактів Bybit зараз недоступний: рушій перевірить символи під час скану.</span>;
+  const known = new Set(symbols);
+  const missing = value.split(/[\s,;]+/).map((x) => x.trim().toUpperCase()).filter((x) => x && !known.has(x));
+  return (
+    <>
+      {missing.length > 0 && <span style={{ ...dim, color: c.orange }}>Немає на Bybit: {missing.join(", ")}</span>}
+      <details style={{ fontSize: 13, color: c.dim }}>
+        <summary style={{ cursor: "pointer", minHeight: 32, display: "flex", alignItems: "center" }}>Доступні на Bybit: {symbols.length}</summary>
+        <p style={{ ...dim, fontSize: 12, marginTop: 6, overflowWrap: "anywhere" }}>{symbols.map((x) => x.replace(/USDT$/, "")).join(", ")}</p>
+      </details>
+    </>
   );
 }
 
@@ -149,10 +167,12 @@ function SettingsForm() {
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [note, setNote] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [stockSymbols, setStockSymbols] = useState<string[] | null>(null);
 
   const load = () =>
-    api<{ values: Record<string, unknown>; schema: Spec[] }>("/api/settings").then((d) => {
+    api<{ values: Record<string, unknown>; schema: Spec[]; stockSymbols?: string[] | null }>("/api/settings").then((d) => {
       const text = Object.fromEntries(d.schema.map((s) => [s.key, toText(s.kind, d.values[s.key])]));
+      setStockSymbols(d.stockSymbols ?? null);
       setSchema(d.schema);
       setSaved(text);
       setDraft(text);
@@ -195,7 +215,14 @@ function SettingsForm() {
           {schema
             .filter((s) => s.group === g)
             .map((s) => (
-              <Field key={s.key} spec={s} value={draft[s.key] ?? ""} error={errors[s.key]} onChange={(v) => setDraft({ ...draft, [s.key]: v })} />
+              <Field
+                key={s.key}
+                spec={s}
+                value={draft[s.key] ?? ""}
+                error={errors[s.key]}
+                onChange={(v) => setDraft({ ...draft, [s.key]: v })}
+                extra={s.key === "stocks_watchlist" ? <StockSymbols symbols={stockSymbols} value={draft[s.key] ?? ""} /> : undefined}
+              />
             ))}
         </section>
       ))}

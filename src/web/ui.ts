@@ -1,3 +1,6 @@
+import { createContext, useContext } from "react";
+import { parseDesk, type Desk } from "../shared/desk";
+
 /**
  * Палітра. up/down: напрямок ціни й результату (завжди разом зі стрілкою ▲▼ або знаком, не лише кольором);
  * blue: акцент і нейтральні дані; orange: попередження й помилки; violet: оцінки моделі.
@@ -42,8 +45,54 @@ export const KIND: Record<string, string> = { morning: "Ранковий", eveni
 /** Service worker позначає відповідь із кешу заголовком x-cached-at; застосунок показує, що дані офлайн. */
 export const OFFLINE_EVENT = "offline-data";
 
+// ── Режим: крипто або акції ─────────────────────────────────────────────────
+
+const DESK_STORAGE = "desk";
+
+function storedDesk(): Desk {
+  // Посилання зі сповіщення (?desk=stocks) має перевагу над збереженим вибором.
+  const fromUrl = new URLSearchParams(location.search).get("desk");
+  try {
+    if (fromUrl) {
+      localStorage.setItem(DESK_STORAGE, parseDesk(fromUrl));
+      return parseDesk(fromUrl);
+    }
+    return parseDesk(localStorage.getItem(DESK_STORAGE));
+  } catch {
+    return parseDesk(fromUrl);
+  }
+}
+
+let currentDesk: Desk = storedDesk();
+export const getDesk = () => currentDesk;
+export function setDesk(desk: Desk) {
+  currentDesk = desk;
+  try {
+    localStorage.setItem(DESK_STORAGE, desk);
+  } catch {
+    /* приватний режим браузера: вибір живе до перезавантаження */
+  }
+}
+
+export const DeskContext = createContext<Desk>("crypto");
+export const useDesk = () => useContext(DeskContext);
+
+/** Слова, що залежать від режиму. */
+export const unit = (desk: Desk) =>
+  desk === "crypto"
+    ? { many: "Монети", gen: "монет", one: "монета", acc: "монету", kind: "ф'ючерс" }
+    : { many: "Акції", gen: "акцій", one: "акція", acc: "акцію", kind: "контракт Bybit" };
+
+/** Додає режим до запитів API: сервер фільтрує за ним сигнали, звіти, ідеї й статистику; іншим запитам він не заважає. */
+function withDesk(path: string): string {
+  if (!path.startsWith("/api/")) return path;
+  const url = new URL(path, location.origin);
+  if (!url.searchParams.has("desk")) url.searchParams.set("desk", currentDesk);
+  return url.pathname + url.search;
+}
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, init);
+  const res = await fetch(withDesk(path), init);
   const cachedAt = res.headers.get("x-cached-at");
   window.dispatchEvent(new CustomEvent(OFFLINE_EVENT, { detail: cachedAt }));
   if (!res.ok) {

@@ -1,3 +1,4 @@
+import { CRYPTO_LEADER, type Desk } from "../shared/desk";
 /**
  * Статистика: рахує код, модель лише пояснює її в тижневому розборі.
  * Чисті функції над рядками бази плюс завантажувач для D1.
@@ -67,7 +68,9 @@ export interface Stats {
     riskPct: number;
     /** Сума R × ризик на угоду, без складних відсотків. */
     equityPct: number;
+    /** Утримання орієнтира за період, %: BTC для крипто, ETF індексу для акцій. */
     btcHoldPct: number | null;
+    holdSymbol: string;
     /** Скільки закритих сигналів до рішення за форвард-тестом. */
     target: number;
   };
@@ -140,6 +143,8 @@ export interface StatsInput {
   budgetUsd: number | null;
   riskPct: number;
   btc: { start: number | null; end: number | null };
+  /** Що порівнюємо з утриманням: BTCUSDT або орієнтир акцій. */
+  holdSymbol?: string;
   from: string | null;
   to: string;
   target?: number;
@@ -185,6 +190,7 @@ export function computeStats(input: StatsInput): Stats {
       riskPct: input.riskPct,
       equityPct: round(total.totalR * input.riskPct),
       btcHoldPct: start && end ? round((end / start - 1) * 100) : null,
+      holdSymbol: input.holdSymbol ?? CRYPTO_LEADER,
       target: input.target ?? 100,
     },
     bySetup: setups.map((setup) => ({
@@ -224,8 +230,13 @@ const monthStart = (now: number) => {
  * Завантажує рядки з D1 і рахує статистику. from: ISO або null (увесь час).
  * Сигнал входить у період, якщо створений або закритий у ньому.
  */
-export async function loadStats(db: D1Database, opts: { from: string | null; now: number }): Promise<Stats> {
+export async function loadStats(
+  db: D1Database,
+  opts: { from: string | null; now: number; desk?: Desk; leader?: string },
+): Promise<Stats> {
   const from = opts.from ?? "0000";
+  const desk = opts.desk ?? "crypto";
+  const leader = opts.leader ?? CRYPTO_LEADER;
   const to = new Date(opts.now).toISOString();
   const setting = async <T>(key: string, fallback: T): Promise<T> => {
     const row = await db.prepare("SELECT value FROM settings WHERE key = ?").bind(key).first<{ value: string }>();
@@ -236,31 +247,38 @@ export async function loadStats(db: D1Database, opts: { from: string | null; now
       .prepare(
         `SELECT id, created_at, resolved_at, setup, status, result_r, fee_r, p_analyst, p_skeptic, playbook_version, shadow_status, shadow_r, hit, shadow_hit,
            (SELECT action FROM journal WHERE signal_id = signals.id ORDER BY id DESC LIMIT 1) AS action
-         FROM signals WHERE created_at >= ? OR resolved_at >= ?`,
+         FROM signals WHERE desk = ? AND (created_at >= ? OR resolved_at >= ?)`,
       )
-      .bind(from, from)
+      .bind(desk, from, from)
       .all<SignalStatRow>(),
-    db.prepare("SELECT probability, outcome FROM forecasts WHERE resolved_at >= ?").bind(from).all<ForecastStatRow>(),
-    db.prepare("SELECT detail FROM runs WHERE kind = 'signals' AND started_at >= ? AND detail IS NOT NULL").bind(from).all<{ detail: string }>(),
+    db.prepare("SELECT probability, outcome FROM forecasts WHERE desk = ? AND resolved_at >= ?").bind(desk, from).all<ForecastStatRow>(),
+    db
+      .prepare("SELECT detail FROM runs WHERE kind = 'signals' AND desk = ? AND started_at >= ? AND detail IS NOT NULL")
+      .bind(desk, from)
+      .all<{ detail: string }>(),
     db
       .prepare("SELECT pipeline, SUM(cost_usd) AS usd, COUNT(*) AS calls FROM llm_calls WHERE ts >= ? GROUP BY pipeline")
       .bind(monthStart(opts.now))
       .all<{ pipeline: string; usd: number; calls: number }>(),
     setting<number | null>("llm_budget_usd", null),
     setting("risk_per_trade_pct", 0.5),
-    db.prepare("SELECT MIN(created_at) AS at FROM signals WHERE status != 'rejected' AND created_at >= ?").bind(from).first<{ at: string | null }>(),
+    db
+      .prepare("SELECT MIN(created_at) AS at FROM signals WHERE desk = ? AND status != 'rejected' AND created_at >= ?")
+      .bind(desk, from)
+      .first<{ at: string | null }>(),
   ]);
 
-  // Утримання BTC: від першого опублікованого сигналу періоду до останньої ціни.
+  // Утримання орієнтира (BTC або ETF індексу): від першого опублікованого сигналу періоду до останньої ціни.
   const startDate = (opts.from ?? firstSignal?.at ?? null)?.slice(0, 10) ?? null;
   const [btcStart, btcEnd] = startDate
     ? await Promise.all([
         db
-          .prepare("SELECT close FROM prices_daily WHERE symbol = 'BTCUSDT' AND date <= ? ORDER BY date DESC LIMIT 1")
-          .bind(startDate)
+          .prepare("SELECT close FROM prices_daily WHERE symbol = ? AND date <= ? ORDER BY date DESC LIMIT 1")
+          .bind(leader, startDate)
           .first<{ close: number }>(),
         db
-          .prepare("SELECT json_extract(features, '$.price') AS close FROM snapshots WHERE symbol = 'BTCUSDT' ORDER BY id DESC LIMIT 1")
+          .prepare("SELECT json_extract(features, '$.price') AS close FROM snapshots WHERE symbol = ? ORDER BY id DESC LIMIT 1")
+          .bind(leader)
           .first<{ close: number }>(),
       ])
     : [null, null];
@@ -279,6 +297,7 @@ export async function loadStats(db: D1Database, opts: { from: string | null; now
     budgetUsd: budget,
     riskPct,
     btc: { start: btcStart?.close ?? null, end: btcEnd?.close ?? null },
+    holdSymbol: leader,
     from: opts.from,
     to,
   });

@@ -1,3 +1,4 @@
+import { CRYPTO_LEADER } from "../shared/desk";
 import { TIMEFRAMES, type Candle, type Funding, type MarketData, type Timeframe } from "./market/types";
 import { marketRegime, type MarketRegime } from "./regime";
 import { buildSnapshot, type Snapshot } from "./snapshot";
@@ -77,9 +78,9 @@ export async function scanChunk(market: MarketData, symbols: string[], now: numb
   return { snapshots: results.filter((s): s is Snapshot => s !== null), errors };
 }
 
-/** Режим ринку за знімками всіх монет. */
-export function marketFromSnapshots(snapshots: Snapshot[]): MarketRegime {
-  const btc = snapshots.find((s) => s.symbol === "BTCUSDT");
+/** Режим ринку за знімками всіх інструментів. leader — орієнтир: BTC для крипто, ETF індексу для акцій. */
+export function marketFromSnapshots(snapshots: Snapshot[], leader: string = CRYPTO_LEADER): MarketRegime {
+  const btc = snapshots.find((s) => s.symbol === leader);
   return marketRegime(
     btc?.regime.trend ?? null,
     snapshots.map((s) => (s.tf["4h"].ema200 === null ? null : s.tf["4h"].close > s.tf["4h"].ema200)),
@@ -87,7 +88,7 @@ export function marketFromSnapshots(snapshots: Snapshot[]): MarketRegime {
 }
 
 /** Повний скан одним викликом (для тестів і невеликих списків). */
-export async function scan(market: MarketData, symbols: string[], now: number): Promise<ScanResult> {
+export async function scan(market: MarketData, symbols: string[], now: number, leader: string = CRYPTO_LEADER): Promise<ScanResult> {
   const snapshots: Snapshot[] = [];
   const errors: ScanResult["errors"] = [];
   for (let i = 0; i < symbols.length; i += CHUNK_SIZE) {
@@ -98,5 +99,5 @@ export async function scan(market: MarketData, symbols: string[], now: number): 
   }
   const order = new Map(symbols.map((s, i) => [s, i]));
   snapshots.sort((a, b) => order.get(a.symbol)! - order.get(b.symbol)!);
-  return { snapshots, market: marketFromSnapshots(snapshots), errors };
+  return { snapshots, market: marketFromSnapshots(snapshots, leader), errors };
 }

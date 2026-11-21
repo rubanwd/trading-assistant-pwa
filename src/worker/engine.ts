@@ -25,7 +25,9 @@ import { BybitLinear } from "./market/bybit";
 import { FailoverMarket } from "./market/failover";
 import type { Candle, MarketData } from "./market/types";
 import { newsHash, parseFeed } from "./news/rss";
-import { sanitizeTriage, TRIAGE_SYSTEM, triageSchema, triageUser, type TriageInput } from "./news/triage";
+import { categoriesFor, sanitizeTriage, triageSchema, triageSystem, triageUser, type TriageInput } from "./news/triage";
+import { CRYPTO_LEADER, DESK_LABEL, deskKey, parseDesk, STOCKS_LEADER_DEFAULT, usSessionOpen, usTradingDay, type Desk } from "../shared/desk";
+import { forDesk } from "./desk";
 import { parseSubscription, sendPush, type PushMessage, type PushOutcome, type StoredSubscription } from "./push";
 import type { MarketRegime } from "./regime";
 import { reportInput, type NewsField, type PriorForecast } from "./report/input";
@@ -66,17 +68,27 @@ export interface ProbeResult {
   targets: ProbeTarget[];
 }
 
-/** Стан циклу між кроками. Лежить у сховищі Durable Object, тож переживає перезапуск рушія. */
-interface PipelineState {
-  startedAt: number;
-  /** Список монет на момент планування: усі кроки скану працюють з тим самим списком. */
+/** Стан одного режиму (крипто або акції) у циклі. */
+interface DeskState {
+  /** Список інструментів на момент планування: усі кроки скану працюють з тим самим списком. */
   symbols: string[];
-  /** Черга кроків: scan:N, scan:done, news, signals, review:N, pick, forecasts, reports, weekly, cleanup. */
-  steps: string[];
-  log: { step: string; ms: number; requests: number; error?: string }[];
+  /** Орієнтир ринку: BTCUSDT для крипто, ETF індексу для акцій. */
+  leader: string;
   scan?: { runId: number; market: MarketRegime };
   candidates?: Candidate[];
   signals?: SignalsSummary;
+}
+
+/** Стан циклу між кроками. Лежить у сховищі Durable Object, тож переживає перезапуск рушія. */
+interface PipelineState {
+  startedAt: number;
+  desks: Partial<Record<Desk, DeskState>>;
+  /**
+   * Черга кроків. Для кожного режиму: scan:<desk>:N, scan:<desk>:done, news:<desk>, signals:<desk>, review:<desk>:N, pick:<desk>;
+   * потім forecasts, reports:<desk>, weekly:<desk>, cleanup.
+   */
+  steps: string[];
+  log: { step: string; ms: number; requests: number; error?: string }[];
 }
 
 const PIPELINE_KEY = "pipeline";
@@ -99,7 +111,8 @@ export interface ReportBody {
   v: 1;
   content: ReportContent;
   market: MarketRegime;
-  context: Awaited<ReturnType<typeof marketContext>>["context"];
+  /** Фон ринку крипто; null у звітах по акціях. */
+  context: Awaited<ReturnType<typeof marketContext>>["context"] | null;
   /** Запуск скану, зі знімків якого складено звіт. */
   snapshotRunId: number;
   /** Новини, поля яких бачила модель. */
@@ -157,6 +170,10 @@ const HOUR = 3_600_000;
 const SIDE_NAME = { long: "лонг", short: "шорт" } as const;
 const coin = (symbol: string) => symbol.replace(/USDT$/, "");
 const REPORT_TITLE: Record<ReportKind, string> = { morning: "Ранковий звіт готовий", evening: "Вечірній звіт готовий" };
+/** Префікс сповіщень режиму акцій: крипто лишається як було. */
+const deskTitle = (desk: Desk, title: string) => (desk === "crypto" ? title : `${DESK_LABEL[desk]} · ${title}`);
+/** Посилання зі сповіщення відкриває застосунок у потрібному режимі. */
+const deskUrl = (desk: Desk, path: string) => (desk === "crypto" ? path : `${path}&desk=${desk}`);
 
 /**
  * Рушій. Усі серверні запити назовні (біржа, Claude API, новини)
@@ -195,19 +212,25 @@ export class Engine extends DurableObject<Env> {
   private async startPipeline(now: number): Promise<{ queued: boolean; steps?: string[] }> {
     if (await this.busy()) return { queued: false };
     this.settingsCache = null;
-    const symbols = await this.watchlist();
-    const steps = [
-      ...Array.from({ length: Math.ceil(symbols.length / CHUNK_SIZE) }, (_, i) => `scan:${i}`),
-      "scan:done",
-      "news",
-      "signals",
-      "pick",
-      "forecasts",
-      "reports",
-      "weekly",
-      "cleanup",
-    ];
-    await this.ctx.storage.put<PipelineState>(PIPELINE_KEY, { startedAt: now, symbols, steps, log: [] });
+    const desks: PipelineState["desks"] = {};
+    const steps: string[] = [];
+    const active = await this.activeDesks();
+    for (const desk of active) {
+      const leader = await this.leader(desk);
+      const list = await this.watchlist(desk);
+      // Орієнтир акцій потрібен для настрою ринку, тож скан бере його завжди.
+      const symbols = desk === "stocks" && !list.includes(leader) ? [leader, ...list] : list;
+      desks[desk] = { symbols, leader };
+      steps.push(
+        ...Array.from({ length: Math.ceil(symbols.length / CHUNK_SIZE) }, (_, i) => `scan:${desk}:${i}`),
+        `scan:${desk}:done`,
+        `news:${desk}`,
+        `signals:${desk}`,
+        `pick:${desk}`,
+      );
+    }
+    steps.push("forecasts", ...active.map((d) => `reports:${d}`), ...active.map((d) => `weekly:${d}`), "cleanup");
+    await this.ctx.storage.put<PipelineState>(PIPELINE_KEY, { startedAt: now, desks, steps, log: [] });
     await this.ctx.storage.setAlarm(Date.now());
     return { queued: true, steps };
   }
@@ -216,6 +239,8 @@ export class Engine extends DurableObject<Env> {
   async alarm(): Promise<void> {
     const state = await this.pipelineState();
     if (!state) return;
+    // Цикл, запланований до появи режимів: його кроки вже не зрозумілі, наступний Cron почне новий.
+    if (!state.desks) return void (await this.ctx.storage.delete(PIPELINE_KEY));
     const step = state.steps.shift();
     if (!step) return this.finishPipeline(state);
     // Крок знімається з черги до виконання: якщо запуск упаде посередині, цикл не застрягне на ньому.
@@ -238,25 +263,31 @@ export class Engine extends DurableObject<Env> {
 
   private async runStep(step: string, state: PipelineState): Promise<void> {
     const now = Date.now();
-    const [name, arg] = step.split(":");
+    const [name, deskArg, arg] = step.split(":");
+    const desk = parseDesk(deskArg);
+    const ds = state.desks[desk];
     switch (name) {
       case "scan":
-        return arg === "done" ? this.finishScan(state) : this.scanPart(state, Number(arg));
+        if (!ds) return;
+        return arg === "done" ? this.finishScan(desk, ds, state.startedAt) : this.scanPart(desk, ds, Number(arg), state.startedAt);
       case "news":
-        return this.runNews(now);
+        return this.runNews(now, desk);
       case "signals":
-        return this.runSignals(state, now);
+        if (!ds) return;
+        return this.runSignals(state, desk, ds, now);
       case "review":
-        return this.reviewCandidate(state, Number(arg), now);
+        if (!ds) return;
+        return this.reviewCandidate(state, desk, ds, Number(arg), now);
       case "pick":
-        return this.runPick(state, now);
+        if (!ds) return;
+        return this.runPick(desk, ds, now);
       case "forecasts":
         return this.resolveForecasts(now);
       case "reports":
-        for (const due of await this.dueReports(now)) await this.runReport(due.kind, due.date);
+        for (const due of await this.dueReports(now, desk)) await this.runReport(desk, due.kind, due.date);
         return;
       case "weekly":
-        await this.runWeekly(now);
+        await this.runWeekly(now, desk);
         return;
       case "cleanup":
         return this.cleanup(now);
@@ -279,26 +310,28 @@ export class Engine extends DurableObject<Env> {
           failed.length ? failed.map((l) => `${l.step}: ${l.error}`).join("; ").slice(0, 2000) : null,
         ),
     ];
-    if (state.signals) {
+    for (const [desk, ds] of Object.entries(state.desks)) {
+      if (!ds?.signals) continue;
       statements.push(
         db
-          .prepare("INSERT INTO runs (kind, started_at, status, duration_ms, candidates, detail, error) VALUES ('signals', ?, 'ok', ?, ?, ?, NULL)")
-          .bind(new Date(state.startedAt).toISOString(), Date.now() - state.startedAt, state.signals.reviewed, JSON.stringify(state.signals)),
+          .prepare("INSERT INTO runs (kind, desk, started_at, status, duration_ms, candidates, detail, error) VALUES ('signals', ?, ?, 'ok', ?, ?, ?, NULL)")
+          .bind(desk, new Date(state.startedAt).toISOString(), Date.now() - state.startedAt, ds.signals.reviewed, JSON.stringify(ds.signals)),
       );
     }
     await db.batch(statements);
   }
 
   /** Ручний запуск звіту з API. null, якщо рушій зайнятий; помилка, якщо звіт за цю дату вже є. */
-  async reportNow(kind: ReportKind): Promise<ReportSummary | { error: string } | null> {
+  async reportNow(kind: ReportKind, desk: Desk = "crypto"): Promise<ReportSummary | { error: string } | null> {
     if (await this.busy()) return null;
     try {
       const now = Date.now();
+      if (desk === "stocks" && !(await this.deskEnabled("stocks"))) return { error: "режим акцій вимкнено в налаштуваннях" };
       const date = localTime(now, await this.setting("timezone", "Europe/Kyiv")).date;
-      if (await this.reportExists(kind, date)) return { error: "звіт за цю дату вже є" };
-      await this.runNews(now).catch((e) => console.error("крок news:", e));
+      if (await this.reportExists(desk, kind, date)) return { error: "звіт за цю дату вже є" };
+      await this.runNews(now, desk).catch((e) => console.error("крок news:", e));
       await this.resolveForecasts(now).catch((e) => console.error("крок forecasts:", e));
-      return await this.runReport(kind, date);
+      return await this.runReport(desk, kind, date);
     } catch (e) {
       return { error: String(e) };
     }
@@ -314,37 +347,68 @@ export class Engine extends DurableObject<Env> {
     return this.startPipeline(Date.now());
   }
 
-  private marketCache: { source: string; market: MarketData } | null = null;
+  private marketCache = new Map<Desk, { source: string; market: MarketData }>();
   private candleStorage: SqlCandleStorage | null = null;
 
   /**
-   * Джерело ринкових даних за settings.market_source: binance, bybit або auto
+   * Джерело ринкових даних режиму. Крипто: за settings.market_source binance, bybit або auto
    * (Binance, а якщо він відмовляє за локацією, то Bybit до перезапуску рушія).
-   * Свічки йдуть через кеш у сховищі рушія: біржа докачує лише нові.
+   * Акції: лише Bybit, лінійні контракти на акції та ETF США.
+   * Свічки йдуть через кеш у сховищі рушія (символи акцій і монет не перетинаються): біржа докачує лише нові.
    */
-  private async market(): Promise<MarketData> {
-    const source = await this.setting("market_source", "auto");
-    if (this.marketCache?.source !== source) {
-      const binance = () => new BinanceFutures(this.http);
-      const bybit = () => new BybitLinear(this.http);
-      const inner = source === "binance" ? binance() : source === "bybit" ? bybit() : new FailoverMarket(binance(), bybit());
-      this.candleStorage ??= new SqlCandleStorage(this.ctx.storage.sql);
-      this.marketCache = { source, market: new CachedMarket(inner, this.candleStorage) };
-    }
-    return this.marketCache.market;
+  private async market(desk: Desk = "crypto"): Promise<MarketData> {
+    const source = desk === "stocks" ? "bybit" : await this.setting("market_source", "auto");
+    const cached = this.marketCache.get(desk);
+    if (cached?.source === source) return cached.market;
+    const binance = () => new BinanceFutures(this.http);
+    const bybit = () => new BybitLinear(this.http);
+    const inner = source === "binance" ? binance() : source === "bybit" ? bybit() : new FailoverMarket(binance(), bybit());
+    this.candleStorage ??= new SqlCandleStorage(this.ctx.storage.sql);
+    const market = new CachedMarket(inner, this.candleStorage);
+    this.marketCache.set(desk, { source, market });
+    return market;
   }
 
-  /** Частина скану: кілька монет, результат чекає в сховищі рушія на крок scan:done. */
-  private async scanPart(state: PipelineState, index: number): Promise<void> {
-    const symbols = state.symbols.slice(index * CHUNK_SIZE, (index + 1) * CHUNK_SIZE);
-    const part = await scanChunk(await this.market(), symbols, state.startedAt);
-    await this.ctx.storage.put(`scan-part:${index}`, part);
+  private universeCache: { at: number; symbols: string[] } | null = null;
+
+  /**
+   * Контракти Bybit на акції та ETF США, що зараз торгуються. Кеш на 6 годин і в сховищі рушія:
+   * два запити до біржі не частіше ніж раз на 6 годин.
+   */
+  async stockSymbols(): Promise<string[]> {
+    this.universeCache ??= (await this.ctx.storage.get<{ at: number; symbols: string[] }>("stock-universe")) ?? null;
+    if (this.universeCache && Date.now() - this.universeCache.at < 6 * HOUR) return this.universeCache.symbols;
+    const bybit = new BybitLinear(this.http);
+    const [stocks, etfs] = await Promise.all([bybit.instruments("stock"), bybit.instruments("ETF")]);
+    const symbols = [...new Set([...stocks, ...etfs])].sort();
+    if (!symbols.length) throw new Error("Bybit не повернув жодного контракту на акції");
+    this.universeCache = { at: Date.now(), symbols };
+    await this.ctx.storage.put("stock-universe", this.universeCache);
+    return symbols;
+  }
+
+  /** Частина скану: кілька інструментів, результат чекає в сховищі рушія на крок scan:<desk>:done. */
+  private async scanPart(desk: Desk, ds: DeskState, index: number, startedAt: number): Promise<void> {
+    let symbols = ds.symbols.slice(index * CHUNK_SIZE, (index + 1) * CHUNK_SIZE);
+    const missing: ChunkResult["errors"] = [];
+    if (desk === "stocks") {
+      // Символ без контракту на Bybit не запитуємо: інакше біржа відповідає помилкою на кожну свічку.
+      const universe = await this.stockSymbols().catch(() => null);
+      if (universe) {
+        const known = new Set(universe);
+        for (const s of symbols) if (!known.has(s)) missing.push({ symbol: s, message: "на Bybit немає такого контракту на акцію чи ETF" });
+        symbols = symbols.filter((s) => known.has(s));
+      }
+    }
+    const part = await scanChunk(await this.market(desk), symbols, startedAt);
+    part.errors.push(...missing);
+    await this.ctx.storage.put(`scan-part:${desk}:${index}`, part);
   }
 
   /** Збирає частини скану: режим ринку, запис запуску й знімків у базу, денні ціни. */
-  private async finishScan(state: PipelineState): Promise<void> {
+  private async finishScan(desk: Desk, ds: DeskState, startedAt: number): Promise<void> {
     const db = this.env.DB;
-    const keys = Array.from({ length: Math.ceil(state.symbols.length / CHUNK_SIZE) }, (_, i) => `scan-part:${i}`);
+    const keys = Array.from({ length: Math.ceil(ds.symbols.length / CHUNK_SIZE) }, (_, i) => `scan-part:${desk}:${i}`);
     const parts = await this.ctx.storage.get<ChunkResult>(keys);
     const snapshots: Snapshot[] = [];
     const errors: ChunkResult["errors"] = [];
@@ -358,16 +422,17 @@ export class Engine extends DurableObject<Env> {
       // Збій фандингу повторюється в кожній частині: лишаємо один запис.
       for (const e of part.errors) if (e.symbol !== null || !errors.some((x) => x.message === e.message)) errors.push(e);
     }
-    const market = marketFromSnapshots(snapshots);
-    const source = (await this.market()).name;
-    const failed = state.symbols.length === 0 || snapshots.length < state.symbols.length;
-    const summary = { source, market, symbols: state.symbols.length, snapshots: snapshots.length, errors };
+    const market = marketFromSnapshots(snapshots, ds.leader);
+    const source = (await this.market(desk)).name;
+    const failed = ds.symbols.length === 0 || snapshots.length < ds.symbols.length;
+    const summary = { source, market, leader: ds.leader, symbols: ds.symbols.length, snapshots: snapshots.length, errors };
     const run = await db
-      .prepare("INSERT INTO runs (kind, started_at, status, duration_ms, detail, error) VALUES ('scan', ?, ?, ?, ?, ?) RETURNING id")
+      .prepare("INSERT INTO runs (kind, desk, started_at, status, duration_ms, detail, error) VALUES ('scan', ?, ?, ?, ?, ?, ?) RETURNING id")
       .bind(
-        new Date(state.startedAt).toISOString(),
+        desk,
+        new Date(startedAt).toISOString(),
         failed ? "error" : "ok",
-        Date.now() - state.startedAt,
+        Date.now() - startedAt,
         JSON.stringify(summary),
         failed ? errors.map((e) => (e.symbol ? `${e.symbol}: ${e.message}` : e.message)).join("; ").slice(0, 2000) || "порожній список монет" : null,
       )
@@ -385,18 +450,20 @@ export class Engine extends DurableObject<Env> {
     }
     if (statements.length) await db.batch(statements);
     await this.ctx.storage.delete(keys);
-    state.scan = { runId, market };
-    await this.recordDailyPrices(snapshots.map((s) => s.symbol)).catch((e) => console.error("денні ціни:", e));
+    ds.scan = { runId, market };
+    await this.recordDailyPrices(desk, snapshots.map((s) => s.symbol)).catch((e) => console.error("денні ціни:", e));
   }
 
   /**
    * Денні закриття для порівняння з утриманням BTC. Щоразу пишемо останню закриту денну свічку;
    * якщо таблиця порожня, заповнюємо 120 днів історії. Свічки беруться з кешу, біржу не питаємо.
    */
-  private async recordDailyPrices(symbols: string[]): Promise<void> {
+  private async recordDailyPrices(desk: Desk, symbols: string[]): Promise<void> {
     const db = this.env.DB;
-    const empty = (await db.prepare("SELECT 1 AS x FROM prices_daily LIMIT 1").first()) === null;
-    const market = await this.market();
+    // Історію заповнюємо, коли для орієнтира режиму ще немає жодного рядка: так і акції отримують свої 120 днів.
+    const leader = await this.leader(desk);
+    const empty = (await db.prepare("SELECT 1 AS x FROM prices_daily WHERE symbol = ? LIMIT 1").bind(leader).first()) === null;
+    const market = await this.market(desk);
     const rows: [string, string, number][] = [];
     for (const symbol of symbols) {
       const daily = await market.candles(symbol, "1d", CANDLE_LIMIT);
@@ -412,17 +479,34 @@ export class Engine extends DurableObject<Env> {
     if (statements.length) await db.batch(statements);
   }
 
-  private async watchlist(): Promise<string[]> {
-    const list = await this.setting<unknown>("watchlist", []);
-    if (!Array.isArray(list)) throw new Error("settings.watchlist має бути масивом");
+  private async watchlist(desk: Desk = "crypto"): Promise<string[]> {
+    const key = deskKey(desk, "watchlist");
+    const list = await this.setting<unknown>(key, []);
+    if (!Array.isArray(list)) throw new Error(`settings.${key} має бути масивом`);
     return list.filter((s): s is string => typeof s === "string" && /^[A-Z0-9]{2,20}$/.test(s));
   }
 
+  /** Орієнтир ринку режиму: BTC для крипто, налаштування stocks_benchmark для акцій. */
+  private async leader(desk: Desk): Promise<string> {
+    if (desk === "crypto") return CRYPTO_LEADER;
+    const s = await this.setting<unknown>("stocks_benchmark", STOCKS_LEADER_DEFAULT);
+    return typeof s === "string" && /^[A-Z0-9]{2,20}USDT$/.test(s) ? s : STOCKS_LEADER_DEFAULT;
+  }
+
+  private async deskEnabled(desk: Desk): Promise<boolean> {
+    return desk === "crypto" || (await this.setting("stocks_enabled", "on")) !== "off";
+  }
+
+  /** Режими, які працюють у циклі: крипто завжди, акції — якщо не вимкнені. */
+  private async activeDesks(): Promise<Desk[]> {
+    return (await this.deskEnabled("stocks")) ? ["crypto", "stocks"] : ["crypto"];
+  }
+
   /** Свічки для графіка в застосунку: з кешу рушія, біржа докачує лише нові. */
-  async candles(symbol: string, timeframe: "15m" | "1h" | "4h", limit: number): Promise<Candle[]> {
+  async candles(symbol: string, timeframe: "15m" | "1h" | "4h", limit: number, desk: Desk = "crypto"): Promise<Candle[]> {
     if (!/^[A-Z0-9]{2,20}USDT$/.test(symbol)) throw new Error("невідомий символ");
     const n = Math.min(Math.max(Math.trunc(limit) || 96, 10), 300);
-    return (await (await this.market()).candles(symbol, timeframe, n)).slice(-n);
+    return (await (await this.market(desk)).candles(symbol, timeframe, n)).slice(-n);
   }
 
   private accessKeysCache: { domain: string; keys: AccessJwk[]; at: number } | null = null;
@@ -532,11 +616,11 @@ export class Engine extends DurableObject<Env> {
     return value === undefined ? fallback : (value as T);
   }
 
-  private async logRun(kind: string, started: number, detail: unknown, error: string | null): Promise<void> {
+  private async logRun(kind: string, started: number, detail: unknown, error: string | null, desk: Desk | null = null): Promise<void> {
     await this.env.DB.prepare(
-      "INSERT INTO runs (kind, started_at, status, duration_ms, detail, error) VALUES (?, ?, ?, ?, ?, ?)",
+      "INSERT INTO runs (kind, desk, started_at, status, duration_ms, detail, error) VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
-      .bind(kind, new Date(started).toISOString(), error ? "error" : "ok", Date.now() - started, JSON.stringify(detail), error?.slice(0, 2000) ?? null)
+      .bind(kind, desk, new Date(started).toISOString(), error ? "error" : "ok", Date.now() - started, JSON.stringify(detail), error?.slice(0, 2000) ?? null)
       .run();
   }
 
@@ -655,10 +739,10 @@ export class Engine extends DurableObject<Env> {
   // ── Новини ───────────────────────────────────────────────────────────────
 
   /** Нові заголовки зі стрічок у news, потім сортувальник перетворює їх на поля. */
-  private async runNews(now: number): Promise<void> {
+  private async runNews(now: number, desk: Desk = "crypto"): Promise<void> {
     const started = Date.now();
     const errors: string[] = [];
-    const feeds = (await this.setting<{ source: string; url: string }[]>("news_feeds", [])).filter(
+    const feeds = (await this.setting<{ source: string; url: string }[]>(deskKey(desk, "news_feeds"), [])).filter(
       (f) => typeof f?.source === "string" && typeof f?.url === "string" && f.url.startsWith("https://"),
     );
     let added = 0;
@@ -678,12 +762,12 @@ export class Engine extends DurableObject<Env> {
           );
           if (!items.length) return;
           const insert = this.env.DB.prepare(
-            "INSERT OR IGNORE INTO news (ts, source, url, title, hash) VALUES (?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO news (desk, ts, source, url, title, hash) VALUES (?, ?, ?, ?, ?, ?)",
           );
           const results = await this.env.DB.batch(
             await Promise.all(
               items.map(async (i) =>
-                insert.bind(new Date(i.ts ?? now).toISOString(), feed.source.slice(0, 40), i.url, i.title, await newsHash(i.url)),
+                insert.bind(desk, new Date(i.ts ?? now).toISOString(), feed.source.slice(0, 40), i.url, i.title, await newsHash(i.url)),
               ),
             ),
           );
@@ -698,20 +782,23 @@ export class Engine extends DurableObject<Env> {
     let skipped: string | null = null;
     try {
       const pending = await this.env.DB.prepare(
-        "SELECT id, source, title FROM news WHERE relevance IS NULL AND ts >= ? ORDER BY ts DESC LIMIT 40",
+        "SELECT id, source, title FROM news WHERE desk = ? AND relevance IS NULL AND ts >= ? ORDER BY ts DESC LIMIT 40",
       )
-        .bind(new Date(now - 24 * HOUR).toISOString())
+        .bind(desk, new Date(now - 24 * HOUR).toISOString())
         .all<TriageInput>();
       if (pending.results.length) {
-        const symbols = await this.watchlist();
+        const leader = await this.leader(desk);
+        const list = await this.watchlist(desk);
+        const symbols = desk === "stocks" && !list.includes(leader) ? [leader, ...list] : list;
+        const categories = categoriesFor(desk);
         const res = await this.llm("news", {
-          system: TRIAGE_SYSTEM,
+          system: triageSystem(desk),
           user: triageUser(pending.results),
-          schema: triageSchema(symbols),
+          schema: triageSchema(symbols, categories),
         });
         if (!res) skipped = "стелю витрат вичерпано";
         else {
-          const rows = sanitizeTriage(res.data, pending.results, symbols);
+          const rows = sanitizeTriage(res.data, pending.results, symbols, categories);
           const update = this.env.DB.prepare(
             "UPDATE news SET relevance = ?, impact = ?, sentiment = ?, symbols = ?, category = ? WHERE id = ?",
           );
@@ -726,7 +813,7 @@ export class Engine extends DurableObject<Env> {
     } catch (e) {
       errors.push(`сортувальник: ${String(e)}`);
     }
-    await this.logRun("news", started, { feeds: feeds.length, added, triaged, skipped, errors }, errors.length ? errors.join("; ") : null);
+    await this.logRun("news", started, { feeds: feeds.length, added, triaged, skipped, errors }, errors.length ? errors.join("; ") : null, desk);
     if (errors.length && !added && !triaged) throw new Error(errors.join("; "));
   }
 
@@ -735,25 +822,29 @@ export class Engine extends DurableObject<Env> {
   /** Закриває прогнози, чий термін настав: результат рахує код за свічками 1h. */
   private async resolveForecasts(now: number): Promise<void> {
     const due = await this.env.DB.prepare(
-      "SELECT id, rule, resolve_at FROM forecasts WHERE outcome IS NULL AND resolve_at <= ? ORDER BY resolve_at LIMIT 30",
+      "SELECT id, desk, rule, resolve_at FROM forecasts WHERE outcome IS NULL AND resolve_at <= ? ORDER BY resolve_at LIMIT 30",
     )
       .bind(new Date(now).toISOString())
-      .all<{ id: number; rule: string; resolve_at: string }>();
+      .all<{ id: number; desk: string; rule: string; resolve_at: string }>();
     if (!due.results.length) return;
-    const market = await this.market();
-    const bySymbol = new Map<string, { id: number; rule: ForecastRule; resolveAt: number }[]>();
+    // Свічки беремо з джерела того режиму, до якого належить прогноз.
+    const bySymbol = new Map<string, { desk: Desk; list: { id: number; rule: ForecastRule; resolveAt: number }[] }>();
     for (const row of due.results) {
       try {
         const rule = JSON.parse(row.rule) as ForecastRule;
-        const list = bySymbol.get(rule.symbol) ?? [];
-        list.push({ id: row.id, rule, resolveAt: Date.parse(row.resolve_at) });
-        bySymbol.set(rule.symbol, list);
+        const desk = parseDesk(row.desk);
+        const key = `${desk}:${rule.symbol}`;
+        const group = bySymbol.get(key) ?? { desk, list: [] };
+        group.list.push({ id: row.id, rule, resolveAt: Date.parse(row.resolve_at) });
+        bySymbol.set(key, group);
       } catch {
         // Зіпсоване правило лишається відкритим і видимим у статистиці.
       }
     }
     const update = this.env.DB.prepare("UPDATE forecasts SET outcome = ?, resolved_at = ? WHERE id = ? AND outcome IS NULL");
-    for (const [symbol, list] of bySymbol) {
+    for (const { desk, list } of bySymbol.values()) {
+      const symbol = list[0]!.rule.symbol;
+      const market = await this.market(desk);
       const oldest = Math.min(...list.map((f) => Date.parse(f.rule.from)));
       const limit = Math.min(498, Math.ceil((now - oldest) / HOUR) + 2);
       const candles = await market.candles(symbol, "1h", limit);
@@ -767,41 +858,47 @@ export class Engine extends DurableObject<Env> {
 
   // ── Звіти ────────────────────────────────────────────────────────────────
 
-  private async reportExists(kind: ReportKind | "weekly", date: string): Promise<boolean> {
-    return (await this.env.DB.prepare("SELECT 1 AS x FROM reports WHERE kind = ? AND date = ?").bind(kind, date).first()) !== null;
+  private async reportExists(desk: Desk, kind: ReportKind | "weekly", date: string): Promise<boolean> {
+    return (await this.env.DB.prepare("SELECT 1 AS x FROM reports WHERE desk = ? AND kind = ? AND date = ?").bind(desk, kind, date).first()) !== null;
   }
 
-  /** Звіти, час яких настав за місцевим часом і яких ще немає в базі. */
-  private async dueReports(now: number): Promise<{ kind: ReportKind; date: string }[]> {
+  /**
+   * Звіти, час яких настав за місцевим часом і яких ще немає в базі.
+   * Звіти по акціях — лише в торгові дні США: у вихідні ринок стоїть і писати немає про що.
+   */
+  private async dueReports(now: number, desk: Desk = "crypto"): Promise<{ kind: ReportKind; date: string }[]> {
+    if (desk === "stocks" && !usTradingDay(now)) return [];
     const timezone = await this.setting("timezone", "Europe/Kyiv");
-    const times = await this.setting<ReportTimes>("report_times", { morning: "07:30", evening: "20:30" });
+    const fallback = desk === "crypto" ? { morning: "07:30", evening: "20:30" } : { morning: "16:00", evening: "23:15" };
+    const times = await this.setting<ReportTimes>(deskKey(desk, "report_times"), fallback);
     const out: { kind: ReportKind; date: string }[] = [];
     for (const due of dueReports(now, timezone, times)) {
-      if (!(await this.reportExists(due.kind, due.date))) out.push(due);
+      if (!(await this.reportExists(desk, due.kind, due.date))) out.push(due);
     }
     return out;
   }
 
-  private async runReport(kind: ReportKind, date: string): Promise<ReportSummary> {
+  private async runReport(desk: Desk, kind: ReportKind, date: string): Promise<ReportSummary> {
     const started = Date.now();
     try {
-      const summary = await this.buildReport(kind, date, started);
-      await this.logRun(`${kind}_report`, started, summary, null);
+      const summary = await this.buildReport(desk, kind, date, started);
+      await this.logRun(`${kind}_report`, started, summary, null, desk);
       return summary;
     } catch (e) {
-      await this.logRun(`${kind}_report`, started, null, String(e));
+      await this.logRun(`${kind}_report`, started, null, String(e), desk);
       throw e;
     }
   }
 
-  private async buildReport(kind: ReportKind, date: string, now: number): Promise<ReportSummary> {
+  private async buildReport(desk: Desk, kind: ReportKind, date: string, now: number): Promise<ReportSummary> {
     const db = this.env.DB;
     const timezone = await this.setting("timezone", "Europe/Kyiv");
+    const leader = await this.leader(desk);
 
     // 1. Знімки останнього скану: звіт не складається зі застарілих даних.
     const scanRun = await db
-      .prepare("SELECT id, detail FROM runs WHERE kind = 'scan' AND started_at >= ? ORDER BY id DESC LIMIT 1")
-      .bind(new Date(now - 1.5 * HOUR).toISOString())
+      .prepare("SELECT id, detail FROM runs WHERE kind = 'scan' AND desk = ? AND started_at >= ? ORDER BY id DESC LIMIT 1")
+      .bind(desk, new Date(now - 1.5 * HOUR).toISOString())
       .first<{ id: number; detail: string | null }>();
     const rows = scanRun
       ? await db.prepare("SELECT features FROM snapshots WHERE run_id = ? ORDER BY id").bind(scanRun.id).all<{ features: string }>()
@@ -810,15 +907,16 @@ export class Engine extends DurableObject<Env> {
     if (!scanRun || !snapshots.length) throw new Error("немає свіжих знімків ринку: останній скан не вдався");
     const market = (JSON.parse(scanRun.detail ?? "{}") as { market: MarketRegime }).market;
 
-    // 2. Фон ринку. Збій джерела не зупиняє звіт.
-    const { context, errors: warnings } = await marketContext(this.http, this.env.COINGECKO_API_KEY);
+    // 2. Фон ринку крипто (домінація BTC, страх і жадібність). Збій джерела не зупиняє звіт; для акцій його немає.
+    const { context, errors: warnings } =
+      desk === "crypto" ? await marketContext(this.http, this.env.COINGECKO_API_KEY) : { context: null, errors: [] as string[] };
 
     // 3. Новини за 12 годин: до 8 найважливіших, лише поля сортувальника.
     const newsRows = await db
       .prepare(
-        "SELECT id, ts, category, impact, sentiment, symbols, relevance FROM news WHERE ts >= ? AND relevance >= 0.4 ORDER BY relevance DESC, ts DESC LIMIT 8",
+        "SELECT id, ts, category, impact, sentiment, symbols, relevance FROM news WHERE desk = ? AND ts >= ? AND relevance >= 0.4 ORDER BY relevance DESC, ts DESC LIMIT 8",
       )
-      .bind(new Date(now - 12 * HOUR).toISOString())
+      .bind(desk, new Date(now - 12 * HOUR).toISOString())
       .all<{ id: number; ts: string; category: string; impact: string; sentiment: string; symbols: string; relevance: number }>();
     const news: NewsField[] = newsRows.results.map((n) => ({
       category: n.category,
@@ -831,8 +929,9 @@ export class Engine extends DurableObject<Env> {
 
     // 4. Прогнози попереднього звіту з результатами, які порахував код.
     const previous = await db
-      .prepare("SELECT id FROM reports WHERE kind IN ('morning', 'evening') AND created_at >= ? ORDER BY created_at DESC LIMIT 1")
-      .bind(new Date(now - 36 * HOUR).toISOString())
+      .prepare("SELECT id FROM reports WHERE desk = ? AND kind IN ('morning', 'evening') AND created_at >= ? ORDER BY created_at DESC LIMIT 1")
+      // Між звітами по акціях бувають вихідні: попередній шукаємо глибше.
+      .bind(desk, new Date(now - (desk === "stocks" ? 96 : 36) * HOUR).toISOString())
       .first<{ id: number }>();
     const priorRows = previous
       ? await db
@@ -849,7 +948,8 @@ export class Engine extends DurableObject<Env> {
 
     // 5. Відкриті сигнали (з'являться на етапі «Сигнали»).
     const signals = await db
-      .prepare("SELECT symbol, side, setup, status FROM signals WHERE status IN ('pending', 'active') ORDER BY id")
+      .prepare("SELECT symbol, side, setup, status FROM signals WHERE desk = ? AND status IN ('pending', 'active') ORDER BY id")
+      .bind(desk)
       .all<{ symbol: string; side: string; setup: string; status: string }>();
 
     // 6. Автор звіту.
@@ -866,7 +966,7 @@ export class Engine extends DurableObject<Env> {
       openSignals: signals.results,
     });
     const res = await this.llm(`${kind}_report`, {
-      system: reportSystem(kind),
+      system: forDesk(reportSystem(kind, desk), desk, leader),
       user: JSON.stringify(input),
       schema: reportSchema(symbols),
     });
@@ -880,23 +980,23 @@ export class Engine extends DurableObject<Env> {
     });
     const body: ReportBody = { v: 1, content, market, context, snapshotRunId: scanRun.id, newsIds: newsRows.results.map((n) => n.id), prior };
     const inserted = await db
-      .prepare("INSERT INTO reports (kind, date, body, model, cost_usd, created_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id")
-      .bind(kind, date, JSON.stringify(body), res.model, res.costUsd, new Date(now).toISOString())
+      .prepare("INSERT INTO reports (desk, kind, date, body, model, cost_usd, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id")
+      .bind(desk, kind, date, JSON.stringify(body), res.model, res.costUsd, new Date(now).toISOString())
       .first<{ id: number }>();
     const id = inserted!.id;
 
     // Кожна ймовірність стає рядком у forecasts із правилом перевірки.
     const insertForecast = db.prepare(
-      "INSERT INTO forecasts (source, statement, probability, resolve_at, rule) VALUES (?, ?, ?, ?, ?)",
+      "INSERT INTO forecasts (desk, source, statement, probability, resolve_at, rule) VALUES (?, ?, ?, ?, ?, ?)",
     );
     const forecasts = content.scenarios.flatMap((s) =>
       s.rule && s.statement && s.resolveAt
-        ? [insertForecast.bind(`report:${id}`, s.statement, s.probability, s.resolveAt, JSON.stringify(s.rule))]
+        ? [insertForecast.bind(desk, `report:${id}`, s.statement, s.probability, s.resolveAt, JSON.stringify(s.rule))]
         : [],
     );
     if (forecasts.length) await db.batch(forecasts);
 
-    const push = await this.push({ title: REPORT_TITLE[kind], body: content.headline, url: `/?report=${id}`, tag: `report-${id}` });
+    const push = await this.push({ title: deskTitle(desk, REPORT_TITLE[kind]), body: content.headline, url: deskUrl(desk, `/?report=${id}`), tag: `report-${id}` });
     return { id, kind, date, model: res.model, costUsd: res.costUsd, forecasts: forecasts.length, push, warnings };
   }
 
@@ -907,28 +1007,29 @@ export class Engine extends DurableObject<Env> {
    * Кандидати, що пройшли фільтр, стають окремими кроками review: так виклики моделей
    * не збираються в один запуск і не впираються в його ліміти.
    */
-  private async runSignals(state: PipelineState, now: number): Promise<void> {
+  private async runSignals(state: PipelineState, desk: Desk, ds: DeskState, now: number): Promise<void> {
     const summary: SignalsSummary = { updated: 0, detection: false, detected: 0, filtered: {}, reviewed: 0, published: 0, rejected: 0, notes: [] };
-    state.signals = summary;
-    summary.updated = await this.trackSignals(now);
-    if (!state.scan) {
+    ds.signals = summary;
+    summary.updated = await this.trackSignals(now, desk, ds);
+    if (!ds.scan) {
       summary.notes.push("скан не вдався: нові сетапи не шукались");
       return;
     }
-    state.candidates = await this.findCandidates(now, state.scan, summary);
-    state.steps.unshift(...state.candidates.map((_, i) => `review:${i}`));
+    ds.candidates = await this.findCandidates(now, desk, ds.scan, summary);
+    state.steps.unshift(...ds.candidates.map((_, i) => `review:${desk}:${i}`));
   }
 
-  /** Стоп, вихід за каналом або закриття за часом для кожного відкритого сигналу. Повертає кількість змін. */
-  private async trackSignals(now: number): Promise<number> {
+  /** Стоп, вихід за каналом або закриття за часом для кожного відкритого сигналу режиму. Повертає кількість змін. */
+  private async trackSignals(now: number, desk: Desk, ds: DeskState): Promise<number> {
     const db = this.env.DB;
     const open = await db
-      .prepare("SELECT id, created_at, symbol, side, setup, entry_low, entry_high, stop, tp1, tp2, rr, status, expires_at, hit FROM signals WHERE status IN ('pending', 'active') ORDER BY id")
+      .prepare("SELECT id, created_at, symbol, side, setup, entry_low, entry_high, stop, tp1, tp2, rr, status, expires_at, hit FROM signals WHERE desk = ? AND status IN ('pending', 'active') ORDER BY id")
+      .bind(desk)
       .all<SignalRow>();
     const maxHoldMs = (await this.setting("signal_max_hold_hours", 120)) * HOUR;
     const fees: Fees = { makerPct: await this.setting("fee_maker_pct", 0.02), takerPct: await this.setting("fee_taker_pct", 0.05) };
     let updated = 0;
-    const market = await this.market();
+    const market = await this.market(desk);
     for (const sig of open.results) {
       // Свічки з кешу: якщо монета в списку, скан їх щойно оновив, і біржу не питаємо.
       const [h1, h4] = await Promise.all([market.candles(sig.symbol, "1h", CANDLE_LIMIT), market.candles(sig.symbol, "4h", CANDLE_LIMIT)]);
@@ -964,10 +1065,10 @@ export class Engine extends DurableObject<Env> {
       const lastEvent = [...fresh].reverse().find((e) => text[e.type]);
       if (lastEvent) {
         const [title, body] = text[lastEvent.type]!;
-        await this.signalPush(sig.id, { title, body, url: `/?signal=${sig.id}`, tag: `signal-${sig.id}` }, now, "position");
+        await this.signalPush(sig.id, { title: deskTitle(desk, title), body, url: deskUrl(desk, `/?signal=${sig.id}`), tag: `signal-${sig.id}` }, now, "position");
       }
     }
-    await this.trackShadows(now, maxHoldMs, fees);
+    await this.trackShadows(now, maxHoldMs, fees, desk, ds);
     return updated;
   }
 
@@ -975,19 +1076,19 @@ export class Engine extends DurableObject<Env> {
    * Тіньовий супровід відхилених моделлю кандидатів: ті самі правила, але без подій і сповіщень.
    * shadow_r зберігається вже після комісій. Потрібен, щоб калібрувати оцінки й бачити, що відсіяв скептик.
    */
-  private async trackShadows(now: number, maxHoldMs: number, fees: Fees): Promise<void> {
+  private async trackShadows(now: number, maxHoldMs: number, fees: Fees, desk: Desk, ds: DeskState): Promise<void> {
     const db = this.env.DB;
     const rows = await db
       .prepare(
         `SELECT id, created_at, symbol, side, entry_low, entry_high, stop, tp1, tp2, expires_at FROM signals
-         WHERE status = 'rejected' AND (shadow_status IS NULL OR shadow_status IN ('pending', 'active')) AND created_at >= ?`,
+         WHERE desk = ? AND status = 'rejected' AND (shadow_status IS NULL OR shadow_status IN ('pending', 'active')) AND created_at >= ?`,
       )
-      .bind(new Date(now - maxHoldMs - 24 * HOUR).toISOString())
+      .bind(desk, new Date(now - maxHoldMs - 24 * HOUR).toISOString())
       .all<SignalRow>();
     const update = db.prepare("UPDATE signals SET shadow_status = ?, shadow_r = ?, shadow_hit = ? WHERE id = ?");
     const statements: D1PreparedStatement[] = [];
-    const market = await this.market();
-    const watched = new Set(await this.watchlist());
+    const market = await this.market(desk);
+    const watched = new Set(ds.symbols);
     for (const sig of rows.results) {
       // Тінь ведемо лише для монет зі списку: їхні свічки вже в кеші, зайвих запитів до біржі немає.
       if (!watched.has(sig.symbol)) continue;
@@ -1003,12 +1104,17 @@ export class Engine extends DurableObject<Env> {
    * Детектори → фільтр. Повертає кандидатів для моделі; самі виклики аналітика і скептика
    * йдуть окремими кроками review, по одному кандидату на запуск.
    */
-  private async findCandidates(now: number, scan: { runId: number; market: MarketRegime }, summary: SignalsSummary): Promise<Candidate[]> {
+  private async findCandidates(now: number, desk: Desk, scan: { runId: number; market: MarketRegime }, summary: SignalsSummary): Promise<Candidate[]> {
     const db = this.env.DB;
     const rows = await db.prepare("SELECT features FROM snapshots WHERE run_id = ?").bind(scan.runId).all<{ features: string }>();
     const snapshots = rows.results.map((r) => JSON.parse(r.features) as Snapshot);
     // Сетап шукаємо лише на свічці 4h, що закрилась щойно: наступні скани до закриття нової свічки його не шукають.
     const fresh = snapshots.filter((s) => now - Date.parse(s.tf["4h"].closedAt) <= 20 * 60_000);
+    // Акції: вхід за ринком має сенс лише в основну сесію, поза нею контракт малоліквідний і ціна стоїть.
+    if (fresh.length && desk === "stocks" && !usSessionOpen(now)) {
+      summary.notes.push("фондовий ринок США закритий: нові сетапи не шукались");
+      return [];
+    }
     summary.detection = fresh.length > 0;
     if (!fresh.length) return [];
 
@@ -1020,17 +1126,18 @@ export class Engine extends DurableObject<Env> {
       this.setting("signal_cooldown_hours", 6),
       this.setting("max_candidates_per_scan", 5),
     ]);
+    // Ліміт відкритих сигналів рахується окремо для кожного режиму.
     const [open, recent] = await Promise.all([
-      db.prepare("SELECT symbol FROM signals WHERE status IN ('pending', 'active')").all<{ symbol: string }>(),
+      db.prepare("SELECT symbol FROM signals WHERE desk = ? AND status IN ('pending', 'active')").bind(desk).all<{ symbol: string }>(),
       db
-        .prepare("SELECT symbol, setup, side FROM signals WHERE created_at >= ?")
-        .bind(new Date(now - cooldown * HOUR).toISOString())
+        .prepare("SELECT symbol, setup, side FROM signals WHERE desk = ? AND created_at >= ?")
+        .bind(desk, new Date(now - cooldown * HOUR).toISOString())
         .all<Pick<Candidate, "symbol" | "setup" | "side">>(),
     ]);
     const openSymbols = new Set(open.results.map((r) => r.symbol));
     const recentKeys = new Set(recent.results.map(candidateKey));
     const toMacro = minutesToMacro(macro, now);
-    const market = await this.market();
+    const market = await this.market(desk);
 
     const passed: Candidate[] = [];
     for (const snap of fresh) {
@@ -1056,10 +1163,10 @@ export class Engine extends DurableObject<Env> {
   }
 
   /** Аналітик → скептик → публікація для одного кандидата. Окремий крок циклу. */
-  private async reviewCandidate(state: PipelineState, index: number, now: number): Promise<void> {
-    const candidate = state.candidates?.[index];
-    const summary = state.signals;
-    const scan = state.scan;
+  private async reviewCandidate(state: PipelineState, desk: Desk, ds: DeskState, index: number, now: number): Promise<void> {
+    const candidate = ds.candidates?.[index];
+    const summary = ds.signals;
+    const scan = ds.scan;
     if (!candidate || !summary || !scan) return;
     const db = this.env.DB;
     const [maxActive, macro, threshold, maxHold] = await Promise.all([
@@ -1069,7 +1176,7 @@ export class Engine extends DurableObject<Env> {
       this.setting("signal_max_hold_hours", 120),
     ]);
     // Попередні кроки могли вже опублікувати сигнали: ліміт перевіряється заново.
-    const open = await db.prepare("SELECT symbol FROM signals WHERE status IN ('pending', 'active')").all<{ symbol: string }>();
+    const open = await db.prepare("SELECT symbol FROM signals WHERE desk = ? AND status IN ('pending', 'active')").bind(desk).all<{ symbol: string }>();
     if (open.results.length >= maxActive || open.results.some((r) => r.symbol === candidate.symbol)) {
       const reason: Rejection = open.results.length >= maxActive ? "max_active" : "duplicate";
       summary.filtered[reason] = (summary.filtered[reason] ?? 0) + 1;
@@ -1077,16 +1184,16 @@ export class Engine extends DurableObject<Env> {
     }
     try {
       const snaps = await db
-        .prepare("SELECT id, symbol, features FROM snapshots WHERE run_id = ? AND symbol IN (?, 'BTCUSDT')")
-        .bind(scan.runId, candidate.symbol)
+        .prepare("SELECT id, symbol, features FROM snapshots WHERE run_id = ? AND symbol IN (?, ?)")
+        .bind(scan.runId, candidate.symbol, ds.leader)
         .all<{ id: number; symbol: string; features: string }>();
       const own = snaps.results.find((r) => r.symbol === candidate.symbol);
-      if (!own) throw new Error("немає знімка монети");
-      const btcRow = snaps.results.find((r) => r.symbol === "BTCUSDT");
+      if (!own) throw new Error("немає знімка інструмента");
+      const btcRow = snaps.results.find((r) => r.symbol === ds.leader);
       const playbook = await this.playbook();
       const newsRows = await db
-        .prepare("SELECT ts, category, impact, sentiment, symbols, relevance FROM news WHERE ts >= ? AND relevance >= 0.4 ORDER BY relevance DESC, ts DESC LIMIT 30")
-        .bind(new Date(now - 12 * HOUR).toISOString())
+        .prepare("SELECT ts, category, impact, sentiment, symbols, relevance FROM news WHERE desk = ? AND ts >= ? AND relevance >= 0.4 ORDER BY relevance DESC, ts DESC LIMIT 30")
+        .bind(desk, new Date(now - 12 * HOUR).toISOString())
         .all<{ ts: string; category: string; impact: string; sentiment: string; symbols: string; relevance: number }>();
       const news: NewsField[] = newsRows.results.map((n) => ({
         category: n.category,
@@ -1112,14 +1219,14 @@ export class Engine extends DurableObject<Env> {
         summary.notes.push("стелю витрат вичерпано: нові сигнали не публікуються");
         state.steps = state.steps.filter((s) => !s.startsWith("review:"));
       };
-      const first = await this.llm("analyst", { user, system: ANALYST_SYSTEM, schema: ANALYST_SCHEMA });
+      const first = await this.llm("analyst", { user, system: forDesk(ANALYST_SYSTEM, desk, ds.leader), schema: ANALYST_SCHEMA });
       if (!first) return stopReviews();
       summary.reviewed++;
       const analyst = sanitizeAnalyst(first.data);
       // Скептик працює окремим викликом і не бачить відповіді аналітика.
       let skeptic: SkepticView | null = null;
       if (analyst.verdict === "take") {
-        const second = await this.llm("skeptic", { user, system: SKEPTIC_SYSTEM, schema: SKEPTIC_SCHEMA });
+        const second = await this.llm("skeptic", { user, system: forDesk(SKEPTIC_SYSTEM, desk, ds.leader), schema: SKEPTIC_SCHEMA });
         if (!second) return stopReviews();
         skeptic = sanitizeSkeptic(second.data);
       }
@@ -1128,12 +1235,12 @@ export class Engine extends DurableObject<Env> {
       const createdAt = new Date(now).toISOString();
       const row = await db
         .prepare(
-          `INSERT INTO signals (created_at, symbol, side, setup, entry_low, entry_high, stop, tp1, tp2, rr, p_analyst, p_skeptic,
+          `INSERT INTO signals (desk, created_at, symbol, side, setup, entry_low, entry_high, stop, tp1, tp2, rr, p_analyst, p_skeptic,
              status, expires_at, resolved_at, reasoning, snapshot_id, playbook_version)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
         )
         .bind(
-          createdAt, candidate.symbol, candidate.side, candidate.setup, candidate.entry, candidate.entry, candidate.stop,
+          desk, createdAt, candidate.symbol, candidate.side, candidate.setup, candidate.entry, candidate.entry, candidate.stop,
           null, null, null, analyst.probability, skeptic?.probability ?? null,
           decision.publish ? "active" : "rejected", new Date(now + maxHold * HOUR).toISOString(), decision.publish ? null : createdAt,
           JSON.stringify(reasoning), own.id, playbook.version,
@@ -1144,23 +1251,23 @@ export class Engine extends DurableObject<Env> {
         return;
       }
       summary.published++;
-      await this.signalPush(row!.id, await this.signalMessage(row!.id, candidate), now);
+      await this.signalPush(row!.id, await this.signalMessage(row!.id, candidate, desk), now);
     } catch (e) {
       summary.notes.push(`${candidate.symbol} ${candidate.setup}: ${String(e)}`);
     }
   }
 
   /** Текст сповіщення про новий сигнал. Розмір позиції рахує код від ризику на угоду. */
-  private async signalMessage(id: number, c: Candidate): Promise<PushMessage> {
+  private async signalMessage(id: number, c: Candidate, desk: Desk = "crypto"): Promise<PushMessage> {
     const [deposit, riskPct] = await Promise.all([this.setting<number | null>("deposit_usd", null), this.setting("risk_per_trade_pct", 0.5)]);
     const size = deposit ? positionSize(deposit, riskPct, c.entry, c.stop) : null;
     return {
-      title: `Сигнал: ${coin(c.symbol)} ${SIDE_NAME[c.side]}`,
+      title: deskTitle(desk, `Сигнал: ${coin(c.symbol)} ${SIDE_NAME[c.side]}`),
       body:
         `${SETUP_NAME[c.setup]} · вхід за ринком біля ${c.entry} · стоп ${c.stop} (${stopDistancePct(c.entry, c.stop).toFixed(1)}%) · ` +
         `вихід: закриття 4h за каналом ${EXIT_BARS} свічок` +
         (size ? ` · розмір $${Math.round(size.notionalUsd)}` : ""),
-      url: `/?signal=${id}`,
+      url: deskUrl(desk, `/?signal=${id}`),
       tag: `signal-${id}`,
     };
   }
@@ -1221,26 +1328,29 @@ export class Engine extends DurableObject<Env> {
    * стоп і ціль; агент «Ідея скану» вибирає один із кількох найкращих варіантів або жоден.
    * Без моделі (стеля витрат, збій) ідея лишається технічною. Спершу код закриває попередні ідеї за свічками.
    */
-  private async runPick(state: PipelineState, now: number): Promise<void> {
-    await this.resolvePicks(state, now);
-    if (!state.scan || (await this.setting("pick_enabled", "on")) === "off") return;
+  private async runPick(desk: Desk, ds: DeskState, now: number): Promise<void> {
+    await this.resolvePicks(desk, ds, now);
+    if (!ds.scan || (await this.setting("pick_enabled", "on")) === "off") return;
+    // Акції: ідея з входом за ринком має сенс лише в основну сесію США.
+    if (desk === "stocks" && !usSessionOpen(now)) return;
+    const scan = ds.scan;
     const db = this.env.DB;
     const [minStopPct, horizonHours, macro] = await Promise.all([
       this.setting("min_stop_pct", 1),
       this.setting("pick_horizon_hours", 24),
       this.setting<unknown>("macro_events", []),
     ]);
-    const rows = await db.prepare("SELECT symbol, features FROM snapshots WHERE run_id = ?").bind(state.scan.runId).all<{ symbol: string; features: string }>();
+    const rows = await db.prepare("SELECT symbol, features FROM snapshots WHERE run_id = ?").bind(scan.runId).all<{ symbol: string; features: string }>();
     const snapshots = new Map(rows.results.map((r) => [r.symbol, JSON.parse(r.features) as Snapshot]));
-    // Монета з відкритою ідеєю (ще чекає входу або в позиції) не береться знову, поки та не закриється.
-    const busy = await db.prepare("SELECT DISTINCT symbol FROM picks WHERE status = 'open'").all<{ symbol: string }>();
+    // Інструмент з відкритою ідеєю (ще чекає входу або в позиції) не береться знову, поки та не закриється.
+    const busy = await db.prepare("SELECT DISTINCT symbol FROM picks WHERE desk = ? AND status = 'open'").bind(desk).all<{ symbol: string }>();
     const exclude = new Set(busy.results.map((r) => r.symbol));
-    const options = rankPicks([...snapshots.values()], state.scan.market, { minStopPct, exclude });
+    const options = rankPicks([...snapshots.values()], scan.market, { minStopPct, exclude, leader: ds.leader });
     if (!options.length) return;
 
     const newsRows = await db
-      .prepare("SELECT ts, category, impact, sentiment, symbols, relevance FROM news WHERE ts >= ? AND relevance >= 0.4 ORDER BY relevance DESC, ts DESC LIMIT 30")
-      .bind(new Date(now - 12 * HOUR).toISOString())
+      .prepare("SELECT ts, category, impact, sentiment, symbols, relevance FROM news WHERE desk = ? AND ts >= ? AND relevance >= 0.4 ORDER BY relevance DESC, ts DESC LIMIT 30")
+      .bind(desk, new Date(now - 12 * HOUR).toISOString())
       .all<{ ts: string; category: string; impact: string; sentiment: string; symbols: string; relevance: number }>();
     const news: NewsField[] = newsRows.results.map((n) => ({
       category: n.category,
@@ -1258,13 +1368,13 @@ export class Engine extends DurableObject<Env> {
       const input = pickInput({
         options,
         snapshots,
-        btc: snapshots.get("BTCUSDT") ?? null,
-        market: state.scan.market,
+        btc: snapshots.get(ds.leader) ?? null,
+        market: scan.market,
         news,
         horizonHours,
         minutesToMacro: minutesToMacro(macro, now),
       });
-      const res = await this.llm("pick", { system: PICK_SYSTEM, user: JSON.stringify(input), schema: PICK_SCHEMA });
+      const res = await this.llm("pick", { system: forDesk(PICK_SYSTEM, desk, ds.leader), user: JSON.stringify(input), schema: PICK_SCHEMA });
       if (!res) note = "стелю витрат вичерпано: лише технічний аналіз";
       else {
         ai = sanitizePick(res.data, options);
@@ -1275,14 +1385,14 @@ export class Engine extends DurableObject<Env> {
     }
     const choice = choosePick(options, ai)!;
     const { option, levels } = choice;
-    const body: PickBody = { v: 1, factors: option.factors, roomAtr: option.roomAtr, options, ai, note, market: state.scan.market };
+    const body: PickBody = { v: 1, factors: option.factors, roomAtr: option.roomAtr, options, ai, note, market: scan.market };
     await db
       .prepare(
-        `INSERT INTO picks (created_at, run_id, symbol, side, entry_kind, price, entry, stop, target, score, verdict, probability, model, horizon_hours, is_repeat, body)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO picks (desk, created_at, run_id, symbol, side, entry_kind, price, entry, stop, target, score, verdict, probability, model, horizon_hours, is_repeat, body)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(
-        new Date(now).toISOString(), state.scan.runId, option.symbol, option.side, choice.entryKind, option.price,
+        desk, new Date(now).toISOString(), scan.runId, option.symbol, option.side, choice.entryKind, option.price,
         levels.entry, levels.stop, levels.target, option.score, choice.verdict, ai && ai.choice >= 0 ? ai.probability : null,
         model, horizonHours, 0, JSON.stringify(body),
       )
@@ -1290,14 +1400,15 @@ export class Engine extends DurableObject<Env> {
   }
 
   /** Закриває відкриті ідеї: ціль, стоп, без входу або за часом. Свічки 1h з кешу. */
-  private async resolvePicks(state: PipelineState, now: number): Promise<void> {
+  private async resolvePicks(desk: Desk, ds: DeskState, now: number): Promise<void> {
     const db = this.env.DB;
     const open = await db
-      .prepare("SELECT id, created_at, symbol, side, entry_kind, entry, stop, target, horizon_hours FROM picks WHERE status = 'open' ORDER BY id LIMIT 150")
+      .prepare("SELECT id, created_at, symbol, side, entry_kind, entry, stop, target, horizon_hours FROM picks WHERE desk = ? AND status = 'open' ORDER BY id LIMIT 150")
+      .bind(desk)
       .all<{ id: number; created_at: string; symbol: string; side: "long" | "short"; entry_kind: "market" | "pullback"; entry: number; stop: number; target: number; horizon_hours: number }>();
     if (!open.results.length) return;
-    const market = await this.market();
-    const watched = new Set(state.symbols);
+    const market = await this.market(desk);
+    const watched = new Set(ds.symbols);
     const update = db.prepare("UPDATE picks SET status = ?, result_r = ?, filled_at = ?, resolved_at = ? WHERE id = ?");
     const statements: D1PreparedStatement[] = [];
     const iso = (t: number | null) => (t === null ? null : new Date(t).toISOString());
@@ -1330,24 +1441,27 @@ export class Engine extends DurableObject<Env> {
    * У неділю рахує статистику тижня й просить агента «Тижневий розбір» пояснити її.
    * Якщо стеля витрат не дозволяє або виклик не вдався, звіт виходить зі статистикою без розбору моделі.
    */
-  private async runWeekly(now: number, force = false): Promise<{ status: "saved" | "exists" | "not_due"; id?: number }> {
+  private async runWeekly(now: number, desk: Desk = "crypto", force = false): Promise<{ status: "saved" | "exists" | "not_due"; id?: number }> {
     const db = this.env.DB;
     const timezone = await this.setting("timezone", "Europe/Kyiv");
     const due = force ? { date: localTime(now, timezone).date } : dueWeekly(now, timezone, await this.setting("weekly_review_time", "12:00"));
     if (!due) return { status: "not_due" };
-    if (await this.reportExists("weekly", due.date)) return { status: "exists" };
+    if (await this.reportExists(desk, "weekly", due.date)) return { status: "exists" };
 
     const started = Date.now();
+    const leader = await this.leader(desk);
     const [week, allTime] = await Promise.all([
-      loadStats(db, { from: new Date(now - 7 * 24 * HOUR).toISOString(), now }),
-      loadStats(db, { from: null, now }),
+      loadStats(db, { from: new Date(now - 7 * 24 * HOUR).toISOString(), now, desk, leader }),
+      loadStats(db, { from: null, now, desk, leader }),
     ]);
     const stats = { week, allTime };
 
     const playbook = await this.playbook();
     const notes = await db
-      .prepare("SELECT ts, action, note FROM journal WHERE ts >= ? AND note IS NOT NULL ORDER BY id DESC LIMIT 20")
-      .bind(new Date(now - 7 * 24 * HOUR).toISOString())
+      .prepare(
+        "SELECT j.ts, j.action, j.note FROM journal j JOIN signals s ON s.id = j.signal_id WHERE s.desk = ? AND j.ts >= ? AND j.note IS NOT NULL ORDER BY j.id DESC LIMIT 20",
+      )
+      .bind(desk, new Date(now - 7 * 24 * HOUR).toISOString())
       .all<{ ts: string; action: string | null; note: string }>();
     const settings = Object.fromEntries(
       await Promise.all(
@@ -1359,7 +1473,7 @@ export class Engine extends DurableObject<Env> {
     let note: string | null = null;
     let llm: { model: string; cost: number } | null = null;
     try {
-      const res = await this.llm("weekly_review", { system: WEEKLY_SYSTEM, user: JSON.stringify(input), schema: WEEKLY_SCHEMA });
+      const res = await this.llm("weekly_review", { system: forDesk(WEEKLY_SYSTEM, desk, leader), user: JSON.stringify(input), schema: WEEKLY_SCHEMA });
       if (!res) note = "стеля витрат вичерпана: розбір моделі пропущено";
       else {
         llm = { model: res.model, cost: res.costUsd };
@@ -1368,20 +1482,21 @@ export class Engine extends DurableObject<Env> {
     } catch (e) {
       note = `розбір моделі не вдався: ${e instanceof Error ? e.message : String(e)}`;
     }
-    return { status: "saved", id: await this.saveWeekly(due.date, stats, review, note, started, llm) };
+    return { status: "saved", id: await this.saveWeekly(desk, due.date, stats, review, note, started, llm) };
   }
 
   /** Тижневий розбір поза розкладом: за сьогоднішньою місцевою датою. */
-  async weeklyNow(): Promise<{ status: string; id?: number; error?: string } | null> {
+  async weeklyNow(desk: Desk = "crypto"): Promise<{ status: string; id?: number; error?: string } | null> {
     if (await this.busy()) return null;
     try {
-      return await this.runWeekly(Date.now(), true);
+      return await this.runWeekly(Date.now(), desk, true);
     } catch (e) {
       return { status: "error", error: String(e) };
     }
   }
 
   private async saveWeekly(
+    desk: Desk,
     date: string,
     stats: { week: Awaited<ReturnType<typeof loadStats>>; allTime: Awaited<ReturnType<typeof loadStats>> },
     review: WeeklyReview | null,
@@ -1389,13 +1504,13 @@ export class Engine extends DurableObject<Env> {
     started: number,
     llm: { model: string; cost: number } | null = null,
   ): Promise<number | undefined> {
-    if (await this.reportExists("weekly", date)) return undefined;
+    if (await this.reportExists(desk, "weekly", date)) return undefined;
     const body = weeklyBody(stats.week, stats.allTime, review, note);
-    const row = await this.env.DB.prepare("INSERT INTO reports (kind, date, body, model, cost_usd, created_at) VALUES ('weekly', ?, ?, ?, ?, ?) RETURNING id")
-      .bind(date, JSON.stringify(body), llm?.model ?? null, llm?.cost ?? null, new Date().toISOString())
+    const row = await this.env.DB.prepare("INSERT INTO reports (desk, kind, date, body, model, cost_usd, created_at) VALUES (?, 'weekly', ?, ?, ?, ?, ?) RETURNING id")
+      .bind(desk, date, JSON.stringify(body), llm?.model ?? null, llm?.cost ?? null, new Date().toISOString())
       .first<{ id: number }>();
-    await this.logRun("weekly_review", started, { id: row!.id, date, review: review !== null, note }, null);
-    await this.push({ title: "Тижневий розбір готовий", body: body.content.headline, url: `/?report=${row!.id}`, tag: `report-${row!.id}` });
+    await this.logRun("weekly_review", started, { id: row!.id, date, review: review !== null, note }, null, desk);
+    await this.push({ title: deskTitle(desk, "Тижневий розбір готовий"), body: body.content.headline, url: deskUrl(desk, `/?report=${row!.id}`), tag: `report-${row!.id}` });
     return row!.id;
   }
 
