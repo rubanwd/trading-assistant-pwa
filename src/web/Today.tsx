@@ -16,6 +16,8 @@ interface ScanDetail {
   market: { mood: "risk_on" | "risk_off" | "mixed"; btcTrend: Trend; breadth: number | null };
   symbols: number;
   snapshots: number;
+  /** Символи зі списку, яких немає на біржі: пропущені, скан через них не вважається невдалим. */
+  missing?: string[];
 }
 interface MarketContext { btcDominancePct: number | null; totalMarketCapUsd: number | null; marketCapChange24hPct: number | null; fearGreed: number | null; at: string }
 interface Status {
@@ -476,6 +478,11 @@ function SystemPulse({ status, error, reload }: { status: Status | null; error: 
             )}
           </div>
         </div>
+      )}
+      {scan?.missing && scan.missing.length > 0 && (
+        <p style={{ ...dim, fontSize: 13, color: c.orange }}>
+          Немає на Bybit, пропущено: {scan.missing.map(coin).join(", ")}. Прибери або заміни в Налаштуваннях → Акції.
+        </p>
       )}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8, justifyItems: "center", textAlign: "center" }}>
         {scan && (
