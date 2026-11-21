@@ -391,18 +391,18 @@ export class Engine extends DurableObject<Env> {
   /** Частина скану: кілька інструментів, результат чекає в сховищі рушія на крок scan:<desk>:done. */
   private async scanPart(desk: Desk, ds: DeskState, index: number, startedAt: number): Promise<void> {
     let symbols = ds.symbols.slice(index * CHUNK_SIZE, (index + 1) * CHUNK_SIZE);
-    const missing: ChunkResult["errors"] = [];
+    let missing: string[] = [];
     if (desk === "stocks") {
       // Символ без контракту на Bybit не запитуємо: інакше біржа відповідає помилкою на кожну свічку.
+      // Це помилка в налаштуваннях, а не збій скану: такий символ іде в попередження, а не в помилки.
       const universe = await this.stockSymbols().catch(() => null);
       if (universe) {
         const known = new Set(universe);
-        for (const s of symbols) if (!known.has(s)) missing.push({ symbol: s, message: "на Bybit немає такого контракту на акцію чи ETF" });
+        missing = symbols.filter((s) => !known.has(s));
         symbols = symbols.filter((s) => known.has(s));
       }
     }
-    const part = await scanChunk(await this.market(desk), symbols, startedAt);
-    part.errors.push(...missing);
+    const part: ChunkResult & { missing: string[] } = { ...(await scanChunk(await this.market(desk), symbols, startedAt)), missing };
     await this.ctx.storage.put(`scan-part:${desk}:${index}`, part);
   }
 
@@ -410,23 +410,28 @@ export class Engine extends DurableObject<Env> {
   private async finishScan(desk: Desk, ds: DeskState, startedAt: number): Promise<void> {
     const db = this.env.DB;
     const keys = Array.from({ length: Math.ceil(ds.symbols.length / CHUNK_SIZE) }, (_, i) => `scan-part:${desk}:${i}`);
-    const parts = await this.ctx.storage.get<ChunkResult>(keys);
+    const parts = await this.ctx.storage.get<ChunkResult & { missing?: string[] }>(keys);
     const snapshots: Snapshot[] = [];
     const errors: ChunkResult["errors"] = [];
+    /** Символи зі списку, яких немає на біржі: попередження, скан через них не вважається невдалим. */
+    const missing: string[] = [];
     for (const key of keys) {
       const part = parts.get(key);
       if (!part) {
-        errors.push({ symbol: null, message: `частина скану ${key.split(":")[1]} не виконалась` });
+        errors.push({ symbol: null, message: `частина скану ${key.split(":")[2]} не виконалась` });
         continue;
       }
       snapshots.push(...part.snapshots);
+      missing.push(...(part.missing ?? []));
       // Збій фандингу повторюється в кожній частині: лишаємо один запис.
       for (const e of part.errors) if (e.symbol !== null || !errors.some((x) => x.message === e.message)) errors.push(e);
     }
     const market = marketFromSnapshots(snapshots, ds.leader);
     const source = (await this.market(desk)).name;
-    const failed = ds.symbols.length === 0 || snapshots.length < ds.symbols.length;
-    const summary = { source, market, leader: ds.leader, symbols: ds.symbols.length, snapshots: snapshots.length, errors };
+    const scanned = ds.symbols.length - missing.length;
+    const failed = scanned <= 0 || snapshots.length < scanned;
+    // symbols — скільки інструментів справді сканували; пропущені без контракту окремо в missing.
+    const summary = { source, market, leader: ds.leader, symbols: scanned, snapshots: snapshots.length, errors, missing };
     const run = await db
       .prepare("INSERT INTO runs (kind, desk, started_at, status, duration_ms, detail, error) VALUES ('scan', ?, ?, ?, ?, ?, ?) RETURNING id")
       .bind(
@@ -435,7 +440,10 @@ export class Engine extends DurableObject<Env> {
         failed ? "error" : "ok",
         Date.now() - startedAt,
         JSON.stringify(summary),
-        failed ? errors.map((e) => (e.symbol ? `${e.symbol}: ${e.message}` : e.message)).join("; ").slice(0, 2000) || "порожній список монет" : null,
+        failed
+          ? errors.map((e) => (e.symbol ? `${e.symbol}: ${e.message}` : e.message)).join("; ").slice(0, 2000) ||
+              (missing.length ? `жодного символу зі списку немає на біржі: ${missing.join(", ")}` : "порожній список монет")
+          : null,
       )
       .first<{ id: number }>();
     const runId = run!.id;
