@@ -9,7 +9,9 @@
     "not_found_handling": "single-page-application",
     "run_worker_first": ["/api/*"]
   },
-  "triggers": { "crons": ["*/30 * * * *"] },
+  // :03 і :33, а не :00 і :30: на рівні години запускається найбільше чужих розкладів, і спільні IP Cloudflare
+  // частіше впираються в ліміт частоти Bybit. Свіжа свічка 4h шукається 20 хв після закриття, тож зсув їй не заважає.
+  "triggers": { "crons": ["3,33 * * * *"] },
   "durable_objects": {
     "bindings": [{ "name": "ENGINE", "class_name": "Engine" }]
   },

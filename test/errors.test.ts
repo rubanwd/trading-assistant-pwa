@@ -16,4 +16,9 @@ describe("короткий опис помилки запуску", () => {
     expect(errorSummary("x".repeat(200))).toBe(`${"x".repeat(120)}…`);
     expect(errorSummary(null)).toBe("");
   });
+
+  it("ліміт частоти Bybit: зрозуміло й з кількістю збоїв", () => {
+    const e = "SPYUSDT: MarketDataError: bybit-linear /v5/market/kline: 10006 Too many visits. Exceeded the API Rate Limit.; AAPLUSDT: MarketDataError: bybit-linear /v5/market/kline: 10006 Too many visits. Exceeded the API Rate Limit.";
+    expect(errorSummary(e)).toBe("Bybit обмежив частоту запитів (збоїв: 2): дані цих інструментів підтягне наступний скан.");
+  });
 });

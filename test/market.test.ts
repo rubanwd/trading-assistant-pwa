@@ -82,3 +82,54 @@ describe("перемикання на запасну біржу", () => {
     expect(isGeoBlock(new MarketDataError("x", null))).toBe(false);
   });
 });
+
+describe("Bybit: ліміт частоти", () => {
+  const limited = (headers: Record<string, string> = {}) => Response.json({ retCode: 10006, retMsg: "Too many visits. Exceeded the API Rate Limit.", result: {} }, { headers });
+
+  it("повторює запит після 10006 із паузою й повертає результат", async () => {
+    const waits: number[] = [];
+    let calls = 0;
+    const api = new BybitLinear(
+      async () => (++calls < 3 ? limited() : ok({ list: [{ symbol: "AAPLUSDT", status: "Trading" }] })),
+      "https://api.bybit.com",
+      Date.now,
+      () => true,
+      async (ms) => void waits.push(ms),
+    );
+    expect(await api.instruments("stock")).toEqual(["AAPLUSDT"]);
+    expect(calls).toBe(3);
+    expect(waits).toEqual([1_000, 2_500]);
+  });
+
+  it("чекає до скидання ліміту, якщо біржа його назвала, але не довше 3 с", async () => {
+    const waits: number[] = [];
+    let calls = 0;
+    const api = new BybitLinear(
+      async () => (++calls === 1 ? limited({ "x-bapi-limit-reset-timestamp": "1500" }) : ok({ list: [] })),
+      "https://api.bybit.com",
+      () => 1_000,
+      () => true,
+      async (ms) => void waits.push(ms),
+    );
+    await api.instruments("ETF");
+    expect(waits).toEqual([500]);
+  });
+
+  it("після двох повторів або без запасу запитів віддає помилку", async () => {
+    let calls = 0;
+    const api = new BybitLinear(async () => (calls++, limited()), "https://api.bybit.com", Date.now, () => true, async () => {});
+    await expect(api.funding()).rejects.toMatchObject({ rateLimited: true });
+    expect(calls).toBe(3);
+    calls = 0;
+    const tight = new BybitLinear(async () => (calls++, limited()), "https://api.bybit.com", Date.now, () => false, async () => {});
+    await expect(tight.funding()).rejects.toThrow("10006");
+    expect(calls).toBe(1);
+  });
+
+  it("інші помилки не повторює", async () => {
+    let calls = 0;
+    const api = new BybitLinear(async () => (calls++, Response.json({ retCode: 10001, retMsg: "params error", result: {} })), "https://api.bybit.com", Date.now, () => true, async () => {});
+    await expect(api.funding()).rejects.toThrow("10001");
+    expect(calls).toBe(1);
+  });
+});
