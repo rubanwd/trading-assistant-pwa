@@ -13,6 +13,13 @@ type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
 const INTERVAL: Record<Timeframe, string> = { "15m": "15", "1h": "60", "4h": "240", "1d": "D" };
 
+/** Bybit: «Too many visits. Exceeded the API Rate Limit.» */
+const RATE_LIMITED = 10006;
+/** Паузи перед повторами, мс, якщо біржа не сказала, коли скинеться ліміт. */
+const RETRY_DELAYS = [1_000, 2_500];
+
+const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 interface Envelope<T> {
   retCode: number;
   retMsg: string;
@@ -32,6 +39,12 @@ export class BybitLinear implements MarketData {
     private readonly fetcher: FetchLike = (input, init) => fetch(input, init),
     private readonly base = "https://api.bybit.com",
     private readonly now: () => number = Date.now,
+    /**
+     * Чи можна ще повторити запит після відмови за частотою. Рушій відповідає «ні», коли крок
+     * наближається до ліміту 50 зовнішніх запитів: краще втратити одну монету, ніж увесь крок.
+     */
+    private readonly canRetry: () => boolean = () => true,
+    private readonly sleep: (ms: number) => Promise<void> = wait,
   ) {}
 
   async candles(symbol: string, timeframe: Timeframe, limit: number): Promise<Candle[]> {
@@ -106,7 +119,25 @@ export class BybitLinear implements MarketData {
     return res.list.filter((i) => i.status === "Trading").map((i) => i.symbol);
   }
 
+  /**
+   * Запит із повторами після відмови за частотою (код 10006 або HTTP 429). Публічні ліміти Bybit рахуються на IP,
+   * а вихідні адреси Cloudflare спільні з іншими клієнтами, тож ліміт буває вичерпаний не нами й скидається за секунди.
+   */
   private async get<T>(path: string, params: Record<string, string>): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.once<T>(path, params);
+      } catch (e) {
+        const limited = e instanceof MarketDataError && (e.rateLimited || e.status === 429);
+        if (!limited || attempt >= RETRY_DELAYS.length || !this.canRetry()) throw e;
+        const resetAt = (e as MarketDataError).resetAt;
+        const delay = resetAt ? Math.min(Math.max(resetAt - this.now(), 200), 3_000) : RETRY_DELAYS[attempt]!;
+        await this.sleep(delay);
+      }
+    }
+  }
+
+  private async once<T>(path: string, params: Record<string, string>): Promise<T> {
     const url = `${this.base}${path}?${new URLSearchParams(params)}`;
     let res: Response;
     try {
@@ -116,11 +147,20 @@ export class BybitLinear implements MarketData {
     }
     if (!res.ok) {
       await res.body?.cancel();
-      const note = res.status === 403 || res.status === 451 ? " (заборонена локація)" : "";
+      const note = res.status === 403 || res.status === 451 ? " (заборонена локація)" : res.status === 429 ? " (забагато запитів)" : "";
       throw new MarketDataError(`${this.name} ${path}: HTTP ${res.status}${note}`, res.status);
     }
     const body = (await res.json()) as Envelope<T>;
-    if (body.retCode !== 0) throw new MarketDataError(`${this.name} ${path}: ${body.retCode} ${body.retMsg}`, res.status);
+    if (body.retCode !== 0) {
+      const err = new MarketDataError(`${this.name} ${path}: ${body.retCode} ${body.retMsg}`, res.status);
+      if (body.retCode === RATE_LIMITED) {
+        err.rateLimited = true;
+        // Bybit може сказати, коли скинеться ліміт (мс від епохи).
+        const reset = Number(res.headers.get("x-bapi-limit-reset-timestamp"));
+        if (Number.isFinite(reset) && reset > 0) err.resetAt = reset;
+      }
+      throw err;
+    }
     return body.result;
   }
 }

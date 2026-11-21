@@ -361,7 +361,8 @@ export class Engine extends DurableObject<Env> {
     const cached = this.marketCache.get(desk);
     if (cached?.source === source) return cached.market;
     const binance = () => new BinanceFutures(this.http);
-    const bybit = () => new BybitLinear(this.http);
+    // Повтори після відмови Bybit за частотою лише з запасом до ліміту 50 запитів на крок.
+    const bybit = () => new BybitLinear(this.http, undefined, undefined, () => this.requests < 40);
     const inner = source === "binance" ? binance() : source === "bybit" ? bybit() : new FailoverMarket(binance(), bybit());
     this.candleStorage ??= new SqlCandleStorage(this.ctx.storage.sql);
     const market = new CachedMarket(inner, this.candleStorage);

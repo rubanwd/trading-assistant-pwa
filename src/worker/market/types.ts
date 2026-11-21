@@ -54,6 +54,11 @@ export interface MarketData {
 }
 
 export class MarketDataError extends Error {
+  /** Біржа відмовила за частотою запитів: варто повторити трохи згодом. */
+  rateLimited = false;
+  /** Коли біржа обіцяє скинути ліміт, мс від епохи (якщо сказала). */
+  resetAt: number | null = null;
+
   constructor(
     message: string,
     readonly status: number | null,
