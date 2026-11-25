@@ -5,14 +5,21 @@ import type { Desk } from "./desk";
  * Поки це паперова торгівля на публічних даних Bybit: ордери не йдуть на біржу, виконання рахує код за свічками.
  */
 
-export const BOT_IDS = ["hvt"] as const;
+export const BOT_IDS = ["hvt", "hvb"] as const;
 export type BotId = (typeof BOT_IDS)[number];
 export const isBotId = (v: unknown): v is BotId => typeof v === "string" && (BOT_IDS as readonly string[]).includes(v);
+
+/**
+ * fade — лімітки на відстані від ціни ловлять різкий рух і виходять на відкаті (High Value Tube);
+ * breakout — стоп-ордери на тій самій відстані входять у бік руху, коли ціна її проходить (High Value Breakout).
+ */
+export type BotMode = "fade" | "breakout";
 
 export interface BotInfo {
   id: BotId;
   name: string;
   desk: Desk;
+  mode: BotMode;
   /** Одне речення для списку ботів. */
   summary: string;
 }
@@ -22,9 +29,19 @@ export const BOTS: BotInfo[] = [
     id: "hvt",
     name: "High Value Tube",
     desk: "crypto",
-    summary: "Щогодини бере 3 найрухливіші з топ-20 монет Bybit і ставить по лімітці в лонг і шорт на краях «труби» навколо ціни: ловить різкий рух і виходить на відкаті.",
+    mode: "fade",
+    summary: "Щогодини бере 3 найрухливіші з топ-20 монет Bybit і ставить лімітки на краях «труби» навколо ціни: ловить різкий рух і виходить на відкаті.",
+  },
+  {
+    id: "hvb",
+    name: "High Value Breakout",
+    desk: "crypto",
+    mode: "breakout",
+    summary: "Ті самі 3 найрухливіші монети, але навпаки: стоп-ордери над і під ціною входять у бік різкого руху, коли ціна проходить край «труби», і забирають продовження.",
   },
 ];
+
+export const botInfo = (id: BotId): BotInfo => BOTS.find((b) => b.id === id)!;
 
 /**
  * Стартовий список бота, якщо CoinGecko недоступний: топ-20 за капіталізацією на листопад 2026
@@ -64,38 +81,76 @@ export interface TubeConfig {
   maxHoldHours: number;
   /** Відкритих позицій разом із новими ордерами не більше. */
   maxPositions: number;
+  /**
+   * Лише ордер у бік руху монети: ціна вище EMA20 1h — лише лонг, нижче — лише шорт.
+   * Для ліміток це купівля відкату в русі, для стоп-ордерів — вхід у продовження.
+   */
+  trendOnly: boolean;
+  /** Без нових ордерів, коли ринок без напрямку (не бичачий і не ведмежий). */
+  skipNeutral: boolean;
 }
 
 /** Стартові значення: підібрані бектестом на 2023-11 — 2025-10 і перевірені на 2025-11 — 2026-10 (див. README). */
-export const TUBE_DEFAULTS: TubeConfig = {
-  topN: 20,
-  pickN: 3,
-  entryAtr: 1,
-  biasRatio: 2,
-  biasSide: "counter",
-  stopAtr: 3,
-  targetR: 0.5,
-  minStopPct: 0.5,
-  maxHoldHours: 12,
-  maxPositions: 6,
+export const BOT_DEFAULTS: Record<BotId, TubeConfig> = {
+  hvt: {
+    topN: 20,
+    pickN: 3,
+    entryAtr: 1,
+    biasRatio: 2,
+    biasSide: "counter",
+    stopAtr: 3,
+    targetR: 0.5,
+    minStopPct: 0.5,
+    maxHoldHours: 12,
+    maxPositions: 6,
+    trendOnly: true,
+    skipNeutral: true,
+  },
+  hvb: {
+    topN: 20,
+    pickN: 3,
+    entryAtr: 2,
+    biasRatio: 2,
+    biasSide: "off",
+    stopAtr: 3,
+    targetR: 3,
+    minStopPct: 0.5,
+    maxHoldHours: 12,
+    maxPositions: 6,
+    trendOnly: false,
+    skipNeutral: false,
+  },
+};
+export const TUBE_DEFAULTS = BOT_DEFAULTS.hvt;
+
+/** Префікс налаштувань бота: tube_* для High Value Tube, brk_* для High Value Breakout. */
+export const BOT_PREFIX: Record<BotId, string> = { hvt: "tube", hvb: "brk" };
+
+const FIELD_KEY: Record<keyof TubeConfig, string> = {
+  topN: "top_n",
+  pickN: "pick_n",
+  entryAtr: "entry_atr",
+  biasRatio: "bias_ratio",
+  biasSide: "bias_side",
+  stopAtr: "stop_atr",
+  targetR: "target_r",
+  minStopPct: "min_stop_pct",
+  maxHoldHours: "max_hold_hours",
+  maxPositions: "max_positions",
+  trendOnly: "trend_only",
+  skipNeutral: "skip_neutral",
 };
 
-/** Ключ налаштування для кожного поля. */
-export const TUBE_KEYS: Record<keyof TubeConfig, string> = {
-  topN: "tube_top_n",
-  pickN: "tube_pick_n",
-  entryAtr: "tube_entry_atr",
-  biasRatio: "tube_bias_ratio",
-  biasSide: "tube_bias_side",
-  stopAtr: "tube_stop_atr",
-  targetR: "tube_target_r",
-  minStopPct: "tube_min_stop_pct",
-  maxHoldHours: "tube_max_hold_hours",
-  maxPositions: "tube_max_positions",
-};
+/** Ключі налаштувань бота для кожного поля. */
+export const botKeys = (id: BotId): Record<keyof TubeConfig, string> =>
+  Object.fromEntries(Object.entries(FIELD_KEY).map(([f, k]) => [f, `${BOT_PREFIX[id]}_${k}`])) as Record<keyof TubeConfig, string>;
+/** Ключ «бот увімкнено»: on | off. */
+export const botEnabledKey = (id: BotId) => `${BOT_PREFIX[id]}_enabled`;
+export const TUBE_KEYS = botKeys("hvt");
 
 /** Межі числових полів: те саме перевіряє схема налаштувань. */
-export const TUBE_LIMITS: Record<Exclude<keyof TubeConfig, "biasSide">, { min: number; max: number; integer?: boolean }> = {
+type NumField = Exclude<keyof TubeConfig, "biasSide" | "trendOnly" | "skipNeutral">;
+export const TUBE_LIMITS: Record<NumField, { min: number; max: number; integer?: boolean }> = {
   topN: { min: 5, max: 30, integer: true },
   pickN: { min: 1, max: 5, integer: true },
   entryAtr: { min: 0.5, max: 6 },
@@ -108,13 +163,18 @@ export const TUBE_LIMITS: Record<Exclude<keyof TubeConfig, "biasSide">, { min: n
 };
 
 /** Налаштування бота з таблиці settings; непридатне значення замінюється стартовим. */
-export function tubeConfig(values: Record<string, unknown>): TubeConfig {
-  const out = { ...TUBE_DEFAULTS };
-  for (const [field, limits] of Object.entries(TUBE_LIMITS) as [Exclude<keyof TubeConfig, "biasSide">, (typeof TUBE_LIMITS)[keyof typeof TUBE_LIMITS]][]) {
-    const v = values[TUBE_KEYS[field]];
+export function tubeConfig(values: Record<string, unknown>, id: BotId = "hvt"): TubeConfig {
+  const out = { ...BOT_DEFAULTS[id] };
+  const keys = botKeys(id);
+  for (const [field, limits] of Object.entries(TUBE_LIMITS) as [NumField, (typeof TUBE_LIMITS)[NumField]][]) {
+    const v = values[keys[field]];
     if (typeof v === "number" && Number.isFinite(v) && v >= limits.min && v <= limits.max && (!limits.integer || Number.isInteger(v))) out[field] = v;
   }
-  const side = values[TUBE_KEYS.biasSide];
+  const side = values[keys.biasSide];
   if (TUBE_BIAS_SIDES.includes(side as TubeBiasSide)) out.biasSide = side as TubeBiasSide;
+  for (const field of ["trendOnly", "skipNeutral"] as const) {
+    const v = values[keys[field]];
+    if (v === "on" || v === "off") out[field] = v === "on";
+  }
   return out;
 }

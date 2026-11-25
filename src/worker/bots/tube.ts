@@ -1,4 +1,4 @@
-import type { TubeConfig } from "../../shared/bots";
+import type { BotMode, TubeConfig } from "../../shared/bots";
 import { feeR, type Fees, type Side } from "../../shared/risk";
 import { atr, ema, last, rsi } from "../indicators";
 import type { Candle } from "../market/types";
@@ -131,8 +131,15 @@ export interface TubeOrderPlan {
   rank: number;
 }
 
-/** Лімітка в лонг і шорт для однієї монети. Ордер, у якого стоп чи вхід вийшли б непридатні, не ставиться. */
-export function tubeOrders(f: TubeFeatures, bias: TubeBias, cfg: TubeConfig, rank = 1, anchor: "price" | "ema" = "price"): TubeOrderPlan[] {
+/** Чи ордер у бік руху монети: лонг, коли ціна не нижче EMA20 1h, шорт — коли не вище. */
+export const withMove = (f: Pick<TubeFeatures, "price" | "ema20">, side: Side) => (side === "long" ? f.price >= f.ema20 : f.price <= f.ema20);
+
+/**
+ * Ордери в лонг і шорт для однієї монети. fade: лімітка лонга під ціною, шорта над нею (ловлять різкий рух проти себе);
+ * breakout: стоп-ордер лонга над ціною, шорта під нею (входять у бік руху). Ордер, у якого стоп чи вхід вийшли б непридатні,
+ * не ставиться. Фільтр «лише в бік руху» (cfg.trendOnly) рахує planCycle.
+ */
+export function tubeOrders(f: TubeFeatures, bias: TubeBias, cfg: TubeConfig, rank = 1, anchor: "price" | "ema" = "price", mode: BotMode = "fade"): TubeOrderPlan[] {
   const far = cfg.entryAtr * f.atr;
   const near = far / cfg.biasRatio;
   // counter: бичачий ринок — шорт удвічі ближче за лонг, ведмежий — лонг удвічі ближче за шорт.
@@ -144,9 +151,10 @@ export function tubeOrders(f: TubeFeatures, bias: TubeBias, cfg: TubeConfig, ran
   for (const side of ["long", "short"] as const) {
     const dir = side === "long" ? 1 : -1;
     const dist = closer === side ? near : far;
-    // Лімітка завжди з правильного боку від ціни й не ближче за мінімальний відступ.
-    const raw = base - dir * dist;
-    const entry = side === "long" ? Math.min(raw, f.price - gap) : Math.max(raw, f.price + gap);
+    // Ордер завжди з правильного боку від ціни й не ближче за мінімальний відступ: лімітка лонга під ціною, стоп-ордер — над.
+    const away = mode === "breakout" ? dir : -dir;
+    const raw = base + away * dist;
+    const entry = away < 0 ? Math.min(raw, f.price - gap) : Math.max(raw, f.price + gap);
     const risk = Math.max(cfg.stopAtr * f.atr, (entry * cfg.minStopPct) / 100);
     const stop = entry - dir * risk;
     const target = entry + dir * cfg.targetR * risk;
@@ -176,8 +184,13 @@ export interface CyclePlan {
   /** Монети, взяті в цю годину. */
   chosen: string[];
   orders: TubeOrderPlan[];
-  /** Що не поставлено й чому: position — по цій монеті й напрямку вже відкрита позиція; slots — ліміт позицій. */
-  skipped: { symbol: string; side: Side; reason: "position" | "slots" }[];
+  /**
+   * Що не поставлено й чому: position — по цій монеті й напрямку вже відкрита позиція; slots — ліміт позицій;
+   * trend — ордер проти руху монети (фільтр «лише в бік руху»).
+   */
+  skipped: { symbol: string; side: Side; reason: "position" | "slots" | "trend" }[];
+  /** neutral — ринок без напрямку, а фільтр не дозволяє ставити ордери. */
+  idle: "neutral" | null;
 }
 
 /**
@@ -189,18 +202,20 @@ export function planCycle(
   features: TubeFeatures[],
   open: { symbol: string; side: Side }[],
   cfg: TubeConfig,
-  opts: { leader?: string; rankBy?: RankBy; anchor?: "price" | "ema" } = {},
+  opts: { leader?: string; rankBy?: RankBy; anchor?: "price" | "ema"; mode?: BotMode } = {},
 ): CyclePlan {
   const { market, bias } = tubeMarket(features, opts.leader);
   const ranked = rankTube(features, opts.rankBy);
-  const chosen = ranked.slice(0, cfg.pickN);
+  const idle = cfg.skipNeutral && bias === "neutral" ? "neutral" : null;
+  const chosen = idle ? [] : ranked.slice(0, cfg.pickN);
   const busy = new Set(open.map((o) => `${o.symbol}:${o.side}`));
   let slots = cfg.maxPositions - open.length;
   const orders: TubeOrderPlan[] = [];
   const skipped: CyclePlan["skipped"] = [];
   chosen.forEach((f, i) => {
-    for (const o of tubeOrders(f, bias, cfg, i + 1, opts.anchor)) {
-      if (busy.has(`${o.symbol}:${o.side}`)) skipped.push({ symbol: o.symbol, side: o.side, reason: "position" });
+    for (const o of tubeOrders(f, bias, cfg, i + 1, opts.anchor, opts.mode)) {
+      if (cfg.trendOnly && !withMove(f, o.side)) skipped.push({ symbol: o.symbol, side: o.side, reason: "trend" });
+      else if (busy.has(`${o.symbol}:${o.side}`)) skipped.push({ symbol: o.symbol, side: o.side, reason: "position" });
       else if (slots <= 0) skipped.push({ symbol: o.symbol, side: o.side, reason: "slots" });
       else {
         orders.push(o);
@@ -208,7 +223,7 @@ export function planCycle(
       }
     }
   });
-  return { market, bias, ranked, chosen: chosen.map((f) => f.symbol), orders, skipped };
+  return { market, bias, ranked, chosen: chosen.map((f) => f.symbol), orders, skipped, idle };
 }
 
 // ── Виконання ──────────────────────────────────────────────────────────────
@@ -222,6 +237,8 @@ export interface TubeTrade {
   placedAt: number;
   expiresAt: number;
   maxHoldMs: number;
+  /** fade — лімітка (виконується, коли ціна її пройшла); breakout — стоп-ордер (спрацьовує, коли ціна торкнулась). */
+  mode?: BotMode;
 }
 
 /** pending — лімітка чекає; cancelled — не виконалась і знята; open — позиція; target, stop, timeout — закрита. */
@@ -237,8 +254,9 @@ export interface TubeOutcome {
 }
 
 /**
- * Паперове виконання за свічками 15m. Лімітка виконується лише свічками, що почались після постановки й закрились
- * до зняття, і лише коли ціна пройшла її (торкання не рахується: черга в стакані). У свічці входу перевіряється лише стоп:
+ * Паперове виконання за свічками 15m. Ордер виконується лише свічками, що почались після постановки й закрились
+ * до зняття. Лімітка — лише коли ціна пройшла її (торкання не рахується: черга в стакані); стоп-ордер — коли ціна
+ * торкнулась ціни входу (виконання за нею; проковзування бектест додає окремо). У свічці входу перевіряється лише стоп:
  * порядок цін усередині свічки невідомий, тож тейк у ній не зараховуємо. Далі стоп має перевагу над тейком.
  * Позиція, що прожила maxHold, закривається за останнім закриттям перед терміном.
  */
@@ -261,7 +279,8 @@ export function resolveTube(t: TubeTrade, m15: Candle[], now: number): TubeOutco
     if (filledAt === null) {
       if (c.openTime < t.placedAt) continue;
       if (c.closeTime >= t.expiresAt) break;
-      if (long ? !(c.low < t.entry) : !(c.high > t.entry)) continue;
+      const hit = t.mode === "breakout" ? (long ? c.high >= t.entry : c.low <= t.entry) : long ? c.low < t.entry : c.high > t.entry;
+      if (!hit) continue;
       filledAt = c.openTime;
       if (long ? c.low <= t.stop : c.high >= t.stop) return done("stop", t.stop, c.closeTime, filledAt);
       lastClose = c.close;
@@ -285,8 +304,11 @@ export function resolveTube(t: TubeTrade, m15: Candle[], now: number): TubeOutco
   return { status: "open", filledAt, resolvedAt: null, exitPrice: null, resultR: null };
 }
 
-/** Комісії в R: вхід лімітний (maker), тейк лімітний (maker), стоп і закриття за часом за ринком (taker). */
-export function tubeFeeR(t: Pick<TubeTrade, "entry" | "stop">, status: TubeStatus, exitPrice: number | null, fees: Fees): number | null {
+/**
+ * Комісії в R: вхід лімітний (maker) або стоп-ордером за ринком (taker, breakout), тейк лімітний (maker),
+ * стоп і закриття за часом за ринком (taker).
+ */
+export function tubeFeeR(t: Pick<TubeTrade, "entry" | "stop">, status: TubeStatus, exitPrice: number | null, fees: Fees, mode: BotMode = "fade"): number | null {
   if (exitPrice === null || (status !== "target" && status !== "stop" && status !== "timeout")) return null;
-  return feeR({ price: t.entry, kind: "maker" }, t.stop, [{ price: exitPrice, share: 1, kind: status === "target" ? "maker" : "taker" }], fees);
+  return feeR({ price: t.entry, kind: mode === "breakout" ? "taker" : "maker" }, t.stop, [{ price: exitPrice, share: 1, kind: status === "target" ? "maker" : "taker" }], fees);
 }

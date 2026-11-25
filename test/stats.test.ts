@@ -153,6 +153,9 @@ describe("налаштування", () => {
       stocks_news_feeds: [{ source: "marketwatch", url: "https://feeds.content.dowjones.io/public/rss/mw_topstories" }],
       tube_enabled: "on", tube_top_n: 20, tube_pick_n: 3, tube_entry_atr: 1, tube_bias_ratio: 2, tube_bias_side: "counter", tube_stop_atr: 3,
       tube_target_r: 0.5, tube_min_stop_pct: 0.5, tube_max_hold_hours: 12, tube_max_positions: 6,
+      tube_trend_only: "on", tube_skip_neutral: "on",
+      brk_enabled: "on", brk_top_n: 20, brk_pick_n: 3, brk_entry_atr: 2, brk_bias_ratio: 2, brk_bias_side: "off", brk_stop_atr: 3,
+      brk_target_r: 3, brk_min_stop_pct: 0.5, brk_max_hold_hours: 12, brk_max_positions: 6, brk_trend_only: "off", brk_skip_neutral: "off",
     };
     expect(validateSettings(defaults).errors).toEqual({});
     expect(SETTINGS.map((s) => s.key).sort()).toEqual(Object.keys(defaults).sort());
