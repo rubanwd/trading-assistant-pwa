@@ -87,13 +87,20 @@ export class CachedMarket implements MarketData {
   }
 }
 
-/** Сховище свічок у SQLite самого Durable Object: компактні масиви, один рядок на монету й таймфрейм. */
+/**
+ * Сховище свічок у SQLite самого Durable Object: компактні масиви, один рядок на монету й таймфрейм.
+ * prefix розводить джерела з однаковими символами: бот бере свічки Bybit, а скан крипто — з біржі налаштувань.
+ */
 export class SqlCandleStorage implements CandleStorage {
-  constructor(private readonly sql: SqlStorage) {
+  constructor(
+    private readonly sql: SqlStorage,
+    private readonly prefix = "",
+  ) {
     sql.exec("CREATE TABLE IF NOT EXISTS candles (symbol TEXT NOT NULL, tf TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (symbol, tf))");
   }
 
-  load(symbol: string, tf: Timeframe): Candle[] | null {
+  load(name: string, tf: Timeframe): Candle[] | null {
+    const symbol = this.prefix + name;
     const rows = this.sql.exec<{ data: string }>("SELECT data FROM candles WHERE symbol = ? AND tf = ?", symbol, tf).toArray();
     if (!rows.length) return null;
     const step = TIMEFRAME_MS[tf];
@@ -108,11 +115,11 @@ export class SqlCandleStorage implements CandleStorage {
     }));
   }
 
-  save(symbol: string, tf: Timeframe, candles: Candle[]): void {
+  save(name: string, tf: Timeframe, candles: Candle[]): void {
     const data = JSON.stringify(candles.map((c) => [c.openTime, c.open, c.high, c.low, c.close, c.volume]));
     this.sql.exec(
       "INSERT INTO candles (symbol, tf, data) VALUES (?, ?, ?) ON CONFLICT (symbol, tf) DO UPDATE SET data = excluded.data",
-      symbol,
+      this.prefix + name,
       tf,
       data,
     );
