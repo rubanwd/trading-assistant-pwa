@@ -17,7 +17,7 @@ import {
   type Pipeline,
   type Transport,
 } from "./llm";
-import { TUBE_FALLBACK, tubeConfig, type TubeConfig } from "../shared/bots";
+import { BOT_IDS, botEnabledKey, botInfo, isBotId, TUBE_FALLBACK, tubeConfig, type BotId, type TubeConfig } from "../shared/bots";
 import { planCycle, resolveTube, TUBE_H1_LIMIT, TUBE_H4_LIMIT, tubeFeatures, tubeFeeR, type CyclePlan, type TubeFeatures, type TubeStatus } from "./bots/tube";
 import { marketCaps, topUniverse } from "./bots/universe";
 import { choosePick, PICK_SCHEMA, PICK_SYSTEM, pickInput, rankPicks, resolvePick, sanitizePick, type PickAi, type PickOption } from "./pick";
@@ -87,7 +87,7 @@ interface PipelineState {
   startedAt: number;
   desks: Partial<Record<Desk, DeskState>>;
   /**
-   * Черга кроків. Раз на годину першими йдуть кроки ботів: bot:<id>:universe, bot:<id>:data:N, bot:<id>:run.
+   * Черга кроків. Раз на годину першими йдуть кроки ботів: bot:universe, bot:data:N (спільні), bot:<id>:run.
    * Для кожного режиму: scan:<desk>:N, scan:<desk>:done, news:<desk>, signals:<desk>, review:<desk>:N, pick:<desk>;
    * потім forecasts, reports:<desk>, weekly:<desk>, cleanup.
    */
@@ -174,12 +174,12 @@ const HOUR = 3_600_000;
 const SIDE_NAME = { long: "лонг", short: "шорт" } as const;
 
 const BOT_CHUNK = 5;
-/** Ідентифікатор бота High Value Tube у таблиці bot_orders і в кроках циклу. */
-const TUBE = "hvt";
-/** Невиконана лімітка живе годину: до наступного циклу бота. */
+/** Список монет ботів у сховищі рушія: спільний для всіх ботів. */
+const UNIVERSE_KEY = "bot-universe";
+/** Невиконаний ордер живе годину: до наступного циклу бота. */
 const ORDER_TTL_MS = HOUR;
 
-/** Список монет бота в сховищі рушія. */
+/** Список монет ботів у сховищі рушія. */
 interface BotUniverse {
   /** Коли список востаннє вдалося оновити; 0 — ще ніколи. */
   at: number;
@@ -214,7 +214,7 @@ export interface TubeOrderBody {
   features: TubeFeatures;
   offsetAtr: number;
   market: MarketRegime;
-  cfg: Pick<TubeConfig, "entryAtr" | "biasRatio" | "biasSide" | "stopAtr" | "targetR" | "minStopPct">;
+  cfg: Pick<TubeConfig, "entryAtr" | "biasRatio" | "biasSide" | "stopAtr" | "targetR" | "minStopPct" | "trendOnly" | "skipNeutral">;
 }
 
 /** Підсумок години бота в runs.detail (kind = 'bot'). */
@@ -223,7 +223,7 @@ export interface TubeCycleDetail {
   bias: CyclePlan["bias"] | null;
   market: MarketRegime | null;
   universe: { source: string; at: string | null; size: number; error: string | null };
-  ranked: Pick<TubeFeatures, "symbol" | "price" | "atrPct" | "volRatio" | "score" | "trend4h" | "change24hPct">[];
+  ranked: Pick<TubeFeatures, "symbol" | "price" | "atrPct" | "volRatio" | "score" | "trend4h" | "change24hPct" | "ema20">[];
   chosen: string[];
   placed: number;
   skipped: CyclePlan["skipped"];
@@ -1527,55 +1527,64 @@ export class Engine extends DurableObject<Env> {
     return this.botMarketCache;
   }
 
-  private async tubeCfg(): Promise<TubeConfig> {
-    return tubeConfig(Object.fromEntries(await this.settingsMap()));
+  private async botCfg(id: BotId): Promise<TubeConfig> {
+    return tubeConfig(Object.fromEntries(await this.settingsMap()), id);
+  }
+
+  /** Скільки монет потрібно ботам: найбільший список серед увімкнених. 0 — усі боти вимкнені. */
+  private async botUniverseSize(): Promise<number> {
+    const values = Object.fromEntries(await this.settingsMap());
+    return Math.max(0, ...BOT_IDS.filter((id) => values[botEnabledKey(id)] !== "off").map((id) => tubeConfig(values, id).topN));
   }
 
   /**
-   * Кроки бота High Value Tube: раз на годину (перший цикл нової години UTC). Вимкнений бот лише знімає лімітки
-   * й доводить відкриті позиції до закриття.
+   * Кроки ботів: раз на годину (перший цикл нової години UTC). Список монет і свічки спільні для всіх ботів,
+   * далі кожен бот має свій крок run. Вимкнений бот лише знімає ордери й доводить відкриті позиції до закриття.
    */
   private async botSteps(now: number): Promise<string[]> {
-    const last = await this.ctx.storage.get<number>(`bot-last:${TUBE}`);
-    if (last !== undefined && Math.floor(last / HOUR) === Math.floor(now / HOUR)) return [];
-    if ((await this.setting("tube_enabled", "on")) === "off") return [`bot:${TUBE}:run`];
-    const cfg = await this.tubeCfg();
-    return [`bot:${TUBE}:universe`, ...Array.from({ length: Math.ceil(cfg.topN / BOT_CHUNK) }, (_, i) => `bot:${TUBE}:data:${i}`), `bot:${TUBE}:run`];
+    const hour = Math.floor(now / HOUR);
+    const due: BotId[] = [];
+    for (const id of BOT_IDS) {
+      const last = await this.ctx.storage.get<number>(`bot-last:${id}`);
+      if (last === undefined || Math.floor(last / HOUR) !== hour) due.push(id);
+    }
+    if (!due.length) return [];
+    const size = await this.botUniverseSize();
+    const data = size ? ["bot:universe", ...Array.from({ length: Math.ceil(size / BOT_CHUNK) }, (_, i) => `bot:data:${i}`)] : [];
+    return [...data, ...due.map((id) => `bot:${id}:run`)];
   }
 
   private async runBotStep(step: string, now: number): Promise<void> {
-    const [, bot, phase, arg] = step.split(":");
-    if (bot !== TUBE) return;
-    if (phase === "universe") return this.tubeUniverse(now);
-    if (phase === "data") return this.tubeData(Number(arg), now);
-    if (phase === "run") return this.tubeRun(now);
+    const [, a, b] = step.split(":");
+    if (a === "universe") return this.botUniverse(now);
+    if (a === "data") return this.botData(Number(b), now);
+    if (isBotId(a) && b === "run") return this.botRun(a, now);
   }
 
   /**
-   * Список монет бота: топ за капіталізацією з CoinGecko, що мають контракт на Bybit. Оновлюється раз на добу;
-   * якщо джерело недоступне, бот працює зі старим списком або зі стартовим і пробує знову за годину.
+   * Список монет ботів: топ за капіталізацією з CoinGecko, що мають контракт на Bybit. Оновлюється раз на добу;
+   * якщо джерело недоступне, боти працюють зі старим списком або зі стартовим і пробують знову за годину.
    */
-  private async tubeUniverse(now: number): Promise<void> {
-    const cfg = await this.tubeCfg();
-    const key = `bot-universe:${TUBE}`;
-    const cached = await this.ctx.storage.get<BotUniverse>(key);
-    if (cached?.source === "coingecko" && now - cached.at < 24 * HOUR && cached.symbols.length >= cfg.topN) return;
+  private async botUniverse(now: number): Promise<void> {
+    const size = await this.botUniverseSize();
+    const cached = await this.ctx.storage.get<BotUniverse>(UNIVERSE_KEY);
+    if (cached?.source === "coingecko" && now - cached.at < 24 * HOUR && cached.symbols.length >= size) return;
     try {
       const [caps, instruments] = await Promise.all([marketCaps(this.http, this.env.COINGECKO_API_KEY), new BybitLinear(this.http).linearUsdt()]);
-      const symbols = topUniverse(caps, instruments, cfg.topN);
-      if (symbols.length < Math.min(cfg.topN, 5)) throw new Error(`знайдено лише ${symbols.length} монет з контрактом на Bybit`);
-      await this.ctx.storage.put<BotUniverse>(key, { at: now, symbols, source: "coingecko" });
+      const symbols = topUniverse(caps, instruments, size);
+      if (symbols.length < Math.min(size, 5)) throw new Error(`знайдено лише ${symbols.length} монет з контрактом на Bybit`);
+      await this.ctx.storage.put<BotUniverse>(UNIVERSE_KEY, { at: now, symbols, source: "coingecko" });
     } catch (e) {
-      const symbols = cached?.symbols.length ? cached.symbols : TUBE_FALLBACK.slice(0, cfg.topN);
-      await this.ctx.storage.put<BotUniverse>(key, { at: cached?.at ?? 0, symbols, source: cached?.source ?? "fallback", error: String(e).slice(0, 300) });
+      const symbols = cached?.symbols.length ? cached.symbols : TUBE_FALLBACK.slice(0, size);
+      await this.ctx.storage.put<BotUniverse>(UNIVERSE_KEY, { at: cached?.at ?? 0, symbols, source: cached?.source ?? "fallback", error: String(e).slice(0, 300) });
     }
   }
 
-  /** Частина списку: свічки 1h і 4h з Bybit (через кеш) і ознаки монет; результат чекає на крок run. */
-  private async tubeData(index: number, now: number): Promise<void> {
-    const cfg = await this.tubeCfg();
-    const universe = await this.ctx.storage.get<BotUniverse>(`bot-universe:${TUBE}`);
-    const symbols = (universe?.symbols ?? TUBE_FALLBACK).slice(0, cfg.topN).slice(index * BOT_CHUNK, (index + 1) * BOT_CHUNK);
+  /** Частина списку: свічки 1h і 4h з Bybit (через кеш) і ознаки монет; результат чекає на кроки run ботів. */
+  private async botData(index: number, now: number): Promise<void> {
+    const size = await this.botUniverseSize();
+    const universe = await this.ctx.storage.get<BotUniverse>(UNIVERSE_KEY);
+    const symbols = (universe?.symbols ?? TUBE_FALLBACK).slice(0, size).slice(index * BOT_CHUNK, (index + 1) * BOT_CHUNK);
     const market = this.botMarket();
     const part: BotPart = { features: [], errors: [] };
     // Не більше трьох монет одночасно, як у скані: спільні IP Cloudflare легко впираються в ліміт частоти Bybit.
@@ -1594,27 +1603,29 @@ export class Engine extends DurableObject<Env> {
         }),
       );
     }
-    await this.ctx.storage.put(`bot-part:${TUBE}:${index}`, part);
+    await this.ctx.storage.put(`bot-part:${index}`, part);
   }
 
   /**
    * Година бота: спершу код рахує, що сталося з ордерами минулої години й відкритими позиціями (свічки 15m),
-   * знімає невиконані лімітки, потім ставить нові для 3 найрухливіших монет. Ордери паперові: на біржу нічого не йде.
+   * знімає невиконані ордери, потім ставить нові для найрухливіших монет. Ордери паперові: на біржу нічого не йде.
    */
-  private async tubeRun(now: number): Promise<void> {
+  private async botRun(id: BotId, now: number): Promise<void> {
     const started = Date.now();
     const db = this.env.DB;
     const values = Object.fromEntries(await this.settingsMap());
-    const cfg = tubeConfig(values);
-    const enabled = values.tube_enabled !== "off";
+    const cfg = tubeConfig(values, id);
+    const mode = botInfo(id).mode;
+    const enabled = values[botEnabledKey(id)] !== "off";
+    const word = mode === "breakout" ? "стоп-ордери" : "лімітки";
     const feeNum = (v: unknown, fallback: number) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : fallback);
     const fees: Fees = { makerPct: feeNum(values.fee_maker_pct, 0.02), takerPct: feeNum(values.fee_taker_pct, 0.05) };
-    await this.ctx.storage.put(`bot-last:${TUBE}`, now);
+    await this.ctx.storage.put(`bot-last:${id}`, now);
 
-    // 1. Супровід: лімітки минулої години й відкриті позиції.
+    // 1. Супровід: ордери минулої години й відкриті позиції.
     const active = await db
       .prepare("SELECT id, created_at, symbol, side, entry, stop, target, expires_at, max_hold_hours, status, filled_at FROM bot_orders WHERE bot = ? AND status IN ('pending', 'open') ORDER BY id")
-      .bind(TUBE)
+      .bind(id)
       .all<BotActiveRow>();
     const market = this.botMarket();
     const update = db.prepare("UPDATE bot_orders SET status = ?, filled_at = ?, resolved_at = ?, exit_price = ?, result_r = ?, fee_r = ? WHERE id = ?");
@@ -1637,7 +1648,7 @@ export class Engine extends DurableObject<Env> {
       }
       for (const r of rows) {
         let res = resolveTube(
-          { side: r.side, entry: r.entry, stop: r.stop, target: r.target, placedAt: Date.parse(r.created_at), expiresAt: Date.parse(r.expires_at), maxHoldMs: r.max_hold_hours * HOUR },
+          { side: r.side, entry: r.entry, stop: r.stop, target: r.target, placedAt: Date.parse(r.created_at), expiresAt: Date.parse(r.expires_at), maxHoldMs: r.max_hold_hours * HOUR, mode },
           m15,
           now,
         );
@@ -1655,32 +1666,31 @@ export class Engine extends DurableObject<Env> {
           res = { status: "timeout", filledAt, resolvedAt: last.closeTime, exitPrice: last.close, resultR };
           errors.push(`${symbol}: свічок від входу вже немає, позицію закрито за часом за останньою ціною`);
         }
-        // Нова година замінює лімітки: невиконана знімається зараз, навіть якщо її година ще не минула.
+        // Нова година замінює ордери: невиконаний знімається зараз, навіть якщо його година ще не минула.
         const status: TubeStatus = res.status === "pending" ? "cancelled" : res.status;
         const resolvedAt = res.status === "pending" ? now : res.resolvedAt;
         if (status === "open") open.push({ symbol, side: r.side });
         if (status === "open" && r.status === "open") continue;
         if (r.status === "pending" && res.filledAt !== null) resolved.filled++;
         if (status !== "open") resolved[status]++;
-        statements.push(update.bind(status, iso(res.filledAt), iso(resolvedAt), res.exitPrice, res.resultR, tubeFeeR(r, status, res.exitPrice, fees), r.id));
+        statements.push(update.bind(status, iso(res.filledAt), iso(resolvedAt), res.exitPrice, res.resultR, tubeFeeR(r, status, res.exitPrice, fees, mode), r.id));
       }
     }
 
-    // 2. Нові лімітки години.
+    // 2. Нові ордери години. Ознаки спільні для всіх ботів; кожен бере лише свій розмір списку.
     let plan: CyclePlan | null = null;
     let note: string | null = null;
-    const universe = await this.ctx.storage.get<BotUniverse>(`bot-universe:${TUBE}`);
-    // Частини на будь-який розмір списку: так не лишаються частини від циклу, що впав, чи від більшого списку.
-    const keys = Array.from({ length: Math.ceil(30 / BOT_CHUNK) }, (_, i) => `bot-part:${TUBE}:${i}`);
-    const parts = await this.ctx.storage.get<BotPart>(keys);
-    await this.ctx.storage.delete(keys);
+    const universe = await this.ctx.storage.get<BotUniverse>(UNIVERSE_KEY);
+    const mine = new Set((universe?.symbols ?? TUBE_FALLBACK).slice(0, cfg.topN));
+    const parts = await this.ctx.storage.get<BotPart>(Array.from({ length: Math.ceil(30 / BOT_CHUNK) }, (_, i) => `bot-part:${i}`));
     // Лише свіжі ознаки: частина з циклу, що не дійшов до кінця, могла пролежати годину.
-    const features = [...parts.values()].flatMap((p) => p.features).filter((f) => f.closedAt >= now - 2 * HOUR);
+    const features = [...parts.values()].flatMap((p) => p.features).filter((f) => f.closedAt >= now - 2 * HOUR && mine.has(f.symbol));
     errors.push(...[...parts.values()].flatMap((p) => p.errors));
-    if (!enabled) note = "бот вимкнено: нові лімітки не ставляться, відкриті позиції ведуться до закриття";
-    else if (features.length < Math.max(cfg.pickN, Math.ceil(cfg.topN / 2))) note = `ознаки лише для ${features.length} монет: лімітки цієї години не ставляться`;
+    if (!enabled) note = `бот вимкнено: нові ${word} не ставляться, відкриті позиції ведуться до закриття`;
+    else if (features.length < Math.max(cfg.pickN, Math.ceil(cfg.topN / 2))) note = `ознаки лише для ${features.length} монет: ${word} цієї години не ставляться`;
     else {
-      plan = planCycle(features, open, cfg);
+      plan = planCycle(features, open, cfg, { mode });
+      if (plan.idle === "neutral") note = `ринок без напрямку: ${word} цієї години не ставляться`;
       const insert = db.prepare(
         `INSERT INTO bot_orders (bot, desk, created_at, symbol, side, bias, near, rank, price, atr, entry, stop, target, expires_at, max_hold_hours, body)
          VALUES (?, 'crypto', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -1692,11 +1702,14 @@ export class Engine extends DurableObject<Env> {
           features: byCoin.get(o.symbol)!,
           offsetAtr: o.offsetAtr,
           market: plan.market,
-          cfg: { entryAtr: cfg.entryAtr, biasRatio: cfg.biasRatio, biasSide: cfg.biasSide, stopAtr: cfg.stopAtr, targetR: cfg.targetR, minStopPct: cfg.minStopPct },
+          cfg: {
+            entryAtr: cfg.entryAtr, biasRatio: cfg.biasRatio, biasSide: cfg.biasSide, stopAtr: cfg.stopAtr, targetR: cfg.targetR, minStopPct: cfg.minStopPct,
+            trendOnly: cfg.trendOnly, skipNeutral: cfg.skipNeutral,
+          },
         };
         statements.push(
           insert.bind(
-            iso(now), o.symbol, o.side, o.bias, o.near === null ? null : o.near ? 1 : 0, o.rank, o.price, o.atr, o.entry, o.stop, o.target,
+            id, iso(now), o.symbol, o.side, o.bias, o.near === null ? null : o.near ? 1 : 0, o.rank, o.price, o.atr, o.entry, o.stop, o.target,
             iso(now + ORDER_TTL_MS), cfg.maxHoldHours, JSON.stringify(body),
           ),
         );
@@ -1705,11 +1718,11 @@ export class Engine extends DurableObject<Env> {
     if (statements.length) await db.batch(statements);
 
     const detail: TubeCycleDetail = {
-      bot: TUBE,
+      bot: id,
       bias: plan?.bias ?? null,
       market: plan?.market ?? null,
       universe: { source: universe?.source ?? "fallback", at: universe?.at ? new Date(universe.at).toISOString() : null, size: features.length, error: universe?.error ?? null },
-      ranked: (plan?.ranked ?? []).map((f) => ({ symbol: f.symbol, price: f.price, atrPct: f.atrPct, volRatio: f.volRatio, score: f.score, trend4h: f.trend4h, change24hPct: f.change24hPct })),
+      ranked: (plan?.ranked ?? []).map((f) => ({ symbol: f.symbol, price: f.price, atrPct: f.atrPct, volRatio: f.volRatio, score: f.score, trend4h: f.trend4h, change24hPct: f.change24hPct, ema20: f.ema20 })),
       chosen: plan?.chosen ?? [],
       placed: plan?.orders.length ?? 0,
       skipped: plan?.skipped ?? [],
@@ -1718,7 +1731,7 @@ export class Engine extends DurableObject<Env> {
       note,
       errors: errors.slice(0, 20),
     };
-    await this.logRun("bot", started, detail, plan || !enabled ? null : (note ?? "бот не поставив ліміток"), "crypto");
+    await this.logRun("bot", started, detail, plan || !enabled ? null : (note ?? `бот не поставив ордерів`), "crypto");
   }
 
   // ── Тижневий розбір ──────────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-import { TUBE_BIAS_SIDES, TUBE_LIMITS } from "./bots";
+import { botEnabledKey, botInfo, botKeys, TUBE_BIAS_SIDES, TUBE_LIMITS, type BotId } from "./bots";
 
 /**
  * Схема налаштувань: перевірка значень для API і підписи для екрана «Налаштування».
@@ -34,6 +34,61 @@ const tubeNum = (field: keyof typeof TUBE_LIMITS): Check => {
   const l = TUBE_LIMITS[field];
   return num(l.min, l.max, l.integer);
 };
+
+/** Налаштування одного бота: однаковий набір полів, назва бота в підписі, свій префікс ключів. */
+function botSettings(id: BotId): SettingSpec[] {
+  const { name, mode } = botInfo(id);
+  const k = botKeys(id);
+  const order = mode === "breakout" ? "стоп-ордер" : "лімітка";
+  const orders = mode === "breakout" ? "стоп-ордери" : "лімітки";
+  const g = "Боти" as const;
+  return [
+    {
+      key: botEnabledKey(id),
+      group: g,
+      label: name,
+      help:
+        (mode === "breakout"
+          ? "Паперова торгівля: щогодини найрухливіші монети з топ-20 за капіталізацією, стоп-ордери над і під ціною входять у бік руху, з тейком і стопом."
+          : "Паперова торгівля: щогодини найрухливіші монети з топ-20 за капіталізацією, лімітки під і над ціною ловлять різкий рух і виходять на відкаті, з тейком і стопом.") +
+        ` Ордери на біржу не йдуть. Вимкнений бот знімає ${orders}, а відкриті позиції веде до закриття.`,
+      kind: "enum",
+      options: ["on", "off"],
+      check: onOff,
+    },
+    { key: k.topN, group: g, label: `${name}: монет у списку`, help: "Топ за капіталізацією (CoinGecko) з контрактом на Bybit, без стейблкоїнів і золота.", kind: "number", check: tubeNum("topN") },
+    { key: k.pickN, group: g, label: `${name}: найрухливіших монет щогодини`, kind: "number", check: tubeNum("pickN") },
+    { key: k.entryAtr, group: g, label: `${name}: відстань ордера, ATR 1h`, help: `На скільки ATR(14) 1h від ціни стоїть дальня ${order}.`, kind: "number", check: tubeNum("entryAtr") },
+    { key: k.biasRatio, group: g, label: `${name}: у скільки разів ближчий ордер ближче`, help: "Коли ринок бичачий або ведмежий, один із двох ордерів стоїть ближче до ціни. 2 — удвічі ближче, 1 — однаково.", kind: "number", check: tubeNum("biasRatio") },
+    {
+      key: k.biasSide,
+      group: g,
+      label: `${name}: який ордер ближче`,
+      help: "counter — проти ринку: у бичачому ринку шорт удвічі ближче за лонг, у ведмежому лонг удвічі ближче за шорт. trend — навпаки, за ринком. off — обидва однаково.",
+      kind: "enum",
+      options: TUBE_BIAS_SIDES,
+      check: (v) => (TUBE_BIAS_SIDES.includes(v as never) ? ok(v) : fail(TUBE_BIAS_SIDES.join(", "))),
+    },
+    { key: k.stopAtr, group: g, label: `${name}: стоп, ATR 1h від входу`, kind: "number", check: tubeNum("stopAtr") },
+    { key: k.targetR, group: g, label: `${name}: тейк-профіт, R`, help: "Частки відстані до стопа: 1 — тейк на тій самій відстані, що й стоп.", kind: "number", check: tubeNum("targetR") },
+    { key: k.minStopPct, group: g, label: `${name}: стоп не ближче, % від входу`, kind: "number", check: tubeNum("minStopPct") },
+    { key: k.maxHoldHours, group: g, label: `${name}: найдовше тримати позицію, год`, help: "Позиція, що не дійшла ні до тейка, ні до стопа, закривається за ринком.", kind: "number", check: tubeNum("maxHoldHours") },
+    { key: k.maxPositions, group: g, label: `${name}: позицій не більше`, help: "Відкриті позиції разом із новими ордерами. Ризик кожної — ризик на угоду з групи «Ризик».", kind: "number", check: tubeNum("maxPositions") },
+    {
+      key: k.trendOnly,
+      group: g,
+      label: `${name}: лише в бік руху монети`,
+      help:
+        mode === "breakout"
+          ? "on: ціна вище EMA20 1h — лише стоп-ордер у лонг, нижче — лише в шорт. Так бот не входить проти руху монети."
+          : "on: ціна вище EMA20 1h — лише лімітка в лонг (купівля відкату в русі), нижче — лише в шорт. У бектесті найгірші угоди були саме проти руху.",
+      kind: "enum",
+      options: ["on", "off"],
+      check: onOff,
+    },
+    { key: k.skipNeutral, group: g, label: `${name}: без ордерів у ринку без напрямку`, help: "on: коли ринок не бичачий і не ведмежий, нові ордери не ставляться. У бектесті це найгірший режим.", kind: "enum", options: ["on", "off"], check: onOff },
+  ];
+}
 
 const nullable = (inner: Check): Check => (v) => (v === null ? ok(null) : inner(v));
 
@@ -90,33 +145,8 @@ export const SETTINGS: SettingSpec[] = [
   { key: "signal_max_hold_hours", group: "Сигнали", label: "Найдовше тримати позицію, год", help: "Позицію закриває стоп, вихід за каналом 4h або цей ліміт. Коротший ліміт швидше звільняє місце для нових сигналів: у бектесті 120 год дали більше сигналів без втрати середнього результату. Не більше 480 год: супровід іде за свічками 1h, а кеш тримає ~20 днів.", kind: "number", check: num(4, 480) },
   { key: "pick_enabled", group: "Сигнали", label: "Ідея скану", help: "Щопів години одна монета, напрямок і вхід, найкращі за технічним аналізом і на думку агента «Ідея скану». Це не сигнал: без скептика й сповіщень.", kind: "enum", options: ["on", "off"], check: onOff },
   { key: "pick_horizon_hours", group: "Сигнали", label: "Горизонт ідеї скану, год", help: "За цей час ціна має дійти до цілі 2R раніше за стоп; інакше ідея закривається за часом. Лімітний вхід, що не виконався за цей час, скасовується.", kind: "number", check: num(4, 96) },
-  {
-    key: "tube_enabled",
-    group: "Боти",
-    label: "High Value Tube",
-    help: "Паперова торгівля: щогодини 3 найрухливіші монети з топ-20 за капіталізацією, по лімітці в лонг і шорт з тейком і стопом. Ордери на біржу не йдуть. Вимкнений бот знімає лімітки, а відкриті позиції веде до закриття.",
-    kind: "enum",
-    options: ["on", "off"],
-    check: onOff,
-  },
-  { key: "tube_top_n", group: "Боти", label: "Монет у списку бота", help: "Топ за капіталізацією (CoinGecko) з контрактом на Bybit, без стейблкоїнів і золота.", kind: "number", check: tubeNum("topN") },
-  { key: "tube_pick_n", group: "Боти", label: "Найрухливіших монет щогодини", kind: "number", check: tubeNum("pickN") },
-  { key: "tube_entry_atr", group: "Боти", label: "Відстань лімітки, ATR 1h", help: "На скільки ATR(14) 1h від ціни стоїть дальня лімітка: лонг нижче, шорт вище.", kind: "number", check: tubeNum("entryAtr") },
-  { key: "tube_bias_ratio", group: "Боти", label: "У скільки разів ближча лімітка ближче", help: "Коли ринок бичачий або ведмежий, одна з двох ліміток стоїть ближче до ціни. 2 — удвічі ближче, 1 — однаково.", kind: "number", check: tubeNum("biasRatio") },
-  {
-    key: "tube_bias_side",
-    group: "Боти",
-    label: "Яка лімітка ближче",
-    help: "counter — проти ринку: у бичачому ринку шорт удвічі ближче за лонг, у ведмежому лонг удвічі ближче за шорт (як задано). trend — навпаки, за ринком. off — обидві однаково.",
-    kind: "enum",
-    options: TUBE_BIAS_SIDES,
-    check: (v) => (TUBE_BIAS_SIDES.includes(v as never) ? ok(v) : fail(TUBE_BIAS_SIDES.join(", "))),
-  },
-  { key: "tube_stop_atr", group: "Боти", label: "Стоп, ATR 1h від входу", kind: "number", check: tubeNum("stopAtr") },
-  { key: "tube_target_r", group: "Боти", label: "Тейк-профіт, R", help: "Частки відстані до стопа: 1 — тейк на тій самій відстані, що й стоп.", kind: "number", check: tubeNum("targetR") },
-  { key: "tube_min_stop_pct", group: "Боти", label: "Стоп бота не ближче, % від входу", kind: "number", check: tubeNum("minStopPct") },
-  { key: "tube_max_hold_hours", group: "Боти", label: "Найдовше тримати позицію бота, год", help: "Позиція, що не дійшла ні до тейка, ні до стопа, закривається за ринком.", kind: "number", check: tubeNum("maxHoldHours") },
-  { key: "tube_max_positions", group: "Боти", label: "Позицій бота не більше", help: "Відкриті позиції разом із новими лімітками. Ризик кожної — ризик на угоду з групи «Ризик».", kind: "number", check: tubeNum("maxPositions") },
+  ...botSettings("hvt"),
+  ...botSettings("hvb"),
   { key: "signal_cooldown_hours", group: "Сигнали", label: "Пауза для того самого сетапу по монеті, год", kind: "number", check: num(0, 72) },
   { key: "macro_blackout_hours", group: "Сигнали", label: "Без нових сигналів до макроподії, год", kind: "number", check: num(0, 24) },
   {

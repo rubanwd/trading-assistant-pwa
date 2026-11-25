@@ -1,4 +1,4 @@
-import type { TubeConfig } from "../shared/bots";
+import type { BotMode, TubeConfig } from "../shared/bots";
 import type { Fees } from "../shared/risk";
 import { ORDER_TTL_MS, planCycle, resolveTube, TUBE_H1_LIMIT, TUBE_H4_LIMIT, tubeFeatures, tubeFeeR, type RankBy, type TubeFeatures, type TubeOrderPlan, type TubeStatus } from "../worker/bots/tube";
 import type { Candle } from "../worker/market/types";
@@ -65,10 +65,11 @@ export function tubeHours(symbols: SymbolCandles[], from: number, to: number): T
 export interface TubeBacktestConfig {
   cfg: TubeConfig;
   fees: Fees;
-  /** Проковзування на ринкових виходах (стоп, за часом), % від ціни: стрес-тест. */
+  /** Проковзування на ринкових виконаннях (стоп, за часом, вхід стоп-ордером), % від ціни: стрес-тест. */
   slippagePct: number;
   rankBy?: RankBy;
   anchor?: "price" | "ema";
+  mode?: BotMode;
 }
 
 export interface TubeBtOrder extends TubeOrderPlan {
@@ -95,20 +96,23 @@ export function simulateTube(hours: TubeHour[], m15: Map<string, Candle[]>, bt: 
     // Позиції, що на момент циклу вже виконались і ще не закрились (рушій бачить лише свічки, що закрились до циклу).
     active = active.filter((o) => o.resolvedAt === null || o.resolvedAt >= t);
     const open = active.filter((o) => o.filledAt !== null && o.filledAt < t).map((o) => ({ symbol: o.symbol, side: o.side }));
-    const plan = planCycle(features, open, bt.cfg, { rankBy: bt.rankBy, anchor: bt.anchor });
+    const plan = planCycle(features, open, bt.cfg, { rankBy: bt.rankBy, anchor: bt.anchor, mode: bt.mode });
     for (const p of plan.orders) {
       const candles = m15.get(p.symbol) ?? [];
       let start = cursors.get(p.symbol) ?? 0;
       while (start < candles.length && candles[start]!.openTime < t) start++;
       cursors.set(p.symbol, start);
       const res = resolveTube(
-        { side: p.side, entry: p.entry, stop: p.stop, target: p.target, placedAt: t, expiresAt: t + ORDER_TTL_MS, maxHoldMs: holdMs },
+        { side: p.side, entry: p.entry, stop: p.stop, target: p.target, placedAt: t, expiresAt: t + ORDER_TTL_MS, maxHoldMs: holdMs, mode: bt.mode },
         candles.slice(start, start + span),
         Number.POSITIVE_INFINITY,
       );
-      const fee = tubeFeeR(p, res.status, res.exitPrice, bt.fees);
+      const fee = tubeFeeR(p, res.status, res.exitPrice, bt.fees, bt.mode);
       const risk = Math.abs(p.entry - p.stop);
-      const slip = res.exitPrice !== null && res.status !== "target" && risk > 0 ? (res.exitPrice * bt.slippagePct) / 100 / risk : 0;
+      // Проковзування на ринкових виконаннях: стоп і закриття за часом, а в пробої ще й вхід стоп-ордером.
+      const takerExit = res.exitPrice !== null && res.status !== "target" ? res.exitPrice : 0;
+      const takerEntry = bt.mode === "breakout" && res.exitPrice !== null ? p.entry : 0;
+      const slip = risk > 0 ? ((takerExit + takerEntry) * bt.slippagePct) / 100 / risk : 0;
       const o: TubeBtOrder = {
         ...p,
         createdAt: t,
@@ -220,12 +224,12 @@ function line(name: string, s: TubeSummary): string {
   return `  ${name.padEnd(12)} угод ${String(s.trades).padStart(6)} · виграш ${fmtPct(s.winRate).padStart(4)} · середнє ${fmtR(s.avgR)}${ci} · разом ${s.totalR.toFixed(1)}R · PF ${s.profitFactor ?? "—"} · просадка ${s.maxDrawdownR}R`;
 }
 
-export function formatTubeReport(rep: TubeReport, meta: { from: string; to: string; symbols: number; cfg: TubeConfig; extra?: string }): string {
+export function formatTubeReport(rep: TubeReport, meta: { name: string; from: string; to: string; symbols: number; cfg: TubeConfig; extra?: string }): string {
   const o = rep.overall;
   const c = meta.cfg;
   const out = [
-    `High Value Tube · бектест ${meta.from} — ${meta.to} · ${meta.symbols} монет`,
-    `Параметри: ${c.pickN} з ${c.topN} монет · вхід ${c.entryAtr} ATR (ближчий ÷${c.biasRatio}, ${c.biasSide}) · стоп ${c.stopAtr} ATR (не ближче ${c.minStopPct}%) · тейк ${c.targetR}R · до ${c.maxHoldHours} год · до ${c.maxPositions} позицій${meta.extra ? ` · ${meta.extra}` : ""}`,
+    `${meta.name} · бектест ${meta.from} — ${meta.to} · ${meta.symbols} монет`,
+    `Параметри: ${c.pickN} з ${c.topN} монет · вхід ${c.entryAtr} ATR (ближчий ÷${c.biasRatio}, ${c.biasSide}) · стоп ${c.stopAtr} ATR (не ближче ${c.minStopPct}%) · тейк ${c.targetR}R · до ${c.maxHoldHours} год · до ${c.maxPositions} позицій · лише в бік руху ${c.trendOnly ? "так" : "ні"} · без нейтрального ринку ${c.skipNeutral ? "так" : "ні"}${meta.extra ? ` · ${meta.extra}` : ""}`,
     "",
     `Ордерів ${o.orders} · виконалось ${o.filled} (${fmtPct(o.fillRate)}) · ${o.tradesPerDay} угоди на добу · медіана утримання ${o.medianHoldHours ?? "—"} год · відкрито на кінець ${o.stillOpen}`,
     `Тейк ${o.target} · стоп ${o.stop} · за часом ${o.timeout} · комісії в середньому ${fmtR(o.avgFeeR)}`,

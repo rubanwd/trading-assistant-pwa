@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { BOTS, TUBE_DEFAULTS, TUBE_KEYS, tubeConfig, type TubeConfig } from "../src/shared/bots";
+import { BOT_DEFAULTS, botKeys, BOTS, TUBE_DEFAULTS, TUBE_KEYS, tubeConfig, type TubeConfig } from "../src/shared/bots";
 import { validateSettings } from "../src/shared/settings";
 import {
   MIN_GAP_ATR,
@@ -43,7 +43,7 @@ function feature(symbol: string, over: Partial<TubeFeatures> = {}): TubeFeatures
   };
 }
 
-const cfg = (over: Partial<TubeConfig> = {}): TubeConfig => ({ ...TUBE_DEFAULTS, entryAtr: 2, stopAtr: 2, targetR: 1, minStopPct: 0, ...over });
+const cfg = (over: Partial<TubeConfig> = {}): TubeConfig => ({ ...TUBE_DEFAULTS, entryAtr: 2, stopAtr: 2, targetR: 1, minStopPct: 0, trendOnly: false, skipNeutral: false, ...over });
 
 describe("ознаки й рейтинг руху", () => {
   it("ATR, EMA20, активність обсягу й тренд 4h зі свічок", () => {
@@ -135,6 +135,20 @@ describe("лімітки", () => {
   });
 });
 
+describe("пробій: стоп-ордери в бік руху", () => {
+  it("лонг над ціною, шорт під нею; стоп за входом, тейк далі в бік руху", () => {
+    const [long, short] = tubeOrders(feature("ETHUSDT"), "neutral", cfg(), 1, "price", "breakout");
+    expect(long).toMatchObject({ side: "long", entry: 104, stop: 100, target: 108 });
+    expect(short).toMatchObject({ side: "short", entry: 96, stop: 100, target: 92 });
+  });
+
+  it("правило «ближче» діє так само: бичачий ринок і counter — ближче шорт", () => {
+    const [long, short] = tubeOrders(feature("ETHUSDT"), "bull", cfg(), 1, "price", "breakout");
+    expect(long!.offsetAtr).toBe(2);
+    expect(short!.offsetAtr).toBe(1);
+  });
+});
+
 describe("план години", () => {
   const list = [feature("A", { score: 3 }), feature("B", { score: 2 }), feature("C", { score: 1.5 }), feature("D", { score: 1 })];
 
@@ -142,6 +156,25 @@ describe("план години", () => {
     const plan = planCycle(list, [], cfg({ pickN: 3, maxPositions: 10 }));
     expect(plan.chosen).toEqual(["A", "B", "C"]);
     expect(plan.orders.map((o) => `${o.symbol}:${o.side}:${o.rank}`)).toEqual(["A:long:1", "A:short:1", "B:long:2", "B:short:2", "C:long:3", "C:short:3"]);
+  });
+
+  it("лише в бік руху: ціна над EMA20 — лише лонг, під — лише шорт", () => {
+    const coins = [feature("A", { score: 3, price: 101, ema20: 100 }), feature("B", { score: 2, price: 99, ema20: 100 })];
+    const plan = planCycle(coins, [], cfg({ pickN: 2, maxPositions: 10, trendOnly: true }));
+    expect(plan.orders.map((o) => `${o.symbol}:${o.side}`)).toEqual(["A:long", "B:short"]);
+    expect(plan.skipped).toEqual([
+      { symbol: "A", side: "short", reason: "trend" },
+      { symbol: "B", side: "long", reason: "trend" },
+    ]);
+  });
+
+  it("ринок без напрямку з фільтром — ордерів немає", () => {
+    const plan = planCycle(list, [], cfg({ skipNeutral: true }));
+    expect(plan.idle).toBe("neutral");
+    expect(plan.orders).toEqual([]);
+    expect(plan.ranked).toHaveLength(4);
+    const bull = list.map((f) => ({ ...f, above200: true, trend4h: f.symbol === "A" ? ("up" as const) : f.trend4h }));
+    expect(planCycle(bull, [], cfg({ skipNeutral: true }), { leader: "A" }).idle).toBeNull();
   });
 
   it("по монеті й напрямку з відкритою позицією нового ордера немає; ліміт позицій рахує нові ордери", () => {
@@ -204,11 +237,20 @@ describe("паперове виконання", () => {
     expect(res).toMatchObject({ status: "target", resultR: 1 });
   });
 
+  it("стоп-ордер спрацьовує на торканні ціни входу", () => {
+    const breakout: TubeTrade = { side: "long", entry: 104, stop: 100, target: 108, placedAt, expiresAt: placedAt + H, maxHoldMs: 2 * H, mode: "breakout" };
+    expect(resolveTube(breakout, m15(hour, [[103, 99, 102], [104, 102, 103]]), placedAt + H).filledAt).toBe(hour + M15);
+    expect(resolveTube(breakout, m15(hour, [[103, 99, 102], [103.9, 102, 103]]), placedAt + H).status).toBe("cancelled");
+    expect(resolveTube(breakout, m15(hour, [[103, 99, 102], [104.5, 102, 104], [108.5, 103, 108]]), placedAt + H)).toMatchObject({ status: "target", resultR: 1 });
+  });
+
   it("комісії: вхід і тейк maker, стоп і за часом taker", () => {
     const fees = { makerPct: 0.02, takerPct: 0.05 };
     expect(tubeFeeR(long, "target", 100, fees)).toBeCloseTo((96 * 0.0002 + 100 * 0.0002) / 4, 3);
     expect(tubeFeeR(long, "stop", 92, fees)).toBeCloseTo((96 * 0.0002 + 92 * 0.0005) / 4, 3);
     expect(tubeFeeR(long, "cancelled", null, fees)).toBeNull();
+    // Пробій: вхід стоп-ордером за ринком.
+    expect(tubeFeeR(long, "target", 100, fees, "breakout")).toBeCloseTo((96 * 0.0005 + 100 * 0.0002) / 4, 3);
   });
 });
 
@@ -319,6 +361,14 @@ describe("налаштування бота", () => {
     expect(c.stopAtr).toBe(TUBE_DEFAULTS.stopAtr);
   });
 
+  it("другий бот має власні ключі з префіксом brk_ і власні стартові значення", () => {
+    expect(botKeys("hvb").entryAtr).toBe("brk_entry_atr");
+    const c = tubeConfig({ brk_entry_atr: 1.5, tube_entry_atr: 3, brk_trend_only: "off", brk_skip_neutral: "yes" }, "hvb");
+    expect(c.entryAtr).toBe(1.5);
+    expect(c.trendOnly).toBe(false);
+    expect(c.skipNeutral).toBe(BOT_DEFAULTS.hvb.skipNeutral);
+  });
+
   it("схема перевіряє кожне поле бота", () => {
     const { values, errors } = validateSettings({ tube_enabled: "off", tube_entry_atr: 1.5, tube_bias_side: "trend", tube_pick_n: 9, tube_bias_ratio: "2" });
     expect(values).toEqual({ tube_enabled: "off", tube_entry_atr: 1.5, tube_bias_side: "trend" });
@@ -326,6 +376,6 @@ describe("налаштування бота", () => {
   });
 
   it("бот має назву", () => {
-    expect(BOTS.map((b) => b.name)).toEqual(["High Value Tube"]);
+    expect(BOTS.map((b) => b.name)).toEqual(["High Value Tube", "High Value Breakout"]);
   });
 });

@@ -50,7 +50,7 @@ describe("бектест High Value Tube", () => {
   const to = T0 + 59 * DAY;
   const hours = tubeHours(symbols, from, to);
   const m15 = new Map(symbols.map((s) => [s.symbol, s["15m"]]));
-  const cfg = { ...TUBE_DEFAULTS, topN: 5, maxPositions: 4 };
+  const cfg = { ...TUBE_DEFAULTS, topN: 5, maxPositions: 4, trendOnly: false, skipNeutral: false };
   const orders = simulateTube(hours, m15, { cfg, fees: { makerPct: 0.02, takerPct: 0.05 }, slippagePct: 0 });
 
   it("цикл щогодини о :04 і лише по закритих свічках 1h", () => {

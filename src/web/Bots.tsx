@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
-import type { BotInfo, TubeConfig } from "../shared/bots";
+import type { BotId, BotInfo, BotMode, TubeConfig } from "../shared/bots";
 import { positionSize } from "../shared/risk";
-import { TUBE_BACKTEST } from "../shared/tubeBacktest";
+import { BOT_BACKTESTS } from "../shared/tubeBacktest";
 import { fmtPrice, useLivePrice } from "./live";
 import { EquityCurve } from "./Stats";
 import { api, c, card, coin, day, dim, h2, label, num, p, pct, secondary, signed, time, tone, useDesk } from "./ui";
@@ -54,7 +54,7 @@ interface Order {
 }
 interface Trade extends Order { outcome: Outcome; net_r: number | null }
 interface OrderFull extends Trade { body: { features: Features; offsetAtr: number; market: { mood: string; btcTrend: string | null; breadth: number | null } } }
-interface Ranked { symbol: string; price: number; atrPct: number; volRatio: number | null; score: number; trend4h: Features["trend4h"]; change24hPct: number | null }
+interface Ranked { symbol: string; price: number; atrPct: number; volRatio: number | null; score: number; trend4h: Features["trend4h"]; change24hPct: number | null; ema20?: number }
 interface Cycle { at: string; status: string; error: string | null; bias: Bias | null; chosen: string[]; placed: number; resolved: Record<"filled" | "target" | "stop" | "timeout" | "cancelled", number>; open: number; note: string | null }
 interface LastCycle {
   at: string;
@@ -88,7 +88,7 @@ const BIAS: Record<Bias, { text: string; icon: string; color: string }> = {
   neutral: { text: "без напрямку", icon: "•", color: c.dim },
 };
 const STATUS: Record<Status, { text: string; color: string }> = {
-  pending: { text: "лімітка чекає", color: c.blue },
+  pending: { text: "ордер чекає", color: c.blue },
   cancelled: { text: "знята", color: c.faint },
   open: { text: "позиція", color: c.blue },
   target: { text: "тейк ✓", color: c.up },
@@ -104,16 +104,24 @@ const OUTCOME: Record<Outcome, { text: string; icon: string; color: string }> = 
 };
 const TREND = { up: "▲ вгору", down: "▼ вниз", range: "боковик" } as const;
 
+/** Слова для ордерів бота: лімітки в High Value Tube, стоп-ордери в High Value Breakout. */
+const WORD: Record<BotMode, { one: string; many: string; gen: string; near: string; far: string; Many: string }> = {
+  fade: { one: "лімітка", many: "лімітки", gen: "ліміток", near: "ближча лімітка", far: "дальня лімітка", Many: "Лімітки" },
+  breakout: { one: "стоп-ордер", many: "стоп-ордери", gen: "стоп-ордерів", near: "ближчий стоп-ордер", far: "дальній стоп-ордер", Many: "Стоп-ордери" },
+};
+
 const distPct = (from: number, to: number) => ((to - from) / from) * 100;
 const times = (ratio: number) => (ratio === 2 ? "удвічі" : `у ${ratio} раза`);
 
-/** Яка лімітка зараз ближче до ціни і чому. */
-function biasRule(bias: Bias | null, cfg: TubeConfig): string {
+/** Який ордер зараз ближче до ціни і чому. */
+function biasRule(bias: Bias | null, cfg: TubeConfig, mode: BotMode): string {
   if (bias === null) return "Напрямок ринку ще не визначено.";
-  if (bias === "neutral" || cfg.biasSide === "off" || cfg.biasRatio === 1) return "Обидві лімітки на однаковій відстані від ціни.";
+  if (bias === "neutral" && cfg.skipNeutral) return `Ринок без напрямку: нові ${WORD[mode].many} не ставляться.`;
+  const filter = cfg.trendOnly ? ` Ставиться лише ${WORD[mode].one} у бік руху монети (ціна відносно EMA20 1h).` : "";
+  if (bias === "neutral" || cfg.biasSide === "off" || cfg.biasRatio === 1) return `Обидва ордери на однаковій відстані від ціни.${filter}`;
   const near: Side = (bias === "bull") === (cfg.biasSide === "counter") ? "short" : "long";
   const far: Side = near === "long" ? "short" : "long";
-  return `${SIDE[near].text} ${times(cfg.biasRatio)} ближче до ціни, ніж ${SIDE[far].text.toLowerCase()}.`;
+  return `${SIDE[near].text} ${times(cfg.biasRatio)} ближче до ціни, ніж ${SIDE[far].text.toLowerCase()}.${filter}`;
 }
 
 // ── Список ботів ────────────────────────────────────────────────────────────
@@ -137,7 +145,7 @@ function BotCard({ b, onOpen }: { b: BotListItem; onOpen: () => void }) {
       </div>
       {last && (
         <span style={{ fontSize: 12, color: c.dim }}>
-          Остання година {time(last.at)}: {last.chosen.map(coin).join(", ") || "без монет"} · ринок {last.bias ? BIAS[last.bias].text : "—"} · ліміток {last.placed}
+          Остання година {time(last.at)}: {last.chosen.map(coin).join(", ") || "без монет"} · ринок {last.bias ? BIAS[last.bias].text : "—"} · {WORD[b.mode].gen} {last.placed}
         </span>
       )}
       <span style={{ fontSize: 13, fontWeight: 600, color: c.blue }}>Відкрити →</span>
@@ -146,6 +154,8 @@ function BotCard({ b, onOpen }: { b: BotListItem; onOpen: () => void }) {
 }
 
 /** Розділ «Боти»: список ботів, а вибраний бот відкривається окремою сторінкою. Поки боти працюють лише з крипто. */
+const BOT_IDS_WEB: BotId[] = ["hvt", "hvb"];
+
 export function Bots({ openId, onOpen }: { openId: string | null; onOpen: (id: string | null) => void }) {
   const desk = useDesk();
   const [list, setList] = useState<BotListItem[] | null>(null);
@@ -158,11 +168,12 @@ export function Bots({ openId, onOpen }: { openId: string | null; onOpen: (id: s
     return (
       <section style={card}>
         <h2 style={h2}>Боти поки лише для крипто</h2>
-        <p style={dim}>High Value Tube торгує ф'ючерсами монет з топ-20 за капіталізацією на Bybit. Перемкни ринок на «Крипто» вгорі.</p>
+        <p style={dim}>Боти торгують ф'ючерсами монет з топ-20 за капіталізацією на Bybit. Перемкни ринок на «Крипто» вгорі.</p>
       </section>
     );
   }
-  if (openId === "hvt") return <TubeBot onBack={() => onOpen(null)} />;
+  const bot = BOT_IDS_WEB.find((x) => x === openId);
+  if (bot) return <BotView key={bot} id={bot} onBack={() => onOpen(null)} />;
   return (
     <>
       <p style={{ ...p, color: c.dim }}>
@@ -176,7 +187,7 @@ export function Bots({ openId, onOpen }: { openId: string | null; onOpen: (id: s
   );
 }
 
-// ── Сторінка High Value Tube ────────────────────────────────────────────────
+// ── Сторінка бота ───────────────────────────────────────────────────────────
 
 function Header({ d }: { d: BotPage }) {
   const cfg = d.config;
@@ -202,7 +213,7 @@ function Header({ d }: { d: BotPage }) {
               </Pill>
             )}
           </div>
-          <p style={{ ...p, fontSize: 13 }}>{biasRule(bias, cfg)}</p>
+          <p style={{ ...p, fontSize: 13 }}>{biasRule(bias, cfg, d.bot.mode)}</p>
           {last.detail.note && <p style={{ ...dim, fontSize: 12, color: c.orange }}>{last.detail.note}</p>}
           {stale && <p style={{ ...dim, fontSize: 12, color: c.orange }}>Остання година бота понад 2 години тому: цикл, схоже, не запускався.</p>}
         </>
@@ -210,8 +221,10 @@ function Header({ d }: { d: BotPage }) {
         <p style={dim}>Бот ще не працював: перша година почнеться з найближчим запуском рушія.</p>
       )}
       <p style={{ ...dim, fontSize: 12 }}>
-        Щогодини {cfg.pickN} з {cfg.topN} монет · лімітка на {cfg.entryAtr} ATR 1h від ціни (ближча ÷{cfg.biasRatio}) · стоп {cfg.stopAtr} ATR · тейк {cfg.targetR}R · до{" "}
+        Щогодини {cfg.pickN} з {cfg.topN} монет · {WORD[d.bot.mode].one} на {cfg.entryAtr} ATR 1h від ціни (ближчий ÷{cfg.biasRatio}) · стоп {cfg.stopAtr} ATR · тейк {cfg.targetR}R · до{" "}
         {cfg.maxHoldHours} год · до {cfg.maxPositions} позицій · ризик {d.riskPct}% на угоду
+        {cfg.trendOnly ? " · лише в бік руху" : ""}
+        {cfg.skipNeutral ? " · без ринку без напрямку" : ""}
       </p>
     </section>
   );
@@ -233,7 +246,7 @@ function OrderLine({ o, live, sizing }: { o: Order; live: number | null; sizing:
         <Pill color={STATUS[o.status].color} style={{ fontSize: 11 }}>
           {isPos ? `позиція з ${o.filled_at ? time(o.filled_at) : "—"}` : STATUS[o.status].text}
         </Pill>
-        {o.near !== null && <span style={{ fontSize: 11, color: c.dim }}>{o.near ? "ближча" : "дальня"}</span>}
+        {o.near !== null && <span style={{ fontSize: 11, color: c.dim }}>{o.near ? "ближчий" : "дальній"}</span>}
         {pnl !== null && <span style={{ ...num, marginLeft: "auto", fontWeight: 700, color: tone(pnl) }}>{signed(pnl)}R</span>}
       </div>
       <span style={{ ...num, fontSize: 12, color: c.dim, display: "flex", flexWrap: "wrap", gap: "2px 10px" }}>
@@ -252,7 +265,7 @@ function OrderLine({ o, live, sizing }: { o: Order; live: number | null; sizing:
   );
 }
 
-/** Зараз: робочі лімітки й відкриті позиції, графік «труби» вибраної монети. */
+/** Зараз: робочі ордери й відкриті позиції, графік «труби» вибраної монети. */
 function Now({ d }: { d: BotPage }) {
   const symbols = [...new Set([...(d.last?.detail.chosen ?? []), ...d.active.map((o) => o.symbol)])].filter((s) => d.active.some((o) => o.symbol === s));
   const [sel, setSel] = useState<string | null>(symbols[0] ?? null);
@@ -263,7 +276,7 @@ function Now({ d }: { d: BotPage }) {
     return (
       <section style={card}>
         <h2 style={h2}>Зараз</h2>
-        <p style={dim}>Робочих ліміток і відкритих позицій немає.</p>
+        <p style={dim}>Робочих {WORD[d.bot.mode].gen} і відкритих позицій немає.</p>
       </section>
     );
   }
@@ -284,7 +297,7 @@ function Now({ d }: { d: BotPage }) {
       <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
         <h2 style={h2}>Зараз</h2>
         <span style={{ fontSize: 12, color: c.dim, marginLeft: "auto" }}>
-          ліміток {d.active.filter((o) => o.status === "pending").length} · позицій {d.active.filter((o) => o.status === "open").length}
+          {WORD[d.bot.mode].gen} {d.active.filter((o) => o.status === "pending").length} · позицій {d.active.filter((o) => o.status === "open").length}
         </span>
       </div>
       {symbols.length > 1 && <Segmented options={symbols.map((s) => [s, coin(s)] as [string, string])} value={symbol!} onChange={setSel} size="sm" />}
@@ -301,7 +314,8 @@ function Now({ d }: { d: BotPage }) {
         ))}
       </div>
       <p style={{ ...dim, fontSize: 11 }}>
-        Лімітки знімаються й ставляться заново щогодини за свіжими даними. Виконання паперове: вхід, коли ціна пройшла лімітку, тейк і стоп — за свічками 15m.
+        {WORD[d.bot.mode].Many} знімаються й ставляться заново щогодини за свіжими даними. Виконання паперове:{" "}
+        {d.bot.mode === "breakout" ? "вхід, коли ціна торкнулась стоп-ордера" : "вхід, коли ціна пройшла лімітку"}, тейк і стоп — за свічками 15m.
       </p>
     </section>
   );
@@ -341,6 +355,7 @@ function Ranking({ d }: { d: BotPage }) {
               </span>
             )}
             {r.trend4h && <span>4h {TREND[r.trend4h]}</span>}
+            {r.ema20 !== undefined && <span>{r.price >= r.ema20 ? "▲ над EMA20" : "▼ під EMA20"}</span>}
             {chosen.has(r.symbol) && <span style={{ color: c.violet, fontWeight: 600 }}>у роботі</span>}
           </span>
         </div>
@@ -383,9 +398,9 @@ function SummaryCard({ d }: { d: BotPage }) {
         <Stat label="За часом" value={String(g.timeout)} />
         <Stat label="Середнє" value={g.avgR === null ? "—" : `${signed(g.avgR, 3)}R`} color={g.avgR === null ? undefined : tone(g.avgR)} sub="на угоду" />
         <Stat label="Відкрито" value={String(g.open)} color={c.blue} />
-        <Stat label="Виконалось" value={pct(g.fillRate)} sub={`${g.filled} з ${g.filled + g.cancelled} ліміток`} />
+        <Stat label="Виконалось" value={pct(g.fillRate)} sub={`${g.filled} з ${g.filled + g.cancelled} ${WORD[d.bot.mode].gen}`} />
       </div>
-      <p style={{ ...dim, fontSize: 11 }}>У плюсі — тейк або закриття за часом у плюсі після комісій. Зняті без виконання лімітки зберігаються 30 днів, тож частка виконаних — за останній місяць.</p>
+      <p style={{ ...dim, fontSize: 11 }}>У плюсі — тейк або закриття за часом у плюсі після комісій. Зняті без виконання ордери зберігаються 30 днів, тож частка виконаних — за останній місяць.</p>
     </section>
   );
 }
@@ -429,8 +444,8 @@ function Breakdown({ d }: { d: BotPage }) {
       <GroupLine name="▼ Ведмежий" g={s.byBias.bear} />
       <GroupLine name="• Без напрямку" g={s.byBias.neutral} />
       <span style={{ ...label, marginTop: 4 }}>Правило «{times(d.config.biasRatio)} ближче»</span>
-      <GroupLine name="Ближча лімітка" g={s.byDistance.near} />
-      <GroupLine name="Дальня лімітка" g={s.byDistance.far} />
+      <GroupLine name={WORD[d.bot.mode].near[0]!.toUpperCase() + WORD[d.bot.mode].near.slice(1)} g={s.byDistance.near} />
+      <GroupLine name={WORD[d.bot.mode].far[0]!.toUpperCase() + WORD[d.bot.mode].far.slice(1)} g={s.byDistance.far} />
       {s.bySymbol.length > 0 && (
         <>
           <span style={{ ...label, marginTop: 4 }}>Монети</span>
@@ -449,8 +464,8 @@ function Breakdown({ d }: { d: BotPage }) {
 }
 
 /** Бектест стратегії на історії: ті самі правила й код виконання, що в боті (npm run backtest:tube). */
-function Backtest() {
-  const b = TUBE_BACKTEST;
+function Backtest({ id, mode }: { id: BotId; mode: BotMode }) {
+  const b = BOT_BACKTESTS[id];
   const [open, setOpen] = useState(false);
   const row = (s: (typeof b.periods)[number]) => (
     <div key={s.key} style={{ display: "flex", flexDirection: "column", gap: 2, padding: "6px 0", borderBottom: `1px solid ${c.line}` }}>
@@ -478,7 +493,7 @@ function Backtest() {
         <Stat label="Середнє" value={`${signed(full.avgR, 3)}R`} color={tone(full.avgR)} sub={full.ci ? `95%: ${signed(full.ci[0])}…${signed(full.ci[1])}` : undefined} />
         <Stat label="Разом" value={`${signed(full.totalR, 0)}R`} color={tone(full.totalR)} />
         <Stat label="Просадка" value={`${full.maxDrawdownR.toFixed(0)}R`} color={c.down} />
-        <Stat label="Виконалось" value={pct(full.fillRate)} sub="ліміток" />
+        <Stat label="Виконалось" value={pct(full.fillRate)} sub={WORD[mode].gen} />
       </div>
       <p style={{ ...p, fontSize: 13 }}>{b.verdict}</p>
       <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 52px 44px 64px", gap: 6, fontSize: 11, color: c.faint }}>
@@ -505,13 +520,13 @@ function Backtest() {
   );
 }
 
-function TradeRow({ t }: { t: Trade }) {
+function TradeRow({ t, id, mode }: { t: Trade; id: BotId; mode: BotMode }) {
   const [open, setOpen] = useState(false);
   const [detail, setDetail] = useState<OrderFull | null>(null);
   const [error, setError] = useState<string | null>(null);
   const toggle = () => {
     setOpen(!open);
-    if (!detail && !open) api<OrderFull>(`/api/bots/hvt/orders/${t.id}`).then(setDetail, (e) => setError(String(e)));
+    if (!detail && !open) api<OrderFull>(`/api/bots/${id}/orders/${t.id}`).then(setDetail, (e) => setError(String(e)));
   };
   const side = SIDE[t.side];
   const o = OUTCOME[t.outcome];
@@ -555,7 +570,7 @@ function TradeRow({ t }: { t: Trade }) {
         </span>
         <span style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center", fontSize: 11, color: c.dim }}>
           <span style={{ color: BIAS[t.bias].color }}>ринок {BIAS[t.bias].text}</span>
-          {t.near !== null && <span>· {t.near ? "ближча" : "дальня"} лімітка</span>}
+          {t.near !== null && <span>· {t.near ? WORD[mode].near : WORD[mode].far}</span>}
           <span>· №{t.rank} за рухом</span>
           <span style={{ marginLeft: "auto", color: c.blue }}>{open ? "▴" : "▾"}</span>
         </span>
@@ -568,7 +583,7 @@ function TradeRow({ t }: { t: Trade }) {
             <Skeleton height={60} />
           ) : (
             <p style={{ ...num, ...dim, fontSize: 12 }}>
-              Поставлено {day(detail.created_at)} о {time(detail.created_at)} за ціни {fmtPrice(detail.price)} · лімітка на {detail.body.offsetAtr} ATR від ціни · ATR 1h{" "}
+              Поставлено {day(detail.created_at)} о {time(detail.created_at)} за ціни {fmtPrice(detail.price)} · {WORD[mode].one} на {detail.body.offsetAtr} ATR від ціни · ATR 1h{" "}
               {fmtPrice(f.atr)} ({f.atrPct.toFixed(2)}%) · активність ×{f.volRatio === null ? "—" : f.volRatio.toFixed(2)}
               {f.rsi !== null ? ` · RSI 1h ${Math.round(f.rsi)}` : ""}
               {f.trend4h ? ` · тренд 4h ${TREND[f.trend4h]}` : ""} · стоп {Math.abs(distPct(t.entry, t.stop)).toFixed(2)}%, тейк {Math.abs(distPct(t.entry, t.target)).toFixed(2)}%
@@ -581,7 +596,7 @@ function TradeRow({ t }: { t: Trade }) {
   );
 }
 
-function Trades({ trades }: { trades: Trade[] }) {
+function Trades({ trades, id, mode }: { trades: Trade[]; id: BotId; mode: BotMode }) {
   const [limit, setLimit] = useState(40);
   const days: { day: string; rows: Trade[] }[] = [];
   for (const t of trades.slice(0, limit)) {
@@ -593,12 +608,12 @@ function Trades({ trades }: { trades: Trade[] }) {
   return (
     <section style={card}>
       <h2 style={h2}>Угоди</h2>
-      {!trades.length && <p style={dim}>За цей період жодна лімітка не виконалась.</p>}
+      {!trades.length && <p style={dim}>За цей період жоден ордер не виконався.</p>}
       {days.map((d) => (
         <div key={d.day} style={{ display: "flex", flexDirection: "column" }}>
           <span style={{ ...label, paddingTop: 8 }}>{d.day}</span>
           {d.rows.map((t) => (
-            <TradeRow key={t.id} t={t} />
+            <TradeRow key={t.id} t={t} id={id} mode={mode} />
           ))}
         </div>
       ))}
@@ -611,7 +626,7 @@ function Trades({ trades }: { trades: Trade[] }) {
   );
 }
 
-function Cycles({ cycles }: { cycles: Cycle[] }) {
+function Cycles({ cycles, mode }: { cycles: Cycle[]; mode: BotMode }) {
   const [open, setOpen] = useState(false);
   if (!cycles.length) return null;
   return (
@@ -633,7 +648,7 @@ function Cycles({ cycles }: { cycles: Cycle[] }) {
                 {x.bias && <span style={{ color: BIAS[x.bias].color, marginLeft: "auto" }}>{BIAS[x.bias].text}</span>}
               </span>
               <span style={{ ...num, color: c.dim }}>
-                ліміток {x.placed} · виконалось {r.filled} · тейк {r.target} · стоп {r.stop} · за часом {r.timeout} · знято {r.cancelled} · позицій {x.open}
+                {WORD[mode].gen} {x.placed} · виконалось {r.filled} · тейк {r.target} · стоп {r.stop} · за часом {r.timeout} · знято {r.cancelled} · позицій {x.open}
               </span>
               {(x.note || x.error) && <span style={{ color: c.orange }}>{x.note ?? x.error}</span>}
             </div>
@@ -646,20 +661,20 @@ function Cycles({ cycles }: { cycles: Cycle[] }) {
 type Period = "all" | "30" | "7";
 const PERIODS: [Period, string][] = [["all", "Увесь час"], ["30", "30 днів"], ["7", "7 днів"]];
 
-/** Сторінка бота High Value Tube: що він робить зараз, як торгував, бектест і кожна угода. */
-function TubeBot({ onBack }: { onBack: () => void }) {
+/** Сторінка бота: що він робить зараз, як торгував, бектест і кожна угода. */
+function BotView({ id, onBack }: { id: BotId; onBack: () => void }) {
   const [period, setPeriod] = useState<Period>("all");
   const [data, setData] = useState<BotPage | null>(null);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
-    api<BotPage>(`/api/bots/hvt?period=${period}`).then(
+    api<BotPage>(`/api/bots/${id}?period=${period}`).then(
       (d) => {
         setData(d);
         setError(null);
       },
       (e) => setError(String(e)),
     );
-  }, [period]);
+  }, [id, period]);
   const curve = (data?.trades ?? [])
     .filter((t) => t.net_r !== null)
     .map((t) => ({ r: t.net_r!, at: t.resolved_at ?? t.created_at, symbol: t.symbol }))
@@ -685,12 +700,14 @@ function TubeBot({ onBack }: { onBack: () => void }) {
           <SummaryCard d={data} />
           <EquityCurve trades={curve} title="Крива результату бота" />
           <Breakdown d={data} />
-          <Backtest />
-          <Trades trades={data.trades} />
-          <Cycles cycles={data.cycles} />
+          <Backtest id={id} mode={data.bot.mode} />
+          <Trades trades={data.trades} id={id} mode={data.bot.mode} />
+          <Cycles cycles={data.cycles} mode={data.bot.mode} />
           <p style={{ ...dim, fontSize: 11 }}>
-            Паперова торгівля: ордери на біржу не йдуть, торгових ключів немає. Виконання рахує код за свічками 15m Bybit; лімітка виконується, лише коли ціна її пройшла, у
-            свічці входу тейк не зараховується. R — після комісій (вхід і тейк maker, стоп і закриття за часом taker).
+            Паперова торгівля: ордери на біржу не йдуть, торгових ключів немає. Виконання рахує код за свічками 15m Bybit;{" "}
+            {data.bot.mode === "breakout"
+              ? "стоп-ордер спрацьовує, коли ціна торкнулась ціни входу, у свічці входу тейк не зараховується. R — після комісій (вхід і стоп за ринком — taker, тейк — maker)."
+              : "лімітка виконується, лише коли ціна її пройшла, у свічці входу тейк не зараховується. R — після комісій (вхід і тейк maker, стоп і закриття за часом taker)."}
           </p>
         </>
       )}
