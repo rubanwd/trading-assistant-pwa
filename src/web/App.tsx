@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { Reports } from "./Reports";
 import { AiSettings } from "./Ai";
+import { Bots } from "./Bots";
 import { PickHistory } from "./PickHistory";
 import { Settings } from "./Settings";
 import { Signals } from "./Signals";
@@ -9,9 +10,9 @@ import { Today } from "./Today";
 import { c, DeskContext, getDesk, OFFLINE_EVENT, p, setDesk as storeDesk, time } from "./ui";
 import { DESK_LABEL, DESKS, type Desk } from "../shared/desk";
 
-type Tab = "today" | "signals" | "reports" | "stats" | "settings" | "ai" | "picks";
-const NAV: Exclude<Tab, "settings" | "ai" | "picks">[] = ["today", "signals", "reports", "stats"];
-const TABS: Record<Tab, string> = { today: "Сьогодні", signals: "Сигнали", reports: "Звіти", stats: "Статистика", settings: "Налаштування", ai: "Моделі ШІ", picks: "Історія ідей" };
+type Tab = "today" | "signals" | "bots" | "reports" | "stats" | "settings" | "ai" | "picks";
+const NAV: Exclude<Tab, "settings" | "ai" | "picks">[] = ["today", "signals", "bots", "reports", "stats"];
+const TABS: Record<Tab, string> = { today: "Сьогодні", signals: "Сигнали", bots: "Боти", reports: "Звіти", stats: "Статистика", settings: "Налаштування", ai: "Моделі ШІ", picks: "Історія ідей" };
 
 /** Іконки нижньої панелі: прості лінії, колір бере від тексту кнопки. */
 const ICON: Record<Exclude<Tab, "settings" | "ai" | "picks">, ReactNode> = {
@@ -30,6 +31,12 @@ const ICON: Record<Exclude<Tab, "settings" | "ai" | "picks">, ReactNode> = {
     </>
   ),
   stats: <path d="M4 20V10M10 20V4M16 20v-7M22 20H2" />,
+  bots: (
+    <>
+      <rect x="5" y="8" width="14" height="11" rx="3" />
+      <path d="M12 8V4M9 13h.01M15 13h.01M9.5 16h5" />
+    </>
+  ),
 };
 
 function HeaderButton({ onClick, label, children }: { onClick: () => void; label: string; children: ReactNode }) {
@@ -103,7 +110,9 @@ export function App() {
   const query = new URLSearchParams(location.search);
   const initialReport = Number(query.get("report")) || null;
   const initialSignal = Number(query.get("signal")) || null;
-  const [tab, setTab] = useState<Tab>(initialSignal ? "signals" : initialReport ? "reports" : "today");
+  const initialBot = query.get("bot");
+  const [tab, setTab] = useState<Tab>(initialSignal ? "signals" : initialReport ? "reports" : initialBot ? "bots" : "today");
+  const [botId, setBotId] = useState<string | null>(initialBot);
   const [reportId, setReportId] = useState<number | null>(initialReport);
   const [signalId, setSignalId] = useState<number | null>(initialSignal);
   const [desk, setDeskState] = useState<Desk>(getDesk);
@@ -114,7 +123,13 @@ export function App() {
     setDeskState(d);
     setSignalId(null);
     setReportId(null);
+    setBotId(null);
     history.replaceState(null, "", "/");
+  };
+  const openBot = (id: string | null) => {
+    setBotId(id);
+    history.replaceState(null, "", id ? `/?bot=${id}` : "/");
+    window.scrollTo(0, 0);
   };
 
   const open = (kind: "report" | "signal", id: number | null) => {
@@ -174,6 +189,7 @@ export function App() {
         <DeskContext.Provider value={desk} key={desk}>
           {tab === "today" && <Today onOpenReport={(id) => open("report", id)} onOpenSignal={(id) => open("signal", id)} onOpenPicks={() => go("picks")} />}
           {tab === "signals" && <Signals openId={signalId} onOpen={(id) => open("signal", id)} />}
+          {tab === "bots" && <Bots openId={botId} onOpen={openBot} />}
           {tab === "reports" && <Reports openId={reportId} onOpen={(id) => open("report", id)} />}
           {tab === "stats" && <Stats onOpenPicks={() => go("picks")} />}
           {tab === "picks" && <PickHistory onBack={() => go("today")} />}
@@ -204,6 +220,7 @@ export function App() {
               history.replaceState(null, "", "/");
               if (t === "signals") setSignalId(null);
               if (t === "reports") setReportId(null);
+              if (t === "bots") setBotId(null);
             }}
             style={{
               flex: 1,

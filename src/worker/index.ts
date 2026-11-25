@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import type { ReportBody } from "./engine";
+import type { ReportBody, TubeCycleDetail } from "./engine";
 import { checkAccess } from "./access";
 import { engineStub, type Env } from "./env";
 import { parseSubscription } from "./push";
@@ -11,6 +11,8 @@ import { calibration, hit, loadStats } from "./stats";
 import { netR, outcome, summarize, type PickRecord } from "./pickStats";
 import type { Fees } from "../shared/risk";
 import { CRYPTO_LEADER, parseDesk, STOCKS_LEADER_DEFAULT, type Desk } from "../shared/desk";
+import { BOTS, isBotId, tubeConfig, TUBE_KEYS } from "../shared/bots";
+import { netR as tubeNetR, outcomeOf, tubeGroup, tubeSummarize, type TubeRecord } from "./bots/tubeStats";
 
 export { Engine } from "./engine";
 
@@ -510,6 +512,82 @@ app.get("/api/picks/:id{[0-9]+}", async (c) => {
   const row = await c.env.DB.prepare("SELECT * FROM picks WHERE id = ?").bind(Number(c.req.param("id"))).first<PickRow>();
   if (!row) return c.json({ error: "not found" }, 404);
   return c.json({ ...row, body: JSON.parse(row.body) });
+});
+
+// ── Боти ───────────────────────────────────────────────────────────────────
+
+/** Ордери бота за період, від нових. Зняті без виконання лімітки зберігаються лише retention_days. */
+const BOT_ORDERS = `
+  SELECT id, created_at, symbol, side, bias, near, rank, price, entry, stop, target, status, filled_at, resolved_at, exit_price, result_r, fee_r
+  FROM bot_orders WHERE bot = ? AND created_at >= ? ORDER BY id DESC LIMIT ?`;
+
+/** Останні години бота з журналу запусків. */
+async function botCycles(db: D1Database, limit: number): Promise<{ at: string; status: string; error: string | null; detail: TubeCycleDetail }[]> {
+  const rows = await db
+    .prepare("SELECT started_at, status, error, detail FROM runs WHERE kind = 'bot' AND json_extract(detail, '$.bot') = 'hvt' ORDER BY id DESC LIMIT ?")
+    .bind(limit)
+    .all<{ started_at: string; status: string; error: string | null; detail: string }>();
+  return rows.results.map((r) => ({ at: r.started_at, status: r.status, error: r.error, detail: JSON.parse(r.detail) as TubeCycleDetail }));
+}
+
+/** Список ботів: назва, стан і підсумок за 30 днів. */
+app.get("/api/bots", async (c) => {
+  const db = c.env.DB;
+  const since = new Date(Date.now() - 30 * 86_400_000).toISOString();
+  const [rows, cycles, opts] = await Promise.all([db.prepare(BOT_ORDERS).bind("hvt", since, 20000).all<TubeRecord>(), botCycles(db, 1), settingValues(db, ["tube_enabled"])]);
+  const last = cycles[0] ?? null;
+  return c.json({
+    bots: BOTS.map((b) => ({
+      ...b,
+      enabled: opts.tube_enabled !== "off",
+      stats30: tubeGroup(rows.results),
+      lastCycle: last ? { at: last.at, bias: last.detail.bias, chosen: last.detail.chosen, placed: last.detail.placed, open: last.detail.open, note: last.detail.note } : null,
+    })),
+  });
+});
+
+/**
+ * Сторінка бота: налаштування, остання година (рейтинг монет, напрямок ринку), робочі лімітки й позиції,
+ * підсумки й угоди за період. period=all | 7 | 30 | 90 (днів).
+ */
+app.get("/api/bots/:id", async (c) => {
+  const id = c.req.param("id");
+  if (!isBotId(id)) return c.json({ error: "not found" }, 404);
+  const period = c.req.query("period") ?? "all";
+  const days = period === "all" ? null : Number(period);
+  if (days !== null && ![7, 30, 90].includes(days)) return c.json({ error: "period must be all, 7, 30 or 90" }, 400);
+  const db = c.env.DB;
+  const since = days === null ? "" : new Date(Date.now() - days * 86_400_000).toISOString();
+  const keys = [...Object.values(TUBE_KEYS), "tube_enabled", "risk_per_trade_pct", "deposit_usd", "fee_maker_pct", "fee_taker_pct"];
+  const [rows, cycles, values, active] = await Promise.all([
+    db.prepare(BOT_ORDERS).bind(id, since, 50000).all<TubeRecord>(),
+    botCycles(db, 24),
+    settingValues(db, keys),
+    db.prepare("SELECT * FROM bot_orders WHERE bot = ? AND status IN ('pending', 'open') ORDER BY rank, symbol, side").bind(id).all<TubeRecord & { body: string }>(),
+  ]);
+  const trades = rows.results.filter((r) => r.filled_at !== null);
+  return c.json({
+    bot: BOTS.find((b) => b.id === id),
+    enabled: values.tube_enabled !== "off",
+    config: tubeConfig(values),
+    riskPct: typeof values.risk_per_trade_pct === "number" ? values.risk_per_trade_pct : 0.5,
+    depositUsd: typeof values.deposit_usd === "number" ? values.deposit_usd : null,
+    from: since || null,
+    last: cycles[0] ?? null,
+    cycles: cycles.map((x) => ({ at: x.at, status: x.status, error: x.error, bias: x.detail.bias, chosen: x.detail.chosen, placed: x.detail.placed, resolved: x.detail.resolved, open: x.detail.open, note: x.detail.note })),
+    active: active.results.map((r) => ({ ...r, body: JSON.parse(r.body) })),
+    summary: tubeSummarize(rows.results),
+    trades: trades.map((r) => ({ ...r, outcome: outcomeOf(r), net_r: tubeNetR(r) })),
+  });
+});
+
+/** Один ордер бота з ознаками монети в момент постановки. */
+app.get("/api/bots/:id/orders/:order{[0-9]+}", async (c) => {
+  const row = await c.env.DB.prepare("SELECT * FROM bot_orders WHERE bot = ? AND id = ?")
+    .bind(c.req.param("id"), Number(c.req.param("order")))
+    .first<TubeRecord & { body: string }>();
+  if (!row) return c.json({ error: "not found" }, 404);
+  return c.json({ ...row, body: JSON.parse(row.body), outcome: outcomeOf(row), net_r: tubeNetR(row) });
 });
 
 /** Публічний ключ VAPID для підписки в браузері. */

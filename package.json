@@ -12,6 +12,7 @@
     "db:migrate": "wrangler d1 migrations apply trading-assistant --remote",
     "deploy:ci": "wrangler d1 migrations apply trading-assistant --remote && wrangler deploy",
     "backtest": "tsx scripts/backtest.ts",
+    "backtest:tube": "tsx scripts/tube-backtest.ts",
     "patterns": "tsx scripts/patterns.ts"
   },
   "dependencies": {

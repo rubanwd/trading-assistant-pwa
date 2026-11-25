@@ -1,3 +1,5 @@
+import { TUBE_BIAS_SIDES, TUBE_LIMITS } from "./bots";
+
 /**
  * Схема налаштувань: перевірка значень для API і підписи для екрана «Налаштування».
  * Значення лежать у таблиці settings як JSON; рушій читає їх на кожному запуску, тож зміни діють без деплою.
@@ -7,7 +9,7 @@ export type Check = (v: unknown) => { ok: true; value: unknown } | { ok: false; 
 
 export interface SettingSpec {
   key: string;
-  group: "Ризик" | "Сигнали" | "Звіти й сповіщення" | "Ринок" | "Акції" | "Модель і дані";
+  group: "Ризик" | "Сигнали" | "Боти" | "Звіти й сповіщення" | "Ринок" | "Акції" | "Модель і дані";
   label: string;
   help?: string;
   kind: "number" | "nullable-number" | "clock" | "quiet" | "report-times" | "symbols" | "symbol" | "macro" | "feeds" | "enum" | "timezone";
@@ -26,6 +28,12 @@ function num(min: number, max: number, integer = false): Check {
     return ok(v);
   };
 }
+
+/** Числове поле бота з межами з TUBE_LIMITS. */
+const tubeNum = (field: keyof typeof TUBE_LIMITS): Check => {
+  const l = TUBE_LIMITS[field];
+  return num(l.min, l.max, l.integer);
+};
 
 const nullable = (inner: Check): Check => (v) => (v === null ? ok(null) : inner(v));
 
@@ -82,6 +90,33 @@ export const SETTINGS: SettingSpec[] = [
   { key: "signal_max_hold_hours", group: "Сигнали", label: "Найдовше тримати позицію, год", help: "Позицію закриває стоп, вихід за каналом 4h або цей ліміт. Коротший ліміт швидше звільняє місце для нових сигналів: у бектесті 120 год дали більше сигналів без втрати середнього результату. Не більше 480 год: супровід іде за свічками 1h, а кеш тримає ~20 днів.", kind: "number", check: num(4, 480) },
   { key: "pick_enabled", group: "Сигнали", label: "Ідея скану", help: "Щопів години одна монета, напрямок і вхід, найкращі за технічним аналізом і на думку агента «Ідея скану». Це не сигнал: без скептика й сповіщень.", kind: "enum", options: ["on", "off"], check: onOff },
   { key: "pick_horizon_hours", group: "Сигнали", label: "Горизонт ідеї скану, год", help: "За цей час ціна має дійти до цілі 2R раніше за стоп; інакше ідея закривається за часом. Лімітний вхід, що не виконався за цей час, скасовується.", kind: "number", check: num(4, 96) },
+  {
+    key: "tube_enabled",
+    group: "Боти",
+    label: "High Value Tube",
+    help: "Паперова торгівля: щогодини 3 найрухливіші монети з топ-20 за капіталізацією, по лімітці в лонг і шорт з тейком і стопом. Ордери на біржу не йдуть. Вимкнений бот знімає лімітки, а відкриті позиції веде до закриття.",
+    kind: "enum",
+    options: ["on", "off"],
+    check: onOff,
+  },
+  { key: "tube_top_n", group: "Боти", label: "Монет у списку бота", help: "Топ за капіталізацією (CoinGecko) з контрактом на Bybit, без стейблкоїнів і золота.", kind: "number", check: tubeNum("topN") },
+  { key: "tube_pick_n", group: "Боти", label: "Найрухливіших монет щогодини", kind: "number", check: tubeNum("pickN") },
+  { key: "tube_entry_atr", group: "Боти", label: "Відстань лімітки, ATR 1h", help: "На скільки ATR(14) 1h від ціни стоїть дальня лімітка: лонг нижче, шорт вище.", kind: "number", check: tubeNum("entryAtr") },
+  { key: "tube_bias_ratio", group: "Боти", label: "У скільки разів ближча лімітка ближче", help: "Коли ринок бичачий або ведмежий, одна з двох ліміток стоїть ближче до ціни. 2 — удвічі ближче, 1 — однаково.", kind: "number", check: tubeNum("biasRatio") },
+  {
+    key: "tube_bias_side",
+    group: "Боти",
+    label: "Яка лімітка ближче",
+    help: "counter — проти ринку: у бичачому ринку шорт удвічі ближче за лонг, у ведмежому лонг удвічі ближче за шорт (як задано). trend — навпаки, за ринком. off — обидві однаково.",
+    kind: "enum",
+    options: TUBE_BIAS_SIDES,
+    check: (v) => (TUBE_BIAS_SIDES.includes(v as never) ? ok(v) : fail(TUBE_BIAS_SIDES.join(", "))),
+  },
+  { key: "tube_stop_atr", group: "Боти", label: "Стоп, ATR 1h від входу", kind: "number", check: tubeNum("stopAtr") },
+  { key: "tube_target_r", group: "Боти", label: "Тейк-профіт, R", help: "Частки відстані до стопа: 1 — тейк на тій самій відстані, що й стоп.", kind: "number", check: tubeNum("targetR") },
+  { key: "tube_min_stop_pct", group: "Боти", label: "Стоп бота не ближче, % від входу", kind: "number", check: tubeNum("minStopPct") },
+  { key: "tube_max_hold_hours", group: "Боти", label: "Найдовше тримати позицію бота, год", help: "Позиція, що не дійшла ні до тейка, ні до стопа, закривається за ринком.", kind: "number", check: tubeNum("maxHoldHours") },
+  { key: "tube_max_positions", group: "Боти", label: "Позицій бота не більше", help: "Відкриті позиції разом із новими лімітками. Ризик кожної — ризик на угоду з групи «Ризик».", kind: "number", check: tubeNum("maxPositions") },
   { key: "signal_cooldown_hours", group: "Сигнали", label: "Пауза для того самого сетапу по монеті, год", kind: "number", check: num(0, 72) },
   { key: "macro_blackout_hours", group: "Сигнали", label: "Без нових сигналів до макроподії, год", kind: "number", check: num(0, 24) },
   {

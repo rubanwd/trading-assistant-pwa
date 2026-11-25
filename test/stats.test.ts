@@ -151,6 +151,8 @@ describe("налаштування", () => {
       watchlist: ["BTCUSDT", "ETHUSDT"], news_feeds: [{ source: "coindesk", url: "https://www.coindesk.com/arc/outboundfeeds/rss" }],
       stocks_enabled: "on", stocks_benchmark: "SPYUSDT", stocks_watchlist: ["SPYUSDT", "AAPLUSDT"], stocks_report_times: { morning: "16:00", evening: "23:15" },
       stocks_news_feeds: [{ source: "marketwatch", url: "https://feeds.content.dowjones.io/public/rss/mw_topstories" }],
+      tube_enabled: "on", tube_top_n: 20, tube_pick_n: 3, tube_entry_atr: 1, tube_bias_ratio: 2, tube_bias_side: "counter", tube_stop_atr: 3,
+      tube_target_r: 0.5, tube_min_stop_pct: 0.5, tube_max_hold_hours: 12, tube_max_positions: 6,
     };
     expect(validateSettings(defaults).errors).toEqual({});
     expect(SETTINGS.map((s) => s.key).sort()).toEqual(Object.keys(defaults).sort());

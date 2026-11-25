@@ -17,6 +17,9 @@ import {
   type Pipeline,
   type Transport,
 } from "./llm";
+import { TUBE_FALLBACK, tubeConfig, type TubeConfig } from "../shared/bots";
+import { planCycle, resolveTube, TUBE_H1_LIMIT, TUBE_H4_LIMIT, tubeFeatures, tubeFeeR, type CyclePlan, type TubeFeatures, type TubeStatus } from "./bots/tube";
+import { marketCaps, topUniverse } from "./bots/universe";
 import { choosePick, PICK_SCHEMA, PICK_SYSTEM, pickInput, rankPicks, resolvePick, sanitizePick, type PickAi, type PickOption } from "./pick";
 import { loadStats } from "./stats";
 import { sanitizeWeekly, WEEKLY_SCHEMA, WEEKLY_SYSTEM, weeklyBody, weeklyInput, type WeeklyReview } from "./weekly";
@@ -52,7 +55,7 @@ import {
 } from "./signals/review";
 import { replay, type EventType } from "./signals/track";
 import { SETUP_NAME, type Candidate, type SetupId, type SignalStatus } from "./signals/types";
-import type { Snapshot } from "./snapshot";
+import { timeframeFeatures, type Snapshot } from "./snapshot";
 import { clock, dueReports, dueWeekly, inQuietHours, localTime, type ReportKind, type ReportTimes } from "./time";
 
 export interface ProbeTarget {
@@ -84,7 +87,8 @@ interface PipelineState {
   startedAt: number;
   desks: Partial<Record<Desk, DeskState>>;
   /**
-   * Черга кроків. Для кожного режиму: scan:<desk>:N, scan:<desk>:done, news:<desk>, signals:<desk>, review:<desk>:N, pick:<desk>;
+   * Черга кроків. Раз на годину першими йдуть кроки ботів: bot:<id>:universe, bot:<id>:data:N, bot:<id>:run.
+   * Для кожного режиму: scan:<desk>:N, scan:<desk>:done, news:<desk>, signals:<desk>, review:<desk>:N, pick:<desk>;
    * потім forecasts, reports:<desk>, weekly:<desk>, cleanup.
    */
   steps: string[];
@@ -168,6 +172,67 @@ interface SignalRow {
 
 const HOUR = 3_600_000;
 const SIDE_NAME = { long: "лонг", short: "шорт" } as const;
+
+const BOT_CHUNK = 5;
+/** Ідентифікатор бота High Value Tube у таблиці bot_orders і в кроках циклу. */
+const TUBE = "hvt";
+/** Невиконана лімітка живе годину: до наступного циклу бота. */
+const ORDER_TTL_MS = HOUR;
+
+/** Список монет бота в сховищі рушія. */
+interface BotUniverse {
+  /** Коли список востаннє вдалося оновити; 0 — ще ніколи. */
+  at: number;
+  symbols: string[];
+  source: "coingecko" | "fallback";
+  error?: string;
+}
+
+interface BotPart {
+  features: TubeFeatures[];
+  errors: string[];
+}
+
+interface BotActiveRow {
+  id: number;
+  created_at: string;
+  symbol: string;
+  side: "long" | "short";
+  entry: number;
+  stop: number;
+  target: number;
+  expires_at: string;
+  max_hold_hours: number;
+  status: "pending" | "open";
+  filled_at: string | null;
+}
+
+/** Тіло ордера бота в bot_orders.body. */
+export interface TubeOrderBody {
+  v: 1;
+  /** Ознаки монети в момент постановки. */
+  features: TubeFeatures;
+  offsetAtr: number;
+  market: MarketRegime;
+  cfg: Pick<TubeConfig, "entryAtr" | "biasRatio" | "biasSide" | "stopAtr" | "targetR" | "minStopPct">;
+}
+
+/** Підсумок години бота в runs.detail (kind = 'bot'). */
+export interface TubeCycleDetail {
+  bot: string;
+  bias: CyclePlan["bias"] | null;
+  market: MarketRegime | null;
+  universe: { source: string; at: string | null; size: number; error: string | null };
+  ranked: Pick<TubeFeatures, "symbol" | "price" | "atrPct" | "volRatio" | "score" | "trend4h" | "change24hPct">[];
+  chosen: string[];
+  placed: number;
+  skipped: CyclePlan["skipped"];
+  resolved: Record<"filled" | "target" | "stop" | "timeout" | "cancelled", number>;
+  open: number;
+  note: string | null;
+  errors: string[];
+}
+
 const coin = (symbol: string) => symbol.replace(/USDT$/, "");
 const REPORT_TITLE: Record<ReportKind, string> = { morning: "Ранковий звіт готовий", evening: "Вечірній звіт готовий" };
 /** Префікс сповіщень режиму акцій: крипто лишається як було. */
@@ -213,7 +278,8 @@ export class Engine extends DurableObject<Env> {
     if (await this.busy()) return { queued: false };
     this.settingsCache = null;
     const desks: PipelineState["desks"] = {};
-    const steps: string[] = [];
+    // Бот іде першим: ордери години ставляться якомога ближче до закриття свічки 1h.
+    const steps: string[] = await this.botSteps(now);
     const active = await this.activeDesks();
     for (const desk of active) {
       const leader = await this.leader(desk);
@@ -263,6 +329,7 @@ export class Engine extends DurableObject<Env> {
 
   private async runStep(step: string, state: PipelineState): Promise<void> {
     const now = Date.now();
+    if (step.startsWith("bot:")) return this.runBotStep(step, now);
     const [name, deskArg, arg] = step.split(":");
     const desk = parseDesk(deskArg);
     const ds = state.desks[desk];
@@ -1444,6 +1511,216 @@ export class Engine extends DurableObject<Env> {
     if (statements.length) await db.batch(statements);
   }
 
+  // ── Боти ─────────────────────────────────────────────────────────────────
+
+  private botMarketCache: MarketData | null = null;
+
+  /**
+   * Свічки Bybit для ботів. Окремий простір у кеші рушія: скан крипто може брати свічки з Binance,
+   * а ті самі символи двох бірж змішувати не можна.
+   */
+  private botMarket(): MarketData {
+    this.botMarketCache ??= new CachedMarket(
+      new BybitLinear(this.http, undefined, undefined, () => this.requests < 40),
+      new SqlCandleStorage(this.ctx.storage.sql, "bybit:"),
+    );
+    return this.botMarketCache;
+  }
+
+  private async tubeCfg(): Promise<TubeConfig> {
+    return tubeConfig(Object.fromEntries(await this.settingsMap()));
+  }
+
+  /**
+   * Кроки бота High Value Tube: раз на годину (перший цикл нової години UTC). Вимкнений бот лише знімає лімітки
+   * й доводить відкриті позиції до закриття.
+   */
+  private async botSteps(now: number): Promise<string[]> {
+    const last = await this.ctx.storage.get<number>(`bot-last:${TUBE}`);
+    if (last !== undefined && Math.floor(last / HOUR) === Math.floor(now / HOUR)) return [];
+    if ((await this.setting("tube_enabled", "on")) === "off") return [`bot:${TUBE}:run`];
+    const cfg = await this.tubeCfg();
+    return [`bot:${TUBE}:universe`, ...Array.from({ length: Math.ceil(cfg.topN / BOT_CHUNK) }, (_, i) => `bot:${TUBE}:data:${i}`), `bot:${TUBE}:run`];
+  }
+
+  private async runBotStep(step: string, now: number): Promise<void> {
+    const [, bot, phase, arg] = step.split(":");
+    if (bot !== TUBE) return;
+    if (phase === "universe") return this.tubeUniverse(now);
+    if (phase === "data") return this.tubeData(Number(arg), now);
+    if (phase === "run") return this.tubeRun(now);
+  }
+
+  /**
+   * Список монет бота: топ за капіталізацією з CoinGecko, що мають контракт на Bybit. Оновлюється раз на добу;
+   * якщо джерело недоступне, бот працює зі старим списком або зі стартовим і пробує знову за годину.
+   */
+  private async tubeUniverse(now: number): Promise<void> {
+    const cfg = await this.tubeCfg();
+    const key = `bot-universe:${TUBE}`;
+    const cached = await this.ctx.storage.get<BotUniverse>(key);
+    if (cached?.source === "coingecko" && now - cached.at < 24 * HOUR && cached.symbols.length >= cfg.topN) return;
+    try {
+      const [caps, instruments] = await Promise.all([marketCaps(this.http, this.env.COINGECKO_API_KEY), new BybitLinear(this.http).linearUsdt()]);
+      const symbols = topUniverse(caps, instruments, cfg.topN);
+      if (symbols.length < Math.min(cfg.topN, 5)) throw new Error(`знайдено лише ${symbols.length} монет з контрактом на Bybit`);
+      await this.ctx.storage.put<BotUniverse>(key, { at: now, symbols, source: "coingecko" });
+    } catch (e) {
+      const symbols = cached?.symbols.length ? cached.symbols : TUBE_FALLBACK.slice(0, cfg.topN);
+      await this.ctx.storage.put<BotUniverse>(key, { at: cached?.at ?? 0, symbols, source: cached?.source ?? "fallback", error: String(e).slice(0, 300) });
+    }
+  }
+
+  /** Частина списку: свічки 1h і 4h з Bybit (через кеш) і ознаки монет; результат чекає на крок run. */
+  private async tubeData(index: number, now: number): Promise<void> {
+    const cfg = await this.tubeCfg();
+    const universe = await this.ctx.storage.get<BotUniverse>(`bot-universe:${TUBE}`);
+    const symbols = (universe?.symbols ?? TUBE_FALLBACK).slice(0, cfg.topN).slice(index * BOT_CHUNK, (index + 1) * BOT_CHUNK);
+    const market = this.botMarket();
+    const part: BotPart = { features: [], errors: [] };
+    // Не більше трьох монет одночасно, як у скані: спільні IP Cloudflare легко впираються в ліміт частоти Bybit.
+    for (let i = 0; i < symbols.length; i += 3) {
+      await Promise.all(
+        symbols.slice(i, i + 3).map(async (symbol) => {
+          try {
+            const [h1, h4] = await Promise.all([market.candles(symbol, "1h", TUBE_H1_LIMIT), market.candles(symbol, "4h", TUBE_H4_LIMIT)]);
+            const f = tubeFeatures(symbol, h1, h4.length ? timeframeFeatures(h4) : null);
+            // Свіжа свічка 1h: інакше торги контрактом зупинено.
+            if (f && f.closedAt >= now - 2 * HOUR) part.features.push(f);
+            else part.errors.push(`${symbol}: немає свіжих свічок 1h`);
+          } catch (e) {
+            part.errors.push(`${symbol}: ${String(e)}`.slice(0, 200));
+          }
+        }),
+      );
+    }
+    await this.ctx.storage.put(`bot-part:${TUBE}:${index}`, part);
+  }
+
+  /**
+   * Година бота: спершу код рахує, що сталося з ордерами минулої години й відкритими позиціями (свічки 15m),
+   * знімає невиконані лімітки, потім ставить нові для 3 найрухливіших монет. Ордери паперові: на біржу нічого не йде.
+   */
+  private async tubeRun(now: number): Promise<void> {
+    const started = Date.now();
+    const db = this.env.DB;
+    const values = Object.fromEntries(await this.settingsMap());
+    const cfg = tubeConfig(values);
+    const enabled = values.tube_enabled !== "off";
+    const feeNum = (v: unknown, fallback: number) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : fallback);
+    const fees: Fees = { makerPct: feeNum(values.fee_maker_pct, 0.02), takerPct: feeNum(values.fee_taker_pct, 0.05) };
+    await this.ctx.storage.put(`bot-last:${TUBE}`, now);
+
+    // 1. Супровід: лімітки минулої години й відкриті позиції.
+    const active = await db
+      .prepare("SELECT id, created_at, symbol, side, entry, stop, target, expires_at, max_hold_hours, status, filled_at FROM bot_orders WHERE bot = ? AND status IN ('pending', 'open') ORDER BY id")
+      .bind(TUBE)
+      .all<BotActiveRow>();
+    const market = this.botMarket();
+    const update = db.prepare("UPDATE bot_orders SET status = ?, filled_at = ?, resolved_at = ?, exit_price = ?, result_r = ?, fee_r = ? WHERE id = ?");
+    const statements: D1PreparedStatement[] = [];
+    const resolved: Record<"filled" | "target" | "stop" | "timeout" | "cancelled", number> = { filled: 0, target: 0, stop: 0, timeout: 0, cancelled: 0 };
+    const open: { symbol: string; side: "long" | "short" }[] = [];
+    const errors: string[] = [];
+    const iso = (t: number | null) => (t === null ? null : new Date(t).toISOString());
+    const bySymbol = new Map<string, BotActiveRow[]>();
+    for (const row of active.results) bySymbol.set(row.symbol, [...(bySymbol.get(row.symbol) ?? []), row]);
+    for (const [symbol, rows] of bySymbol) {
+      let m15: Candle[];
+      try {
+        m15 = await market.candles(symbol, "15m", 500);
+      } catch (e) {
+        // Без свічок стан не змінюємо: наступна година дорахує. Позиція лишається відкритою й займає місце.
+        errors.push(`${symbol} 15m: ${String(e)}`.slice(0, 200));
+        for (const r of rows) if (r.status === "open") open.push({ symbol, side: r.side });
+        continue;
+      }
+      for (const r of rows) {
+        let res = resolveTube(
+          { side: r.side, entry: r.entry, stop: r.stop, target: r.target, placedAt: Date.parse(r.created_at), expiresAt: Date.parse(r.expires_at), maxHoldMs: r.max_hold_hours * HOUR },
+          m15,
+          now,
+        );
+        if (r.status === "open" && res.filledAt === null) {
+          // Свічок від входу в кеші вже немає (рушій довго не працював): хід позиції не відтворити.
+          // До терміну вона лишається відкритою, після — закривається за часом за останньою ціною.
+          const filledAt = Date.parse(r.filled_at ?? r.created_at);
+          const last = m15[m15.length - 1];
+          if (!last || now < filledAt + r.max_hold_hours * HOUR) {
+            open.push({ symbol, side: r.side });
+            continue;
+          }
+          const risk = Math.abs(r.entry - r.stop);
+          const resultR = risk ? Number((((last.close - r.entry) / risk) * (r.side === "long" ? 1 : -1)).toFixed(3)) : 0;
+          res = { status: "timeout", filledAt, resolvedAt: last.closeTime, exitPrice: last.close, resultR };
+          errors.push(`${symbol}: свічок від входу вже немає, позицію закрито за часом за останньою ціною`);
+        }
+        // Нова година замінює лімітки: невиконана знімається зараз, навіть якщо її година ще не минула.
+        const status: TubeStatus = res.status === "pending" ? "cancelled" : res.status;
+        const resolvedAt = res.status === "pending" ? now : res.resolvedAt;
+        if (status === "open") open.push({ symbol, side: r.side });
+        if (status === "open" && r.status === "open") continue;
+        if (r.status === "pending" && res.filledAt !== null) resolved.filled++;
+        if (status !== "open") resolved[status]++;
+        statements.push(update.bind(status, iso(res.filledAt), iso(resolvedAt), res.exitPrice, res.resultR, tubeFeeR(r, status, res.exitPrice, fees), r.id));
+      }
+    }
+
+    // 2. Нові лімітки години.
+    let plan: CyclePlan | null = null;
+    let note: string | null = null;
+    const universe = await this.ctx.storage.get<BotUniverse>(`bot-universe:${TUBE}`);
+    // Частини на будь-який розмір списку: так не лишаються частини від циклу, що впав, чи від більшого списку.
+    const keys = Array.from({ length: Math.ceil(30 / BOT_CHUNK) }, (_, i) => `bot-part:${TUBE}:${i}`);
+    const parts = await this.ctx.storage.get<BotPart>(keys);
+    await this.ctx.storage.delete(keys);
+    // Лише свіжі ознаки: частина з циклу, що не дійшов до кінця, могла пролежати годину.
+    const features = [...parts.values()].flatMap((p) => p.features).filter((f) => f.closedAt >= now - 2 * HOUR);
+    errors.push(...[...parts.values()].flatMap((p) => p.errors));
+    if (!enabled) note = "бот вимкнено: нові лімітки не ставляться, відкриті позиції ведуться до закриття";
+    else if (features.length < Math.max(cfg.pickN, Math.ceil(cfg.topN / 2))) note = `ознаки лише для ${features.length} монет: лімітки цієї години не ставляться`;
+    else {
+      plan = planCycle(features, open, cfg);
+      const insert = db.prepare(
+        `INSERT INTO bot_orders (bot, desk, created_at, symbol, side, bias, near, rank, price, atr, entry, stop, target, expires_at, max_hold_hours, body)
+         VALUES (?, 'crypto', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      const byCoin = new Map(features.map((f) => [f.symbol, f]));
+      for (const o of plan.orders) {
+        const body: TubeOrderBody = {
+          v: 1,
+          features: byCoin.get(o.symbol)!,
+          offsetAtr: o.offsetAtr,
+          market: plan.market,
+          cfg: { entryAtr: cfg.entryAtr, biasRatio: cfg.biasRatio, biasSide: cfg.biasSide, stopAtr: cfg.stopAtr, targetR: cfg.targetR, minStopPct: cfg.minStopPct },
+        };
+        statements.push(
+          insert.bind(
+            iso(now), o.symbol, o.side, o.bias, o.near === null ? null : o.near ? 1 : 0, o.rank, o.price, o.atr, o.entry, o.stop, o.target,
+            iso(now + ORDER_TTL_MS), cfg.maxHoldHours, JSON.stringify(body),
+          ),
+        );
+      }
+    }
+    if (statements.length) await db.batch(statements);
+
+    const detail: TubeCycleDetail = {
+      bot: TUBE,
+      bias: plan?.bias ?? null,
+      market: plan?.market ?? null,
+      universe: { source: universe?.source ?? "fallback", at: universe?.at ? new Date(universe.at).toISOString() : null, size: features.length, error: universe?.error ?? null },
+      ranked: (plan?.ranked ?? []).map((f) => ({ symbol: f.symbol, price: f.price, atrPct: f.atrPct, volRatio: f.volRatio, score: f.score, trend4h: f.trend4h, change24hPct: f.change24hPct })),
+      chosen: plan?.chosen ?? [],
+      placed: plan?.orders.length ?? 0,
+      skipped: plan?.skipped ?? [],
+      resolved,
+      open: open.length,
+      note,
+      errors: errors.slice(0, 20),
+    };
+    await this.logRun("bot", started, detail, plan || !enabled ? null : (note ?? "бот не поставив ліміток"), "crypto");
+  }
+
   // ── Тижневий розбір ──────────────────────────────────────────────────────
 
   /**
@@ -1537,7 +1814,7 @@ export class Engine extends DurableObject<Env> {
     const days = await this.setting("retention_days", 30);
     const cutoff = new Date(now - days * 24 * HOUR).toISOString();
     const runsCutoff = new Date(now - Math.max(days, 90) * 24 * HOUR).toISOString();
-    const [snapshots, news, picks, runs] = await db.batch<never>([
+    const [snapshots, news, picks, runs, botOrders] = await db.batch<never>([
       db
         .prepare(
           `DELETE FROM snapshots WHERE id IN (
@@ -1552,12 +1829,19 @@ export class Engine extends DurableObject<Env> {
       db
         .prepare(
           `DELETE FROM runs WHERE id IN (
-             SELECT id FROM runs WHERE started_at < ? AND kind IN ('scan', 'news', 'signals', 'probe', 'pipeline')
+             SELECT id FROM runs WHERE started_at < ? AND kind IN ('scan', 'news', 'signals', 'probe', 'pipeline', 'bot')
                AND id NOT IN (SELECT run_id FROM snapshots) LIMIT 20000)`,
         )
         .bind(runsCutoff),
+      // Угоди ботів лишаються назавжди; зняті без виконання лімітки потрібні лише для частки виконаних за останній час.
+      db.prepare("DELETE FROM bot_orders WHERE id IN (SELECT id FROM bot_orders WHERE status = 'cancelled' AND created_at < ? LIMIT 20000)").bind(cutoff),
     ]);
-    await this.logRun("cleanup", started, { retentionDays: days, snapshots: snapshots!.meta.changes, news: news!.meta.changes, picks: picks!.meta.changes, runs: runs!.meta.changes }, null);
+    await this.logRun(
+      "cleanup",
+      started,
+      { retentionDays: days, snapshots: snapshots!.meta.changes, news: news!.meta.changes, picks: picks!.meta.changes, runs: runs!.meta.changes, botOrders: botOrders!.meta.changes },
+      null,
+    );
   }
 
   // ── Сповіщення ───────────────────────────────────────────────────────────

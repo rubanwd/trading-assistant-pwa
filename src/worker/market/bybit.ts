@@ -120,6 +120,29 @@ export class BybitLinear implements MarketData {
   }
 
   /**
+   * Безстрокові USDT-контракти на криптовалюти, що зараз торгуються, з назвою базової монети (SHIB1000 для SHIB1000USDT).
+   * Біржа віддає до 1000 контрактів на сторінку; беремо не більше трьох сторінок.
+   */
+  async linearUsdt(): Promise<{ symbol: string; baseCoin: string }[]> {
+    const out: { symbol: string; baseCoin: string }[] = [];
+    let cursor = "";
+    for (let page = 0; page < 3; page++) {
+      const res = await this.get<{
+        list: { symbol: string; status: string; contractType?: string; quoteCoin?: string; baseCoin?: string; symbolType?: string }[];
+        nextPageCursor?: string;
+      }>("/v5/market/instruments-info", { category: "linear", limit: "1000", ...(cursor ? { cursor } : {}) });
+      for (const i of res.list) {
+        if (i.status !== "Trading" || i.contractType !== "LinearPerpetual" || i.quoteCoin !== "USDT" || !i.baseCoin) continue;
+        if (i.symbolType === "stock" || i.symbolType === "ETF") continue;
+        out.push({ symbol: i.symbol, baseCoin: i.baseCoin });
+      }
+      cursor = res.nextPageCursor ?? "";
+      if (!cursor) break;
+    }
+    return out;
+  }
+
+  /**
    * Запит із повторами після відмови за частотою (код 10006 або HTTP 429). Публічні ліміти Bybit рахуються на IP,
    * а вихідні адреси Cloudflare спільні з іншими клієнтами, тож ліміт буває вичерпаний не нами й скидається за секунди.
    */
