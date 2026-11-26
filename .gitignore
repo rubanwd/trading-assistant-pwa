@@ -4,3 +4,7 @@ dist
 .dev.vars
 *.log
 .backtest
+.b2010
+.env
+.env.*
+!.env.example
