@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import type { ReportBody, TubeCycleDetail } from "./engine";
+import type { ChannelCycleDetail, ReportBody, TubeCycleDetail } from "./engine";
 import { checkAccess } from "./access";
 import { engineStub, type Env } from "./env";
 import { parseSubscription } from "./push";
@@ -11,7 +11,7 @@ import { calibration, hit, loadStats } from "./stats";
 import { netR, outcome, summarize, type PickRecord } from "./pickStats";
 import type { Fees } from "../shared/risk";
 import { CRYPTO_LEADER, parseDesk, STOCKS_LEADER_DEFAULT, type Desk } from "../shared/desk";
-import { botEnabledKey, botKeys, BOTS, isBotId, tubeConfig, type BotId } from "../shared/bots";
+import { botEnabledKey, botKeys, BOTS, CHANNEL_KEYS, channelConfig, isBotId, tubeConfig, type BotId } from "../shared/bots";
 import { netR as tubeNetR, outcomeOf, tubeGroup, tubeSummarize, type TubeRecord } from "./bots/tubeStats";
 
 export { Engine } from "./engine";
@@ -273,7 +273,7 @@ app.get("/api/stats", async (c) => {
 /** Свічки для графіка сигналу: бере рушій (зі скану в пам'яті або з біржі). */
 app.get("/api/candles/:symbol{[A-Z0-9]{2,20}USDT}", async (c) => {
   const tf = c.req.query("tf") ?? "1h";
-  if (tf !== "15m" && tf !== "1h" && tf !== "4h") return c.json({ error: "tf must be 15m, 1h or 4h" }, 400);
+  if (tf !== "15m" && tf !== "1h" && tf !== "4h" && tf !== "1d") return c.json({ error: "tf must be 15m, 1h, 4h or 1d" }, 400);
   try {
     const candles = await engineStub(c.env).candles(c.req.param("symbol"), tf, Number(c.req.query("limit") ?? 96), deskOf(c));
     return c.json({ candles });
@@ -518,16 +518,16 @@ app.get("/api/picks/:id{[0-9]+}", async (c) => {
 
 /** Ордери бота за період, від нових. Зняті без виконання ордери зберігаються лише retention_days. */
 const BOT_ORDERS = `
-  SELECT id, created_at, symbol, side, bias, near, rank, price, entry, stop, target, status, filled_at, resolved_at, exit_price, result_r, fee_r
+  SELECT id, created_at, symbol, side, bias, near, rank, price, entry, stop, target, trail_stop, status, filled_at, resolved_at, exit_price, result_r, fee_r
   FROM bot_orders WHERE bot = ? AND created_at >= ? ORDER BY id DESC LIMIT ?`;
 
 /** Останні години бота з журналу запусків. */
-async function botCycles(db: D1Database, id: BotId, limit: number): Promise<{ at: string; status: string; error: string | null; detail: TubeCycleDetail }[]> {
+async function botCycles(db: D1Database, id: BotId, limit: number): Promise<{ at: string; status: string; error: string | null; detail: TubeCycleDetail & Partial<ChannelCycleDetail> }[]> {
   const rows = await db
     .prepare("SELECT started_at, status, error, detail FROM runs WHERE kind = 'bot' AND json_extract(detail, '$.bot') = ? ORDER BY id DESC LIMIT ?")
     .bind(id, limit)
     .all<{ started_at: string; status: string; error: string | null; detail: string }>();
-  return rows.results.map((r) => ({ at: r.started_at, status: r.status, error: r.error, detail: JSON.parse(r.detail) as TubeCycleDetail }));
+  return rows.results.map((r) => ({ at: r.started_at, status: r.status, error: r.error, detail: JSON.parse(r.detail) as TubeCycleDetail & Partial<ChannelCycleDetail> }));
 }
 
 /** Список ботів: назва, стан і підсумок за 30 днів. */
@@ -562,10 +562,12 @@ app.get("/api/bots/:id", async (c) => {
   if (days !== null && ![7, 30, 90].includes(days)) return c.json({ error: "period must be all, 7, 30 or 90" }, 400);
   const db = c.env.DB;
   const since = days === null ? "" : new Date(Date.now() - days * 86_400_000).toISOString();
-  const keys = [...Object.values(botKeys(id)), botEnabledKey(id), "risk_per_trade_pct", "deposit_usd", "fee_maker_pct", "fee_taker_pct"];
+  const channel = id === "c2010";
+  const keys = [...Object.values(channel ? CHANNEL_KEYS : botKeys(id)), botEnabledKey(id), "risk_per_trade_pct", "deposit_usd", "fee_maker_pct", "fee_taker_pct"];
   const [rows, cycles, values, active] = await Promise.all([
     db.prepare(BOT_ORDERS).bind(id, since, 50000).all<TubeRecord>(),
-    botCycles(db, id, 24),
+    // Channel 20/10 торгує раз на кілька днів: журнал довший, щоб у ньому були денні сигнали.
+    botCycles(db, id, channel ? 72 : 24),
     settingValues(db, keys),
     db.prepare("SELECT * FROM bot_orders WHERE bot = ? AND status IN ('pending', 'open') ORDER BY rank, symbol, side").bind(id).all<TubeRecord & { body: string }>(),
   ]);
@@ -573,12 +575,15 @@ app.get("/api/bots/:id", async (c) => {
   return c.json({
     bot: BOTS.find((b) => b.id === id),
     enabled: values[botEnabledKey(id)] !== "off",
-    config: tubeConfig(values, id),
+    config: channel ? channelConfig(values) : tubeConfig(values, id),
     riskPct: typeof values.risk_per_trade_pct === "number" ? values.risk_per_trade_pct : 0.5,
     depositUsd: typeof values.deposit_usd === "number" ? values.deposit_usd : null,
     from: since || null,
     last: cycles[0] ?? null,
-    cycles: cycles.map((x) => ({ at: x.at, status: x.status, error: x.error, bias: x.detail.bias, chosen: x.detail.chosen, placed: x.detail.placed, resolved: x.detail.resolved, open: x.detail.open, note: x.detail.note })),
+    cycles: cycles.map((x) => ({
+      at: x.at, status: x.status, error: x.error, bias: x.detail.bias, chosen: x.detail.chosen, placed: x.detail.placed, resolved: x.detail.resolved, open: x.detail.open, note: x.detail.note,
+      ...(channel ? { signal: x.detail.signal ?? null, trailed: x.detail.trailed ?? [], errors: x.detail.errors ?? [] } : {}),
+    })),
     active: active.results.map((r) => ({ ...r, body: JSON.parse(r.body) })),
     summary: tubeSummarize(rows.results),
     trades: trades.map((r) => ({ ...r, outcome: outcomeOf(r), net_r: tubeNetR(r) })),

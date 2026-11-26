@@ -1,4 +1,4 @@
-import { botEnabledKey, botInfo, botKeys, TUBE_BIAS_SIDES, TUBE_LIMITS, type BotId } from "./bots";
+import { botEnabledKey, botInfo, botKeys, CHANNEL_KEYS, CHANNEL_LIMITS, TUBE_BIAS_SIDES, TUBE_LIMITS, type TubeBotId } from "./bots";
 
 /**
  * Схема налаштувань: перевірка значень для API і підписи для екрана «Налаштування».
@@ -36,7 +36,7 @@ const tubeNum = (field: keyof typeof TUBE_LIMITS): Check => {
 };
 
 /** Налаштування одного бота: однаковий набір полів, назва бота в підписі, свій префікс ключів. */
-function botSettings(id: BotId): SettingSpec[] {
+function botSettings(id: TubeBotId): SettingSpec[] {
   const { name, mode } = botInfo(id);
   const k = botKeys(id);
   const order = mode === "breakout" ? "стоп-ордер" : "лімітка";
@@ -87,6 +87,35 @@ function botSettings(id: BotId): SettingSpec[] {
       check: onOff,
     },
     { key: k.skipNeutral, group: g, label: `${name}: без ордерів у ринку без напрямку`, help: "on: коли ринок не бичачий і не ведмежий, нові ордери не ставляться. У бектесті це найгірший режим.", kind: "enum", options: ["on", "off"], check: onOff },
+  ];
+}
+
+/** Налаштування Channel 20/10. */
+function channelSettings(): SettingSpec[] {
+  const g = "Боти" as const;
+  const name = botInfo("c2010").name;
+  const n = (field: keyof typeof CHANNEL_LIMITS) => num(CHANNEL_LIMITS[field].min, CHANNEL_LIMITS[field].max, CHANNEL_LIMITS[field].integer);
+  return [
+    {
+      key: botEnabledKey("c2010"),
+      group: g,
+      label: name,
+      help: "Паперова торгівля BTC на денних свічках: вхід за ринком після закриття доби за межею 20-денного каналу, стоп за 10-денним каналом підтягується щодня, без тейка. Ордери на біржу не йдуть. Вимкнений бот не входить, а відкриту позицію веде до стопа.",
+      kind: "enum",
+      options: ["on", "off"],
+      check: onOff,
+    },
+    { key: CHANNEL_KEYS.symbol, group: g, label: `${name}: контракт`, help: "Безстроковий USDT-контракт Bybit. Стратегію перевірено бектестом лише на BTCUSDT.", kind: "symbol", check: symbol },
+    { key: CHANNEL_KEYS.entryDays, group: g, label: `${name}: канал входу, діб`, help: "Вхід, коли доба закрилась вище найбільшого High (лонг) або нижче найменшого Low (шорт) стількох попередніх діб.", kind: "number", check: n("entryDays") },
+    { key: CHANNEL_KEYS.exitDays, group: g, label: `${name}: канал стопа, діб`, help: "Стоп — найменший Low (лонг) або найбільший High (шорт) стількох останніх діб; після кожного закриття доби рухається лише в бік зменшення ризику.", kind: "number", check: n("exitDays") },
+    {
+      key: CHANNEL_KEYS.entryWindowHours,
+      group: g,
+      label: `${name}: вікно входу, год`,
+      help: "Скільки годин після закриття доби сигнал ще виконується. Якщо рушій прокинувся пізніше, сигнал прострочений: заднім числом бот не входить.",
+      kind: "number",
+      check: n("entryWindowHours"),
+    },
   ];
 }
 
@@ -164,6 +193,7 @@ export const SETTINGS: SettingSpec[] = [
   { key: "pick_horizon_hours", group: "Сигнали", label: "Горизонт ідеї скану, год", help: "За цей час ціна має дійти до цілі 2R раніше за стоп; інакше ідея закривається за часом. Лімітний вхід, що не виконався за цей час, скасовується.", kind: "number", check: num(4, 96) },
   ...botSettings("hvt"),
   ...botSettings("hvb"),
+  ...channelSettings(),
   { key: "signal_cooldown_hours", group: "Сигнали", label: "Пауза для того самого сетапу по монеті, год", kind: "number", check: num(0, 72) },
   { key: "macro_blackout_hours", group: "Сигнали", label: "Без нових сигналів до макроподії, год", kind: "number", check: num(0, 24) },
   {

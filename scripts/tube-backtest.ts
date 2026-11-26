@@ -10,7 +10,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { BOT_DEFAULTS, botInfo, isBotId, TUBE_BIAS_SIDES, TUBE_FALLBACK, type BotId, type BotMode, type TubeBiasSide, type TubeConfig } from "../src/shared/bots";
+import { BOT_DEFAULTS, botInfo, isTubeBot, TUBE_BIAS_SIDES, TUBE_FALLBACK, type BotMode, type TubeBiasSide, type TubeBotId, type TubeConfig } from "../src/shared/bots";
 import { shiftMonth } from "../src/backtest/data";
 import { loadSymbols, ROOT } from "../src/backtest/load";
 import { formatTubeReport, simulateTube, tubeHours, tubeReport, tubeSummary, tubeTradesCsv, type TubeBacktestConfig, type TubeHour } from "../src/backtest/tube";
@@ -79,7 +79,7 @@ async function main() {
   const from = values.from ?? "2023-11";
   if (!/^\d{4}-\d{2}$/.test(from) || !/^\d{4}-\d{2}$/.test(to) || from > to) throw new Error("--from і --to у форматі YYYY-MM, from не пізніше to");
   const symbols = values.symbols ? values.symbols.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean) : TUBE_FALLBACK;
-  const bot: BotId = values.bot === undefined ? "hvt" : isBotId(values.bot) ? values.bot : (() => { throw new Error("--bot: hvt або hvb"); })();
+  const bot: TubeBotId = values.bot === undefined ? "hvt" : isTubeBot(values.bot) ? values.bot : (() => { throw new Error("--bot: hvt або hvb (Channel 20/10 — npm run backtest:channel)"); })();
   const mode: BotMode = botInfo(bot).mode;
   const def = BOT_DEFAULTS[bot];
   const bias = (values.bias ?? def.biasSide) as TubeBiasSide;

@@ -376,6 +376,6 @@ describe("налаштування бота", () => {
   });
 
   it("бот має назву", () => {
-    expect(BOTS.map((b) => b.name)).toEqual(["High Value Tube", "High Value Breakout"]);
+    expect(BOTS.map((b) => b.name)).toEqual(["High Value Tube", "High Value Breakout", "Channel 20/10"]);
   });
 });

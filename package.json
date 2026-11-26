@@ -15,11 +15,10 @@
     "backtest:tube": "tsx scripts/tube-backtest.ts",
     "backtest:pick": "tsx scripts/pick-backtest.ts",
     "patterns": "tsx scripts/patterns.ts",
-    "b2010": "tsx --disable-warning=ExperimentalWarning scripts/b2010.ts"
+    "backtest:channel": "tsx scripts/channel-backtest.ts"
   },
   "dependencies": {
     "@pushforge/builder": "^2.0.5",
-    "decimal.js": "^10.6.0",
     "hono": "^4.13.18",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"

@@ -60,7 +60,7 @@ async function metricsMonth(symbol: string, month: string): Promise<MetricPoint[
   return points;
 }
 
-async function fundingMonth(symbol: string, month: string): Promise<FundingPoint[]> {
+export async function fundingMonth(symbol: string, month: string): Promise<FundingPoint[]> {
   const dir = join(ROOT, "cache", symbol, "funding");
   const file = join(dir, `${month}.csv`);
   if (existsSync(file)) return parseFunding(await readFile(file, "utf8"));

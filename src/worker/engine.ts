@@ -17,9 +17,25 @@ import {
   type Pipeline,
   type Transport,
 } from "./llm";
-import { BOT_IDS, botEnabledKey, botInfo, isBotId, TUBE_FALLBACK, tubeConfig, type BotId, type TubeConfig } from "../shared/bots";
+import { BOT_IDS, botEnabledKey, botInfo, channelConfig, isTubeBot, TUBE_BOT_IDS, TUBE_FALLBACK, tubeConfig, type ChannelConfig, type TubeBotId, type TubeConfig } from "../shared/bots";
+import {
+  advanceChannel,
+  channelFeeR,
+  channelFunding,
+  channelR,
+  channelSignal,
+  channelStop,
+  fillChannel,
+  nextLevels,
+  openTrack,
+  type ChannelExit,
+  type ChannelFunding,
+  type ChannelSignal,
+  type ChannelTrack,
+} from "./bots/channel";
 import { planCycle, resolveTube, TUBE_H1_LIMIT, TUBE_H4_LIMIT, tubeFeatures, tubeFeeR, type CyclePlan, type TubeFeatures, type TubeStatus } from "./bots/tube";
 import { marketCaps, topUniverse } from "./bots/universe";
+import { atr } from "./indicators";
 import { choosePick, PICK_MIN_RSI_1H, PICK_SCHEMA, PICK_SYSTEM, pickInput, rankPicks, resolvePick, sanitizePick, shortMarket, type PickAi, type PickOption, type PickStyle, type ShortMarket } from "./pick";
 import { loadStats } from "./stats";
 import { sanitizeWeekly, WEEKLY_SCHEMA, WEEKLY_SYSTEM, weeklyBody, weeklyInput, type WeeklyReview } from "./weekly";
@@ -184,6 +200,12 @@ const UNIVERSE_KEY = "bot-universe";
 /** Невиконаний ордер живе годину: до наступного циклу бота. */
 const ORDER_TTL_MS = HOUR;
 
+const feeNum = (v: unknown, fallback: number) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : fallback);
+/** Комісії ботів із налаштувань. */
+const botFees = (values: Record<string, unknown>): Fees => ({ makerPct: feeNum(values.fee_maker_pct, 0.02), takerPct: feeNum(values.fee_taker_pct, 0.05) });
+/** Скільки денних свічок бере Channel 20/10: канали й перерахунок стопа за тривалу позицію. */
+const CHANNEL_D1_LIMIT = 120;
+
 /** Список монет ботів у сховищі рушія. */
 interface BotUniverse {
   /** Коли список востаннє вдалося оновити; 0 — ще ніколи. */
@@ -233,6 +255,44 @@ export interface TubeCycleDetail {
   placed: number;
   skipped: CyclePlan["skipped"];
   resolved: Record<"filled" | "target" | "stop" | "timeout" | "cancelled", number>;
+  open: number;
+  note: string | null;
+  errors: string[];
+}
+
+/** Тіло ордера Channel 20/10 у bot_orders.body: сигнал, стан супроводу, перерахунки стопа, вихід і фандинг. */
+export interface ChannelOrderBody {
+  v: 1;
+  kind: "channel";
+  signal: ChannelSignal;
+  cfg: Pick<ChannelConfig, "entryDays" | "exitDays">;
+  /** ATR(14) 1d у % від ціни на свічці сигналу. */
+  atrPct: number | null;
+  track: ChannelTrack | null;
+  trailed: { day: string; stop: number }[];
+  exit: ChannelExit | null;
+  funding: ChannelFunding | null;
+  /** Чому вхід не відбувся: beyond_stop — ціна вже за стопом, no_price — немає ціни у вікні входу. */
+  skip: "beyond_stop" | "no_price" | null;
+}
+
+export type ChannelAction = "placed" | "ignored" | "expired" | "disabled" | "none";
+
+/** Підсумок години Channel 20/10 у runs.detail (kind = 'bot'). Поля bias, chosen, placed, open — як у ботів «труби». */
+export interface ChannelCycleDetail {
+  bot: "c2010";
+  symbol: string;
+  price: number | null;
+  /** Межі каналу на наступне денне закриття й стоп, яким був би вхід зараз. */
+  levels: ReturnType<typeof nextLevels>;
+  /** Сигнал свіжої денної свічки (лише в першу годину нової доби). */
+  signal: (Omit<ChannelSignal, "day"> & { day: string; action: ChannelAction; note: string | null }) | null;
+  position: { id: number; side: "long" | "short"; status: "pending" | "open"; entry: number; stop: number; initialStop: number; filledAt: string | null; r: number | null } | null;
+  resolved: { filled: number; stop: number; cancelled: number };
+  trailed: { day: string; stop: number }[];
+  bias: null;
+  chosen: string[];
+  placed: number;
   open: number;
   note: string | null;
   errors: string[];
@@ -584,7 +644,7 @@ export class Engine extends DurableObject<Env> {
   }
 
   /** Свічки для графіка в застосунку: з кешу рушія, біржа докачує лише нові. */
-  async candles(symbol: string, timeframe: "15m" | "1h" | "4h", limit: number, desk: Desk = "crypto"): Promise<Candle[]> {
+  async candles(symbol: string, timeframe: "15m" | "1h" | "4h" | "1d", limit: number, desk: Desk = "crypto"): Promise<Candle[]> {
     if (!/^[A-Z0-9]{2,20}USDT$/.test(symbol)) throw new Error("невідомий символ");
     const n = Math.min(Math.max(Math.trunc(limit) || 96, 10), 300);
     return (await (await this.market(desk)).candles(symbol, timeframe, n)).slice(-n);
@@ -1539,14 +1599,14 @@ export class Engine extends DurableObject<Env> {
     return this.botMarketCache;
   }
 
-  private async botCfg(id: BotId): Promise<TubeConfig> {
+  private async botCfg(id: TubeBotId): Promise<TubeConfig> {
     return tubeConfig(Object.fromEntries(await this.settingsMap()), id);
   }
 
   /** Скільки монет потрібно ботам: найбільший список серед увімкнених. 0 — усі боти вимкнені. */
   private async botUniverseSize(): Promise<number> {
     const values = Object.fromEntries(await this.settingsMap());
-    return Math.max(0, ...BOT_IDS.filter((id) => values[botEnabledKey(id)] !== "off").map((id) => tubeConfig(values, id).topN));
+    return Math.max(0, ...TUBE_BOT_IDS.filter((id) => values[botEnabledKey(id)] !== "off").map((id) => tubeConfig(values, id).topN));
   }
 
   /**
@@ -1555,7 +1615,7 @@ export class Engine extends DurableObject<Env> {
    */
   private async botSteps(now: number): Promise<string[]> {
     const hour = Math.floor(now / HOUR);
-    const due: BotId[] = [];
+    const due: string[] = [];
     for (const id of BOT_IDS) {
       const last = await this.ctx.storage.get<number>(`bot-last:${id}`);
       if (last === undefined || Math.floor(last / HOUR) !== hour) due.push(id);
@@ -1570,7 +1630,8 @@ export class Engine extends DurableObject<Env> {
     const [, a, b] = step.split(":");
     if (a === "universe") return this.botUniverse(now);
     if (a === "data") return this.botData(Number(b), now);
-    if (isBotId(a) && b === "run") return this.botRun(a, now);
+    if (a === "c2010" && b === "run") return this.channelRun(now);
+    if (isTubeBot(a) && b === "run") return this.botRun(a, now);
   }
 
   /**
@@ -1622,7 +1683,7 @@ export class Engine extends DurableObject<Env> {
    * Година бота: спершу код рахує, що сталося з ордерами минулої години й відкритими позиціями (свічки 15m),
    * знімає невиконані ордери, потім ставить нові для найрухливіших монет. Ордери паперові: на біржу нічого не йде.
    */
-  private async botRun(id: BotId, now: number): Promise<void> {
+  private async botRun(id: TubeBotId, now: number): Promise<void> {
     const started = Date.now();
     const db = this.env.DB;
     const values = Object.fromEntries(await this.settingsMap());
@@ -1630,8 +1691,7 @@ export class Engine extends DurableObject<Env> {
     const mode = botInfo(id).mode;
     const enabled = values[botEnabledKey(id)] !== "off";
     const word = mode === "breakout" ? "стоп-ордери" : "лімітки";
-    const feeNum = (v: unknown, fallback: number) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : fallback);
-    const fees: Fees = { makerPct: feeNum(values.fee_maker_pct, 0.02), takerPct: feeNum(values.fee_taker_pct, 0.05) };
+    const fees = botFees(values);
     await this.ctx.storage.put(`bot-last:${id}`, now);
 
     // 1. Супровід: ордери минулої години й відкриті позиції.
@@ -1744,6 +1804,180 @@ export class Engine extends DurableObject<Env> {
       errors: errors.slice(0, 20),
     };
     await this.logRun("bot", started, detail, plan || !enabled ? null : (note ?? `бот не поставив ордерів`), "crypto");
+  }
+
+  /**
+   * Година Channel 20/10. Спершу супровід: вхід за першою ціною після постановки (свічки 15m), стоп за свічками 15m,
+   * перерахунок стопа після кожного денного закриття. Потім, у першу годину нової доби UTC, — сигнал на свічці, що закрилась.
+   * Паперова торгівля: на біржу нічого не йде. Фандинг за історичними ставками Bybit рахується на виході.
+   */
+  private async channelRun(now: number): Promise<void> {
+    const id = "c2010" as const;
+    const started = Date.now();
+    const db = this.env.DB;
+    const values = Object.fromEntries(await this.settingsMap());
+    const cfg = channelConfig(values);
+    const enabled = values[botEnabledKey(id)] !== "off";
+    const fees = botFees(values);
+    await this.ctx.storage.put(`bot-last:${id}`, now);
+    const errors: string[] = [];
+    const iso = (t: number | null) => (t === null ? null : new Date(t).toISOString());
+    const detail: ChannelCycleDetail = {
+      bot: id, symbol: cfg.symbol, price: null, levels: null, signal: null, position: null, resolved: { filled: 0, stop: 0, cancelled: 0 }, trailed: [],
+      bias: null, chosen: [cfg.symbol], placed: 0, open: 0, note: null, errors,
+    };
+    const market = this.botMarket();
+    let daily: Candle[];
+    let m15: Candle[];
+    try {
+      [daily, m15] = await Promise.all([market.candles(cfg.symbol, "1d", CHANNEL_D1_LIMIT), market.candles(cfg.symbol, "15m", 500)]);
+    } catch (e) {
+      // Без свічок стан не змінюємо: наступна година дорахує.
+      detail.note = `немає свічок ${cfg.symbol}: ${String(e)}`.slice(0, 300);
+      await this.logRun("bot", started, detail, detail.note, "crypto");
+      return;
+    }
+    detail.price = m15[m15.length - 1]?.close ?? null;
+    detail.levels = nextLevels(daily, cfg);
+    const t = daily[daily.length - 1];
+    // Без денних свічок сигналу немає; межа «після закриття» тоді — зараз, щоб не тягнути всю історію виходів.
+    const tClose = t ? t.closeTime : now;
+
+    // 1. Супровід. Разом з активними беремо вихід після закриття доби t: позиція тоді ще була відкрита.
+    const rows = await db
+      .prepare(
+        "SELECT id, created_at, side, entry, stop, trail_stop, expires_at, status, filled_at, resolved_at, body FROM bot_orders WHERE bot = ? AND (status IN ('pending', 'open') OR (status = 'stop' AND resolved_at > ?)) ORDER BY id",
+      )
+      .bind(id, iso(tClose))
+      .all<{ id: number; created_at: string; side: "long" | "short"; entry: number; stop: number; trail_stop: number | null; expires_at: string; status: string; filled_at: string | null; resolved_at: string | null; body: string }>();
+    const update = db.prepare("UPDATE bot_orders SET status = ?, entry = ?, filled_at = ?, resolved_at = ?, exit_price = ?, result_r = ?, fee_r = ?, trail_stop = ?, body = ? WHERE id = ?");
+    const statements: D1PreparedStatement[] = [];
+    let openAtClose = rows.results.some((r) => r.status === "stop");
+    const priceAt = (at: number) => m15.find((c) => c.openTime === at)?.open ?? daily.find((c) => c.openTime <= at && at <= c.closeTime)?.open ?? null;
+    for (const r of rows.results) {
+      if (r.status !== "pending" && r.status !== "open") continue;
+      const body = JSON.parse(r.body) as ChannelOrderBody;
+      let status: "pending" | "open" | "cancelled" | "stop" = r.status;
+      let track = body.track;
+      let filledAt = r.filled_at ? Date.parse(r.filled_at) : null;
+      let resolvedAt: number | null = null;
+      let exitPrice: number | null = null;
+      let resultR: number | null = null;
+      let feeRValue: number | null = null;
+      if (status === "pending") {
+        const f = fillChannel({ side: r.side, stop: r.stop, placedAt: Date.parse(r.created_at), expiresAt: Date.parse(r.expires_at) }, m15, now);
+        if (f.status === "cancelled") {
+          body.skip = f.reason;
+          status = "cancelled";
+          resolvedAt = f.at;
+          detail.resolved.cancelled++;
+        } else if (f.status === "open") {
+          status = "open";
+          filledAt = f.filledAt;
+          track = openTrack(r.side, f.entry, r.stop, f.filledAt, body.signal.day);
+          detail.resolved.filled++;
+        }
+      }
+      if (status === "open" && track && filledAt !== null) {
+        const adv = advanceChannel(track, daily, m15, now, body.cfg.exitDays);
+        let funding: ChannelFunding | null = null;
+        if (adv.exit) {
+          try {
+            const events = await new BybitLinear(this.http).fundingHistory(cfg.symbol, filledAt, adv.exit.to);
+            funding = channelFunding(adv.track, events, filledAt, adv.exit, now, (at) => priceAt(at) ?? adv.track.entry);
+          } catch (e) {
+            // Без ставок вихід не записуємо: наступна година перевірить ту саму свічку знову.
+            errors.push(`фандинг: ${String(e)}`.slice(0, 200));
+          }
+        }
+        if (adv.exit && funding) {
+          status = "stop";
+          resolvedAt = adv.exit.to;
+          exitPrice = adv.exit.price;
+          resultR = channelR(adv.track, adv.exit.price);
+          // Фандинг у R іде разом із комісіями: чистий результат = result_r − fee_r.
+          feeRValue = Number((channelFeeR(adv.track, adv.exit.price, fees) - funding.r).toFixed(4));
+          body.exit = adv.exit;
+          body.funding = funding;
+          detail.resolved.stop++;
+          if (adv.exit.to > tClose) openAtClose = true;
+        }
+        if (!adv.exit || funding) {
+          track = adv.track;
+          body.trailed.push(...adv.trailed.map((x) => ({ day: new Date(x.day).toISOString().slice(0, 10), stop: x.stop })));
+          detail.trailed.push(...adv.trailed.map((x) => ({ day: new Date(x.day).toISOString().slice(0, 10), stop: x.stop })));
+        }
+        body.track = track;
+      }
+      if (status === "pending" || status === "open") {
+        openAtClose = openAtClose || status === "open" || status === "pending";
+        const lastPrice = detail.price;
+        detail.position = {
+          id: r.id,
+          side: r.side,
+          status,
+          entry: track?.entry ?? r.entry,
+          stop: track?.stop ?? r.stop,
+          initialStop: r.stop,
+          filledAt: iso(filledAt),
+          r: status === "open" && track && lastPrice !== null ? channelR(track, lastPrice) : null,
+        };
+        detail.open++;
+      }
+      if (status === r.status && status === "pending") continue;
+      statements.push(update.bind(status, track?.entry ?? r.entry, iso(filledAt), iso(resolvedAt), exitPrice, resultR, feeRValue, track?.stop ?? r.trail_stop, JSON.stringify(body), r.id));
+    }
+
+    // 2. Сигнал свіжої денної свічки — раз на добу.
+    const lastDay = await this.ctx.storage.get<number>(`chn-day:${id}`);
+    if (t && (lastDay === undefined || t.openTime > lastDay)) {
+      await this.ctx.storage.put(`chn-day:${id}`, t.openTime);
+      const s = channelSignal(daily, cfg.entryDays);
+      if (!s) detail.note = `для сигналу потрібно ${cfg.entryDays + 1} послідовних денних свічок`;
+      else {
+        let action: ChannelAction = "none";
+        let note: string | null = null;
+        if (s.side) {
+          const late = now - (tClose + 1) > cfg.entryWindowHours * HOUR;
+          if (!enabled) action = "disabled";
+          else if (openAtClose) {
+            action = "ignored";
+            note = "на закритті доби була відкрита позиція";
+          } else if (late) {
+            action = "expired";
+            note = `перший цикл після закриття доби запізнився більше ніж на ${cfg.entryWindowHours} год; заднім числом бот не входить`;
+          } else {
+            const stop = channelStop(daily, s.side, cfg.exitDays);
+            const atrs = atr(daily, 14);
+            const a = atrs.length ? atrs[atrs.length - 1]! : null;
+            if (stop === null) {
+              action = "expired";
+              note = `для стопа потрібно ${cfg.exitDays} послідовних денних свічок`;
+            } else {
+              const body: ChannelOrderBody = {
+                v: 1, kind: "channel", signal: s, cfg: { entryDays: cfg.entryDays, exitDays: cfg.exitDays },
+                atrPct: a === null ? null : Number(((a / s.close) * 100).toFixed(3)), track: null, trailed: [], exit: null, funding: null, skip: null,
+              };
+              statements.push(
+                db
+                  .prepare(
+                    `INSERT INTO bot_orders (bot, desk, created_at, symbol, side, bias, near, rank, price, atr, entry, stop, target, expires_at, max_hold_hours, trail_stop, body)
+                     VALUES (?, 'crypto', ?, ?, ?, 'neutral', NULL, 1, ?, ?, ?, ?, 0, ?, 0, ?, ?)`,
+                  )
+                  .bind(id, iso(now), cfg.symbol, s.side, s.close, a ?? 0, s.close, stop, iso(now + HOUR), stop, JSON.stringify(body)),
+              );
+              action = "placed";
+              detail.placed = 1;
+              detail.open++;
+            }
+          }
+        }
+        detail.signal = { side: s.side, close: s.close, upper: s.upper, lower: s.lower, day: new Date(s.day).toISOString().slice(0, 10), action, note };
+      }
+    }
+    if (statements.length) await db.batch(statements);
+    if (!enabled && !detail.note) detail.note = "бот вимкнено: нових входів немає, відкрита позиція ведеться до стопа";
+    await this.logRun("bot", started, detail, null, "crypto");
   }
 
   // ── Тижневий розбір ──────────────────────────────────────────────────────
