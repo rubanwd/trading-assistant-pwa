@@ -283,6 +283,27 @@ export function scoreShort(s: Snapshot, side: Side, now: ShortMarket, leader = "
   return { score, factors: factors.sort((a, b) => Math.abs(b.points) - Math.abs(a.points)), roomAtr };
 }
 
+// ── Фільтр імпульсу ────────────────────────────────────────────────────────
+
+/**
+ * Стартовий поріг фільтра імпульсу (`pick_min_rsi_1h`): ідея лише там, де RSI 1h у бік угоди не нижче 65
+ * (для шорта 100 − RSI). Бектест стилю swing 2023-11 — 2026-10, без моделі, після комісій:
+ * без фільтра 18 ідей на добу, −0.010R на ідею, разом −205R, просадка 416R;
+ * з фільтром 7 на добу, +0.028R (навчання до 2025-07 +0.034R, тест +0.020R), разом +218R, просадка 148R.
+ * Поріг 70: 4.4 на добу, +0.044R (+0.064R / +0.018R), просадка 121R. Сам бал переваги не дає (за децилями балу
+ * результат однаковий), а входи «біля EMA20 без перегріву», які бал заохочує, програють найчастіше.
+ * Лімітка на відкаті з фільтром гірша за вхід за ринком (+0.011R проти +0.028R), тож її не пропонуємо.
+ * Бал за імпульс замість штрафу за «перегрів» поверх фільтра нічого не додав.
+ */
+export const PICK_MIN_RSI_1H = 65;
+
+/** RSI 1h у бік угоди не нижче порогу. */
+export function hasMomentum(s: Snapshot, side: Side, minRsi1h: number): boolean {
+  const rsi = s.tf["1h"].rsi14;
+  if (rsi === null) return false;
+  return (side === "long" ? rsi : 100 - rsi) >= minRsi1h;
+}
+
 /**
  * Найкращий напрямок для кожної монети, від найвищого балу. Монети без ATR не беруться,
  * як і монети з `exclude` (по них уже є відкрита ідея: нова чекає, поки та закриється).
@@ -292,7 +313,16 @@ export function scoreShort(s: Snapshot, side: Side, now: ShortMarket, leader = "
 export function rankPicks(
   snapshots: Snapshot[],
   market: MarketRegime,
-  opts: { minStopPct: number; top?: number; exclude?: ReadonlySet<string>; leader?: string; style?: PickStyle; stop?: { tf: "1h" | "4h"; atr: number } },
+  opts: {
+    minStopPct: number;
+    top?: number;
+    exclude?: ReadonlySet<string>;
+    leader?: string;
+    style?: PickStyle;
+    stop?: { tf: "1h" | "4h"; atr: number };
+    /** Фільтр імпульсу: RSI 1h у бік угоди не нижче цього; 0 або без нього фільтр вимкнено. Див. PICK_MIN_RSI_1H. */
+    minRsi1h?: number;
+  },
 ): PickOption[] {
   const style = opts.style ?? "short";
   const stop = opts.stop ?? PICK_STOP;
@@ -307,7 +337,9 @@ export function rankPicks(
       ...(now ? scoreShort(s, side, now, opts.leader) : scoreSide(s, side, market, opts.leader)),
     }));
     const best = sides[0]!.score >= sides[1]!.score ? sides[0]! : sides[1]!;
-    const pb = pullbackEntry(s, best.side);
+    if (opts.minRsi1h && !hasMomentum(s, best.side, opts.minRsi1h)) continue;
+    // З фільтром імпульсу лише вхід за ринком: відкат після сильного руху частіше означає розворот (див. PICK_MIN_RSI_1H).
+    const pb = opts.minRsi1h ? null : pullbackEntry(s, best.side);
     out.push({
       symbol: s.symbol,
       side: best.side,
@@ -337,6 +369,8 @@ export interface PickInputArgs {
   /** Стиль балу і ринок «зараз» (для short). */
   style?: PickStyle;
   marketNow?: ShortMarket | null;
+  /** Поріг фільтра імпульсу (RSI 1h у бік угоди); 0 — вимкнено. */
+  minRsi1h?: number;
 }
 
 const levelsOut = (l: PickLevels) => ({ entry: l.entry, stop: l.stop, target: l.target, stop_distance_pct: l.stopPct });
@@ -346,6 +380,7 @@ export function pickInput(a: PickInputArgs) {
   return {
     horizon_hours: a.horizonHours,
     direction_basis: (a.style ?? "short") === "short" ? "short_term" : "higher_timeframes",
+    momentum_filter_rsi_1h: a.minRsi1h || null,
     market: { mood: a.market.mood, btc_trend_4h: a.market.btcTrend, share_above_ema200_4h: a.market.breadth },
     market_now: a.marketNow
       ? { mood_1h: a.marketNow.mood, btc_trend_1h: a.marketNow.leaderTrend1h, btc_trend_15m: a.marketNow.leaderTrend15m, share_above_ema20_1h: a.marketNow.breadth }
@@ -375,6 +410,7 @@ export const PICK_SYSTEM = `Ти радник трейдера ф'ючерсів
 Твоє завдання: вибрати один варіант, який найкраще узгоджується з ринком (настрій, тренд BTC, ширина ринку, новини) і з картиною самої монети, або чесно сказати, що зараз жоден не вартий входу.
 direction_basis показує, як код вибирав напрямок. short_term: за ринком останніх годин (market_now: настрій за 1h, тренд BTC на 1h і 15m, частка монет вище EMA20 1h) і трендом монети на 1h і 15m; market (4h) і денний тренд — лише фон. Угода проти старшого тренду в такому разі не помилка: якщо глобально ринок падає, а сьогодні йде вгору, лонг на цей відрізок доречний. Не відхиляй варіант лише через те, що він проти тренду 4h чи 1d; відхиляй, якщо проти нього market_now або сама монета на 1h. higher_timeframes: напрямок за трендом 1d і 4h і настроєм market.
 Усі ціни порахував код: не змінюй їх і не пропонуй інших рівнів чи розміру позиції. Розмір позиції рахує код.
+momentum_filter_rsi_1h: якщо задано, код уже пропустив лише варіанти з RSI 1h у бік угоди не нижче цього порогу. У бектесті саме такі входи за ринком дали плюс, а входи «спокійно біля середньої» програвали. Тож високий RSI і розтягнутість від EMA20 у такому разі не причина відмовитися: відмовляйся за іншими ознаками. Лімітки на відкаті тоді немає.
 Вхід entry_market — за ринком зараз; entry_pullback — лімітний ордер на відкаті до опори (може не виконатися за horizon_hours). Обери pullback, якщо ціна розтягнута від середніх або поруч сильний рівень; market, якщо рух лише почався і відкат малоймовірний. Якщо entry_pullback немає, обирай market.
 Імовірність означає одне: протягом horizon_hours після входу ціна дійде до target раніше, ніж до stop. Ціль 2R, тож без переваги це близько 30%; давай вище лише за конкретні ознаки, які називаєш. Ціле число від 5 до 95.
 choice: index вибраного варіанта або -1, якщо жоден не вартий входу (ознаки суперечать одна одній, ринок проти в межах direction_basis, новина високого впливу, близька макроподія).

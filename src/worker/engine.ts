@@ -20,7 +20,7 @@ import {
 import { BOT_IDS, botEnabledKey, botInfo, isBotId, TUBE_FALLBACK, tubeConfig, type BotId, type TubeConfig } from "../shared/bots";
 import { planCycle, resolveTube, TUBE_H1_LIMIT, TUBE_H4_LIMIT, tubeFeatures, tubeFeeR, type CyclePlan, type TubeFeatures, type TubeStatus } from "./bots/tube";
 import { marketCaps, topUniverse } from "./bots/universe";
-import { choosePick, PICK_SCHEMA, PICK_SYSTEM, pickInput, rankPicks, resolvePick, sanitizePick, shortMarket, type PickAi, type PickOption, type PickStyle, type ShortMarket } from "./pick";
+import { choosePick, PICK_MIN_RSI_1H, PICK_SCHEMA, PICK_SYSTEM, pickInput, rankPicks, resolvePick, sanitizePick, shortMarket, type PickAi, type PickOption, type PickStyle, type ShortMarket } from "./pick";
 import { loadStats } from "./stats";
 import { sanitizeWeekly, WEEKLY_SCHEMA, WEEKLY_SYSTEM, weeklyBody, weeklyInput, type WeeklyReview } from "./weekly";
 import { BinanceFutures } from "./market/binance";
@@ -139,6 +139,8 @@ export interface PickBody {
   market: MarketRegime;
   /** Стиль балу і ринок «зараз»; у старих ідеях полів немає (тоді це swing). */
   style?: PickStyle;
+  /** Поріг фільтра імпульсу на момент ідеї; 0 — вимкнено, у старих ідеях поля немає. */
+  minRsi1h?: number;
   marketNow?: ShortMarket | null;
 }
 
@@ -1414,11 +1416,12 @@ export class Engine extends DurableObject<Env> {
     if (desk === "stocks" && !usSessionOpen(now)) return;
     const scan = ds.scan;
     const db = this.env.DB;
-    const [minStopPct, horizonHours, macro, style] = await Promise.all([
+    const [minStopPct, horizonHours, macro, style, minRsi1h] = await Promise.all([
       this.setting("min_stop_pct", 1),
       this.setting("pick_horizon_hours", 24),
       this.setting<unknown>("macro_events", []),
-      this.setting<PickStyle>("pick_style", "short"),
+      this.setting<PickStyle>("pick_style", "swing"),
+      this.setting("pick_min_rsi_1h", PICK_MIN_RSI_1H),
     ]);
     const rows = await db.prepare("SELECT symbol, features FROM snapshots WHERE run_id = ?").bind(scan.runId).all<{ symbol: string; features: string }>();
     const snapshots = new Map(rows.results.map((r) => [r.symbol, JSON.parse(r.features) as Snapshot]));
@@ -1427,7 +1430,7 @@ export class Engine extends DurableObject<Env> {
     const exclude = new Set(busy.results.map((r) => r.symbol));
     const all = [...snapshots.values()];
     const marketNow = style === "short" ? shortMarket(all, ds.leader) : null;
-    const options = rankPicks(all, scan.market, { minStopPct, exclude, leader: ds.leader, style });
+    const options = rankPicks(all, scan.market, { minStopPct, exclude, leader: ds.leader, style, minRsi1h });
     if (!options.length) return;
 
     const newsRows = await db
@@ -1457,6 +1460,7 @@ export class Engine extends DurableObject<Env> {
         minutesToMacro: minutesToMacro(macro, now),
         style,
         marketNow,
+        minRsi1h,
       });
       const res = await this.llm("pick", { system: forDesk(PICK_SYSTEM, desk, ds.leader), user: JSON.stringify(input), schema: PICK_SCHEMA });
       if (!res) note = "стелю витрат вичерпано: лише технічний аналіз";
@@ -1469,7 +1473,7 @@ export class Engine extends DurableObject<Env> {
     }
     const choice = choosePick(options, ai)!;
     const { option, levels } = choice;
-    const body: PickBody = { v: 1, factors: option.factors, roomAtr: option.roomAtr, options, ai, note, market: scan.market, style, marketNow };
+    const body: PickBody = { v: 1, factors: option.factors, roomAtr: option.roomAtr, options, ai, note, market: scan.market, style, marketNow, minRsi1h };
     await db
       .prepare(
         `INSERT INTO picks (desk, created_at, run_id, symbol, side, entry_kind, price, entry, stop, target, score, verdict, probability, model, horizon_hours, is_repeat, body)

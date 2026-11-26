@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { choosePick, fastTrend, PICK_SCHEMA, pickInput, pickLevels, rankPicks, resolvePick, sanitizePick, scoreShort, scoreSide, shortMarket, type PickOption } from "../src/worker/pick";
+import { choosePick, fastTrend, hasMomentum, PICK_SCHEMA, pickInput, pickLevels, rankPicks, resolvePick, sanitizePick, scoreShort, scoreSide, shortMarket, type PickOption } from "../src/worker/pick";
 import type { MarketRegime } from "../src/worker/regime";
 import { netR, outcome, summarize, type PickRecord } from "../src/worker/pickStats";
 import { buildSnapshot, type Snapshot } from "../src/worker/snapshot";
@@ -108,6 +108,32 @@ describe("короткий стиль: напрямок на зараз", () => 
     const swing = pickInput({ options, snapshots: new Map(), btc: null, market: riskOff, news: [], horizonHours: 24, minutesToMacro: null, style: "swing" });
     expect(swing.direction_basis).toBe("higher_timeframes");
     expect(swing.market_now).toBeNull();
+  });
+});
+
+describe("фільтр імпульсу", () => {
+  it("RSI 1h у бік угоди: для шорта 100 − RSI", () => {
+    const rsi = up.tf["1h"].rsi14!;
+    expect(rsi).toBeGreaterThan(65);
+    expect(hasMomentum(up, "long", 65)).toBe(true);
+    expect(hasMomentum(up, "short", 65)).toBe(false);
+    expect(hasMomentum(down, "short", 65)).toBe(true);
+    expect(hasMomentum(up, "long", Math.ceil(rsi) + 1)).toBe(false);
+  });
+
+  it("без імпульсу монета не береться; з фільтром лише вхід за ринком", () => {
+    const flat = snapshot("XRPUSDT", path(Array.from({ length: 260 }, (_, i) => 100 + (i % 2 ? 0.5 : -0.5))));
+    const ranked = rankPicks([flat, up, down], riskOn, { minStopPct: 1, style: "swing", minRsi1h: 65 });
+    expect(ranked.map((o) => o.symbol).sort()).toEqual(["ETHUSDT", "SOLUSDT"]);
+    expect(ranked.every((o) => o.pullback === null)).toBe(true);
+    expect(rankPicks([flat, up, down], riskOn, { minStopPct: 1, style: "swing" })).toHaveLength(3);
+  });
+
+  it("модель знає про фільтр", () => {
+    const options = rankPicks([up], riskOn, { minStopPct: 1, style: "swing", minRsi1h: 65 });
+    const base = { options, snapshots: new Map(), btc: null, market: riskOn, news: [], horizonHours: 24, minutesToMacro: null, style: "swing" as const };
+    expect(pickInput({ ...base, minRsi1h: 65 }).momentum_filter_rsi_1h).toBe(65);
+    expect(pickInput({ ...base, minRsi1h: 0 }).momentum_filter_rsi_1h).toBeNull();
   });
 });
 
