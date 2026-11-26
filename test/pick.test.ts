@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { choosePick, PICK_SCHEMA, pickInput, pickLevels, rankPicks, resolvePick, sanitizePick, scoreSide, type PickOption } from "../src/worker/pick";
+import { choosePick, fastTrend, PICK_SCHEMA, pickInput, pickLevels, rankPicks, resolvePick, sanitizePick, scoreShort, scoreSide, shortMarket, type PickOption } from "../src/worker/pick";
 import type { MarketRegime } from "../src/worker/regime";
 import { netR, outcome, summarize, type PickRecord } from "../src/worker/pickStats";
 import { buildSnapshot, type Snapshot } from "../src/worker/snapshot";
@@ -43,17 +43,71 @@ describe("бал технічного аналізу", () => {
   });
 
   it("для кожної монети береться кращий напрямок, найвищий бал першим", () => {
-    const ranked = rankPicks([down, up], riskOn, { minStopPct: 1 });
+    const ranked = rankPicks([down, up], riskOn, { minStopPct: 1, style: "swing" });
     expect(ranked[0]!.symbol).toBe("ETHUSDT");
     expect(ranked[0]!.side).toBe("long");
     expect(ranked.find((o) => o.symbol === "SOLUSDT")!.side).toBe("short");
-    expect(rankPicks([down, up], riskOn, { minStopPct: 1, top: 1 })).toHaveLength(1);
+    expect(rankPicks([down, up], riskOn, { minStopPct: 1, top: 1, style: "swing" })).toHaveLength(1);
   });
 
   it("монета з відкритою ідеєю не береться знову", () => {
     const ranked = rankPicks([down, up], riskOn, { minStopPct: 1, exclude: new Set(["ETHUSDT"]) });
     expect(ranked.map((o) => o.symbol)).toEqual(["SOLUSDT"]);
     expect(rankPicks([down, up], riskOn, { minStopPct: 1, exclude: new Set(["ETHUSDT", "SOLUSDT"]) })).toEqual([]);
+  });
+});
+
+/** Знімок, де старші таймфрейми (4h, 1d) падають, а молодші (15m, 1h) уже кілька годин ростуть. */
+function bounce(symbol: string): Snapshot {
+  const fall = ohlc(flip(path(uptrend(260)), 600), NOW);
+  const rise = ohlc(path(uptrend(260)), NOW);
+  return buildSnapshot({ symbol, now: NOW, candles: { "15m": rise, "1h": rise, "4h": fall, "1d": fall }, funding: null, openInterest: null });
+}
+
+describe("короткий стиль: напрямок на зараз", () => {
+  it("швидкий тренд за close, EMA20 і EMA50", () => {
+    expect(fastTrend({ close: 110, ema20: 105, ema50: 100 })).toBe("up");
+    expect(fastTrend({ close: 90, ema20: 95, ema50: 100 })).toBe("down");
+    expect(fastTrend({ close: 101, ema20: 95, ema50: 100 })).toBe("range");
+    expect(fastTrend({ close: 101, ema20: null, ema50: 100 })).toBeNull();
+  });
+
+  it("ринок зараз: орієнтир і ширина на 1h", () => {
+    const now = shortMarket([bounce("BTCUSDT"), bounce("ETHUSDT"), down], "BTCUSDT");
+    expect(now.leaderTrend1h).toBe("up");
+    expect(now.breadth).toBeCloseTo(2 / 3, 2);
+    expect(now.mood).toBe("risk_on");
+    expect(shortMarket([down], "BTCUSDT")).toEqual({ mood: "mixed", leaderTrend1h: null, leaderTrend15m: null, breadth: 0 });
+  });
+
+  it("у глобальному спаді денний відскок дає лонг, а попередній стиль — шорт", () => {
+    const s = bounce("ETHUSDT");
+    const now = shortMarket([bounce("BTCUSDT"), s], "BTCUSDT");
+    expect(scoreShort(s, "long", now).score).toBeGreaterThan(scoreShort(s, "short", now).score);
+    expect(scoreSide(s, "short", riskOff).score).toBeGreaterThan(scoreSide(s, "long", riskOff).score);
+    const [short] = rankPicks([bounce("BTCUSDT"), s], riskOff, { minStopPct: 1, top: 1 });
+    expect(short!.side).toBe("long");
+    expect(short!.factors.some((f) => f.note.includes("ринок за 1h ризик-он") && f.points > 0)).toBe(true);
+    const [swing] = rankPicks([bounce("BTCUSDT"), s], riskOff, { minStopPct: 1, top: 1, style: "swing" });
+    expect(swing!.side).toBe("short");
+  });
+
+  it("стоп в обох стилях від ATR 4h", () => {
+    const s = bounce("ETHUSDT");
+    const [o] = rankPicks([s], riskOff, { minStopPct: 0, top: 1 });
+    expect(o!.market).toEqual(pickLevels(o!.side, s.price, s.tf["4h"].atr14!, 0));
+  });
+
+  it("модель бачить ринок зараз і основу напрямку", () => {
+    const s = bounce("ETHUSDT");
+    const now = shortMarket([s], "BTCUSDT");
+    const options = rankPicks([s], riskOff, { minStopPct: 1 });
+    const input = pickInput({ options, snapshots: new Map([[s.symbol, s]]), btc: null, market: riskOff, news: [], horizonHours: 24, minutesToMacro: null, style: "short", marketNow: now });
+    expect(input.direction_basis).toBe("short_term");
+    expect(input.market_now).toEqual({ mood_1h: now.mood, btc_trend_1h: null, btc_trend_15m: null, share_above_ema20_1h: 1 });
+    const swing = pickInput({ options, snapshots: new Map(), btc: null, market: riskOff, news: [], horizonHours: 24, minutesToMacro: null, style: "swing" });
+    expect(swing.direction_basis).toBe("higher_timeframes");
+    expect(swing.market_now).toBeNull();
   });
 });
 

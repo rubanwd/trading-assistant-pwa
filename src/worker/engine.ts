@@ -20,7 +20,7 @@ import {
 import { BOT_IDS, botEnabledKey, botInfo, isBotId, TUBE_FALLBACK, tubeConfig, type BotId, type TubeConfig } from "../shared/bots";
 import { planCycle, resolveTube, TUBE_H1_LIMIT, TUBE_H4_LIMIT, tubeFeatures, tubeFeeR, type CyclePlan, type TubeFeatures, type TubeStatus } from "./bots/tube";
 import { marketCaps, topUniverse } from "./bots/universe";
-import { choosePick, PICK_SCHEMA, PICK_SYSTEM, pickInput, rankPicks, resolvePick, sanitizePick, type PickAi, type PickOption } from "./pick";
+import { choosePick, PICK_SCHEMA, PICK_SYSTEM, pickInput, rankPicks, resolvePick, sanitizePick, shortMarket, type PickAi, type PickOption, type PickStyle, type ShortMarket } from "./pick";
 import { loadStats } from "./stats";
 import { sanitizeWeekly, WEEKLY_SCHEMA, WEEKLY_SYSTEM, weeklyBody, weeklyInput, type WeeklyReview } from "./weekly";
 import { BinanceFutures } from "./market/binance";
@@ -137,6 +137,9 @@ export interface PickBody {
   /** Чому модель не відповіла. */
   note: string | null;
   market: MarketRegime;
+  /** Стиль балу і ринок «зараз»; у старих ідеях полів немає (тоді це swing). */
+  style?: PickStyle;
+  marketNow?: ShortMarket | null;
 }
 
 export interface SignalsSummary {
@@ -1411,17 +1414,20 @@ export class Engine extends DurableObject<Env> {
     if (desk === "stocks" && !usSessionOpen(now)) return;
     const scan = ds.scan;
     const db = this.env.DB;
-    const [minStopPct, horizonHours, macro] = await Promise.all([
+    const [minStopPct, horizonHours, macro, style] = await Promise.all([
       this.setting("min_stop_pct", 1),
       this.setting("pick_horizon_hours", 24),
       this.setting<unknown>("macro_events", []),
+      this.setting<PickStyle>("pick_style", "short"),
     ]);
     const rows = await db.prepare("SELECT symbol, features FROM snapshots WHERE run_id = ?").bind(scan.runId).all<{ symbol: string; features: string }>();
     const snapshots = new Map(rows.results.map((r) => [r.symbol, JSON.parse(r.features) as Snapshot]));
     // Інструмент з відкритою ідеєю (ще чекає входу або в позиції) не береться знову, поки та не закриється.
     const busy = await db.prepare("SELECT DISTINCT symbol FROM picks WHERE desk = ? AND status = 'open'").bind(desk).all<{ symbol: string }>();
     const exclude = new Set(busy.results.map((r) => r.symbol));
-    const options = rankPicks([...snapshots.values()], scan.market, { minStopPct, exclude, leader: ds.leader });
+    const all = [...snapshots.values()];
+    const marketNow = style === "short" ? shortMarket(all, ds.leader) : null;
+    const options = rankPicks(all, scan.market, { minStopPct, exclude, leader: ds.leader, style });
     if (!options.length) return;
 
     const newsRows = await db
@@ -1449,6 +1455,8 @@ export class Engine extends DurableObject<Env> {
         news,
         horizonHours,
         minutesToMacro: minutesToMacro(macro, now),
+        style,
+        marketNow,
       });
       const res = await this.llm("pick", { system: forDesk(PICK_SYSTEM, desk, ds.leader), user: JSON.stringify(input), schema: PICK_SCHEMA });
       if (!res) note = "стелю витрат вичерпано: лише технічний аналіз";
@@ -1461,7 +1469,7 @@ export class Engine extends DurableObject<Env> {
     }
     const choice = choosePick(options, ai)!;
     const { option, levels } = choice;
-    const body: PickBody = { v: 1, factors: option.factors, roomAtr: option.roomAtr, options, ai, note, market: scan.market };
+    const body: PickBody = { v: 1, factors: option.factors, roomAtr: option.roomAtr, options, ai, note, market: scan.market, style, marketNow };
     await db
       .prepare(
         `INSERT INTO picks (desk, created_at, run_id, symbol, side, entry_kind, price, entry, stop, target, score, verdict, probability, model, horizon_hours, is_repeat, body)
