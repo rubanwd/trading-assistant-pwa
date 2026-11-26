@@ -18,7 +18,7 @@ export const CHART_RANGE: Record<ChartRange, { tf: "1h" | "4h"; limit: number; t
 };
 export const CHART_RANGE_OPTIONS: [ChartRange, string][] = [["1d", "24 год"], ["3d", "3 дні"], ["10d", "10 днів"]];
 
-export function useCandles(symbol: string | null, tf: "15m" | "1h" | "4h", limit: number) {
+export function useCandles(symbol: string | null, tf: "15m" | "1h" | "4h" | "1d", limit: number) {
   const [candles, setCandles] = useState<Candle[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {

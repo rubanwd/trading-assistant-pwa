@@ -107,6 +107,29 @@ export class BybitLinear implements MarketData {
   }
 
   /**
+   * Історичні ставки фандингу з моментами нарахування в [start, end], від старих до нових. Bybit віддає до 200
+   * за запит від нових до старих, тож ідемо назад від кінця; pages обмежує кількість запитів.
+   */
+  async fundingHistory(symbol: string, start: number, end: number, pages = 3): Promise<{ at: number; rate: number }[]> {
+    const out: { at: number; rate: number }[] = [];
+    let to = end;
+    for (let page = 0; page < pages && to >= start; page++) {
+      const res = await this.get<{ list: { fundingRate: string; fundingRateTimestamp: string }[] }>("/v5/market/funding/history", {
+        category: "linear",
+        symbol,
+        startTime: String(start),
+        endTime: String(to),
+        limit: "200",
+      });
+      const list = res.list.map((r) => ({ at: Number(r.fundingRateTimestamp), rate: Number(r.fundingRate) })).filter((r) => r.at >= start && r.at <= to);
+      out.push(...list);
+      if (res.list.length < 200 || !list.length) break;
+      to = Math.min(...list.map((r) => r.at)) - 1;
+    }
+    return [...new Map(out.map((r) => [r.at, r])).values()].sort((a, b) => a.at - b.at);
+  }
+
+  /**
    * Символи лінійних контрактів одного типу, що зараз торгуються: stock (акції США), ETF тощо.
    * Режим акцій бере stock і ETF, щоб відсіяти зі списку символи без контракту.
    */

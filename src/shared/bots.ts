@@ -5,15 +5,21 @@ import type { Desk } from "./desk";
  * Поки це паперова торгівля на публічних даних Bybit: ордери не йдуть на біржу, виконання рахує код за свічками.
  */
 
-export const BOT_IDS = ["hvt", "hvb"] as const;
+export const BOT_IDS = ["hvt", "hvb", "c2010"] as const;
 export type BotId = (typeof BOT_IDS)[number];
 export const isBotId = (v: unknown): v is BotId => typeof v === "string" && (BOT_IDS as readonly string[]).includes(v);
 
+/** Боти «труби» (High Value Tube і High Value Breakout): щогодинні ордери на найрухливіших монетах топ-20. */
+export const TUBE_BOT_IDS = ["hvt", "hvb"] as const;
+export type TubeBotId = (typeof TUBE_BOT_IDS)[number];
+export const isTubeBot = (v: unknown): v is TubeBotId => typeof v === "string" && (TUBE_BOT_IDS as readonly string[]).includes(v);
+
 /**
  * fade — лімітки на відстані від ціни ловлять різкий рух і виходять на відкаті (High Value Tube);
- * breakout — стоп-ордери на тій самій відстані входять у бік руху, коли ціна її проходить (High Value Breakout).
+ * breakout — стоп-ордери на тій самій відстані входять у бік руху, коли ціна її проходить (High Value Breakout);
+ * channel — денний пробій каналу з підтягуванням стопа за коротшим каналом, без тейка (Channel 20/10).
  */
-export type BotMode = "fade" | "breakout";
+export type BotMode = "fade" | "breakout" | "channel";
 
 export interface BotInfo {
   id: BotId;
@@ -38,6 +44,13 @@ export const BOTS: BotInfo[] = [
     desk: "crypto",
     mode: "breakout",
     summary: "Ті самі 3 найрухливіші монети, але навпаки: стоп-ордери над і під ціною входять у бік різкого руху, коли ціна проходить край «труби», і забирають продовження.",
+  },
+  {
+    id: "c2010",
+    name: "Channel 20/10",
+    desk: "crypto",
+    mode: "channel",
+    summary: "BTC на денних свічках: вхід за ринком, коли доба закрилась вище максимуму чи нижче мінімуму попередніх 20 днів; стоп за 10-денним каналом щодня підтягується, тейка немає. Одна позиція.",
   },
 ];
 
@@ -91,7 +104,7 @@ export interface TubeConfig {
 }
 
 /** Стартові значення: підібрані бектестом на 2023-11 — 2025-10 і перевірені на 2025-11 — 2026-10 (див. README). */
-export const BOT_DEFAULTS: Record<BotId, TubeConfig> = {
+export const BOT_DEFAULTS: Record<TubeBotId, TubeConfig> = {
   hvt: {
     topN: 20,
     pickN: 3,
@@ -124,7 +137,7 @@ export const BOT_DEFAULTS: Record<BotId, TubeConfig> = {
 export const TUBE_DEFAULTS = BOT_DEFAULTS.hvt;
 
 /** Префікс налаштувань бота: tube_* для High Value Tube, brk_* для High Value Breakout. */
-export const BOT_PREFIX: Record<BotId, string> = { hvt: "tube", hvb: "brk" };
+export const BOT_PREFIX: Record<BotId, string> = { hvt: "tube", hvb: "brk", c2010: "chn" };
 
 const FIELD_KEY: Record<keyof TubeConfig, string> = {
   topN: "top_n",
@@ -142,7 +155,7 @@ const FIELD_KEY: Record<keyof TubeConfig, string> = {
 };
 
 /** Ключі налаштувань бота для кожного поля. */
-export const botKeys = (id: BotId): Record<keyof TubeConfig, string> =>
+export const botKeys = (id: TubeBotId): Record<keyof TubeConfig, string> =>
   Object.fromEntries(Object.entries(FIELD_KEY).map(([f, k]) => [f, `${BOT_PREFIX[id]}_${k}`])) as Record<keyof TubeConfig, string>;
 /** Ключ «бот увімкнено»: on | off. */
 export const botEnabledKey = (id: BotId) => `${BOT_PREFIX[id]}_enabled`;
@@ -163,7 +176,7 @@ export const TUBE_LIMITS: Record<NumField, { min: number; max: number; integer?:
 };
 
 /** Налаштування бота з таблиці settings; непридатне значення замінюється стартовим. */
-export function tubeConfig(values: Record<string, unknown>, id: BotId = "hvt"): TubeConfig {
+export function tubeConfig(values: Record<string, unknown>, id: TubeBotId = "hvt"): TubeConfig {
   const out = { ...BOT_DEFAULTS[id] };
   const keys = botKeys(id);
   for (const [field, limits] of Object.entries(TUBE_LIMITS) as [NumField, (typeof TUBE_LIMITS)[NumField]][]) {
@@ -176,5 +189,53 @@ export function tubeConfig(values: Record<string, unknown>, id: BotId = "hvt"): 
     const v = values[keys[field]];
     if (v === "on" || v === "off") out[field] = v === "on";
   }
+  return out;
+}
+
+// ── Channel 20/10 ──────────────────────────────────────────────────────────
+
+/** Налаштування бота Channel 20/10. Однакові для рушія й бектесту. */
+export interface ChannelConfig {
+  /** Контракт Bybit (linear USDT perpetual). Стратегія задумана для BTCUSDT. */
+  symbol: string;
+  /** Канал входу: найбільший High / найменший Low попередніх N завершених діб, без свічки сигналу. */
+  entryDays: number;
+  /** Канал стопа: найменший Low / найбільший High останніх N завершених діб, разом зі свічкою сигналу. */
+  exitDays: number;
+  /**
+   * Скільки годин від початку доби UTC сигнал ще можна виконати. Рушій прокидається о :03 і :33;
+   * якщо перший цикл нової доби запізнився більше, сигнал прострочений — заднім числом бот не входить.
+   */
+  entryWindowHours: number;
+}
+
+/** Стартові значення — правила стратегії 20/10. За бектестом їх не підбирали. */
+export const CHANNEL_DEFAULTS: ChannelConfig = { symbol: "BTCUSDT", entryDays: 20, exitDays: 10, entryWindowHours: 2 };
+
+type ChannelNum = Exclude<keyof ChannelConfig, "symbol">;
+export const CHANNEL_LIMITS: Record<ChannelNum, { min: number; max: number; integer?: boolean }> = {
+  entryDays: { min: 5, max: 100, integer: true },
+  exitDays: { min: 2, max: 100, integer: true },
+  entryWindowHours: { min: 1, max: 12 },
+};
+
+export const CHANNEL_KEYS: Record<keyof ChannelConfig, string> = {
+  symbol: "chn_symbol",
+  entryDays: "chn_entry_days",
+  exitDays: "chn_exit_days",
+  entryWindowHours: "chn_entry_window_hours",
+};
+
+const CHANNEL_SYMBOL = /^[A-Z0-9]{2,20}USDT$/;
+
+/** Налаштування Channel 20/10 з таблиці settings; непридатне значення замінюється стартовим. */
+export function channelConfig(values: Record<string, unknown>): ChannelConfig {
+  const out = { ...CHANNEL_DEFAULTS };
+  for (const [field, l] of Object.entries(CHANNEL_LIMITS) as [ChannelNum, (typeof CHANNEL_LIMITS)[ChannelNum]][]) {
+    const v = values[CHANNEL_KEYS[field]];
+    if (typeof v === "number" && Number.isFinite(v) && v >= l.min && v <= l.max && (!l.integer || Number.isInteger(v))) out[field] = v;
+  }
+  const sym = values[CHANNEL_KEYS.symbol];
+  if (typeof sym === "string" && CHANNEL_SYMBOL.test(sym)) out.symbol = sym;
   return out;
 }

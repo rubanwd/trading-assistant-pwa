@@ -1,35 +1,16 @@
 import { useEffect, useState } from "react";
 import type { BotId, BotInfo, BotMode, TubeConfig } from "../shared/bots";
 import { positionSize } from "../shared/risk";
-import { BOT_BACKTESTS } from "../shared/tubeBacktest";
+import { Backtest, GroupLine, OUTCOME, PERIODS, SIDE, WORD, type Group, type Outcome, type Period, type Side } from "./botParts";
+import { ChannelView } from "./ChannelBot";
 import { fmtPrice, useLivePrice } from "./live";
 import { EquityCurve } from "./Stats";
 import { api, c, card, coin, day, dim, h2, label, num, p, pct, secondary, signed, time, tone, useDesk } from "./ui";
 import { LiveDot, Meter, Pill, PriceChart, Ring, Segmented, Skeleton, Stat, useCandles } from "./viz";
 
-type Side = "long" | "short";
 type Bias = "bull" | "bear" | "neutral";
 type Status = "pending" | "cancelled" | "open" | "target" | "stop" | "timeout";
-type Outcome = "win" | "loss" | "open" | "pending" | "cancelled";
 
-/** Підсумок групи ордерів бота (як TubeGroup у рушії): R після комісій. */
-interface Group {
-  orders: number;
-  filled: number;
-  cancelled: number;
-  pending: number;
-  open: number;
-  closed: number;
-  wins: number;
-  losses: number;
-  target: number;
-  stop: number;
-  timeout: number;
-  winRate: number | null;
-  avgR: number | null;
-  totalR: number;
-  fillRate: number | null;
-}
 interface Features { symbol: string; price: number; atr: number; atrPct: number; ema20: number; rsi: number | null; volRatio: number | null; change24hPct: number | null; trend4h: "up" | "down" | "range" | null; score: number }
 interface Order {
   id: number;
@@ -81,7 +62,6 @@ interface BotListItem extends BotInfo {
   lastCycle: { at: string; bias: Bias | null; chosen: string[]; placed: number; open: number; note: string | null } | null;
 }
 
-const SIDE = { long: { text: "Лонг", icon: "▲", color: c.up }, short: { text: "Шорт", icon: "▼", color: c.down } } as const;
 const BIAS: Record<Bias, { text: string; icon: string; color: string }> = {
   bull: { text: "бичачий", icon: "▲", color: c.up },
   bear: { text: "ведмежий", icon: "▼", color: c.down },
@@ -95,20 +75,7 @@ const STATUS: Record<Status, { text: string; color: string }> = {
   stop: { text: "стоп", color: c.down },
   timeout: { text: "за часом", color: c.dim },
 };
-const OUTCOME: Record<Outcome, { text: string; icon: string; color: string }> = {
-  win: { text: "у плюсі", icon: "✓", color: c.up },
-  loss: { text: "у мінусі", icon: "✗", color: c.down },
-  open: { text: "відкрита", icon: "◷", color: c.blue },
-  pending: { text: "чекає", icon: "◷", color: c.blue },
-  cancelled: { text: "знята", icon: "–", color: c.faint },
-};
 const TREND = { up: "▲ вгору", down: "▼ вниз", range: "боковик" } as const;
-
-/** Слова для ордерів бота: лімітки в High Value Tube, стоп-ордери в High Value Breakout. */
-const WORD: Record<BotMode, { one: string; many: string; gen: string; near: string; far: string; Many: string }> = {
-  fade: { one: "лімітка", many: "лімітки", gen: "ліміток", near: "ближча лімітка", far: "дальня лімітка", Many: "Лімітки" },
-  breakout: { one: "стоп-ордер", many: "стоп-ордери", gen: "стоп-ордерів", near: "ближчий стоп-ордер", far: "дальній стоп-ордер", Many: "Стоп-ордери" },
-};
 
 const distPct = (from: number, to: number) => ((to - from) / from) * 100;
 const times = (ratio: number) => (ratio === 2 ? "удвічі" : `у ${ratio} раза`);
@@ -143,18 +110,24 @@ function BotCard({ b, onOpen }: { b: BotListItem; onOpen: () => void }) {
         <Stat label="У плюсі" value={pct(s.winRate)} color={s.winRate === null ? undefined : s.winRate >= 0.5 ? c.up : c.orange} sub={`${s.wins} з ${s.closed}`} />
         <Stat label="Результат" value={s.closed ? `${signed(s.totalR)}R` : "—"} color={s.closed ? tone(s.totalR) : undefined} sub="після комісій" />
       </div>
-      {last && (
-        <span style={{ fontSize: 12, color: c.dim }}>
-          Остання година {time(last.at)}: {last.chosen.map(coin).join(", ") || "без монет"} · ринок {last.bias ? BIAS[last.bias].text : "—"} · {WORD[b.mode].gen} {last.placed}
-        </span>
-      )}
+      {last &&
+        (b.mode === "channel" ? (
+          <span style={{ fontSize: 12, color: c.dim }}>
+            Остання година {time(last.at)}: {coin(last.chosen[0] ?? "BTCUSDT")} · {last.open ? "позиція відкрита" : "без позиції, чекає пробою"}
+            {last.placed ? " · новий вхід" : ""}
+          </span>
+        ) : (
+          <span style={{ fontSize: 12, color: c.dim }}>
+            Остання година {time(last.at)}: {last.chosen.map(coin).join(", ") || "без монет"} · ринок {last.bias ? BIAS[last.bias].text : "—"} · {WORD[b.mode].gen} {last.placed}
+          </span>
+        ))}
       <span style={{ fontSize: 13, fontWeight: 600, color: c.blue }}>Відкрити →</span>
     </button>
   );
 }
 
 /** Розділ «Боти»: список ботів, а вибраний бот відкривається окремою сторінкою. Поки боти працюють лише з крипто. */
-const BOT_IDS_WEB: BotId[] = ["hvt", "hvb"];
+const BOT_IDS_WEB: BotId[] = ["hvt", "hvb", "c2010"];
 
 export function Bots({ openId, onOpen }: { openId: string | null; onOpen: (id: string | null) => void }) {
   const desk = useDesk();
@@ -168,11 +141,12 @@ export function Bots({ openId, onOpen }: { openId: string | null; onOpen: (id: s
     return (
       <section style={card}>
         <h2 style={h2}>Боти поки лише для крипто</h2>
-        <p style={dim}>Боти торгують ф'ючерсами монет з топ-20 за капіталізацією на Bybit. Перемкни ринок на «Крипто» вгорі.</p>
+        <p style={dim}>Боти торгують ф'ючерсами крипто на Bybit. Перемкни ринок на «Крипто» вгорі.</p>
       </section>
     );
   }
   const bot = BOT_IDS_WEB.find((x) => x === openId);
+  if (bot === "c2010") return <ChannelView key={bot} id={bot} onBack={() => onOpen(null)} />;
   if (bot) return <BotView key={bot} id={bot} onBack={() => onOpen(null)} />;
   return (
     <>
@@ -405,30 +379,6 @@ function SummaryCard({ d }: { d: BotPage }) {
   );
 }
 
-function GroupLine({ name, g }: { name: string; g: Group }) {
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 5, padding: "8px 0", borderBottom: `1px solid ${c.line}` }}>
-      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, fontSize: 14 }}>
-        <span style={{ fontWeight: 600 }}>{name}</span>
-        <span style={{ ...num, fontWeight: 700, color: g.closed ? tone(g.totalR) : c.dim }}>{g.closed ? `${signed(g.totalR)}R` : "—"}</span>
-      </div>
-      {g.closed > 0 ? (
-        <>
-          <div style={{ display: "flex", height: 6, borderRadius: 3, overflow: "hidden", gap: 2 }} aria-hidden>
-            {g.wins > 0 && <div style={{ width: `${(g.wins / g.closed) * 100}%`, background: c.up }} />}
-            {g.losses > 0 && <div style={{ flex: 1, background: `${c.down}AA` }} />}
-          </div>
-          <span style={{ ...num, fontSize: 12, color: c.dim }}>
-            ✓ {g.wins} · ✗ {g.losses} · {pct(g.winRate)} у плюсі · середнє {g.avgR === null ? "—" : `${signed(g.avgR, 3)}R`}
-          </span>
-        </>
-      ) : (
-        <span style={{ fontSize: 12, color: c.dim }}>{g.filled ? `${g.filled} угод, жодна ще не закрилась` : "угод немає"}</span>
-      )}
-    </div>
-  );
-}
-
 function Breakdown({ d }: { d: BotPage }) {
   const s = d.summary;
   const [more, setMore] = useState(false);
@@ -459,63 +409,6 @@ function Breakdown({ d }: { d: BotPage }) {
           )}
         </>
       )}
-    </section>
-  );
-}
-
-/** Бектест стратегії на історії: ті самі правила й код виконання, що в боті (npm run backtest:tube). */
-function Backtest({ id, mode }: { id: BotId; mode: BotMode }) {
-  const b = BOT_BACKTESTS[id];
-  const [open, setOpen] = useState(false);
-  const row = (s: (typeof b.periods)[number]) => (
-    <div key={s.key} style={{ display: "flex", flexDirection: "column", gap: 2, padding: "6px 0", borderBottom: `1px solid ${c.line}` }}>
-      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 52px 44px 64px", gap: 6, fontSize: 13 }}>
-        <span style={{ fontWeight: 600 }}>{s.label}</span>
-        <span style={{ ...num, textAlign: "right" }}>{s.trades}</span>
-        <span style={{ ...num, textAlign: "right" }}>{pct(s.winRate)}</span>
-        <span style={{ ...num, textAlign: "right", fontWeight: 700, color: tone(s.avgR) }}>{signed(s.avgR, 3)}R</span>
-      </div>
-      <span style={{ fontSize: 11, color: c.dim }}>{s.note}</span>
-    </div>
-  );
-  const full = b.periods.find((x) => x.key === "full")!;
-  return (
-    <section style={card}>
-      <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
-        <h2 style={h2}>Бектест</h2>
-        <span style={{ fontSize: 12, color: c.dim, marginLeft: "auto" }}>
-          {b.from} — {b.to}
-        </span>
-      </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 10 }}>
-        <Stat label="Угод на добу" value={full.perDay.toFixed(1)} />
-        <Stat label="У плюсі" value={pct(full.winRate)} />
-        <Stat label="Середнє" value={`${signed(full.avgR, 3)}R`} color={tone(full.avgR)} sub={full.ci ? `95%: ${signed(full.ci[0])}…${signed(full.ci[1])}` : undefined} />
-        <Stat label="Разом" value={`${signed(full.totalR, 0)}R`} color={tone(full.totalR)} />
-        <Stat label="Просадка" value={`${full.maxDrawdownR.toFixed(0)}R`} color={c.down} />
-        <Stat label="Виконалось" value={pct(full.fillRate)} sub={WORD[mode].gen} />
-      </div>
-      <p style={{ ...p, fontSize: 13 }}>{b.verdict}</p>
-      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 52px 44px 64px", gap: 6, fontSize: 11, color: c.faint }}>
-        <span />
-        <span style={{ textAlign: "right" }}>угод</span>
-        <span style={{ textAlign: "right" }}>у плюсі</span>
-        <span style={{ textAlign: "right" }}>середнє</span>
-      </div>
-      {b.periods.filter((x) => x.key !== "full").map(row)}
-      <button type="button" onClick={() => setOpen(!open)} style={{ background: "none", border: 0, color: c.blue, font: "600 13px Inter, system-ui, sans-serif", textAlign: "left", padding: 0, minHeight: 32, cursor: "pointer" }}>
-        {open ? "Сховати ▴" : "Що ще перевірено ▾"}
-      </button>
-      {open && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          {b.findings.map((f) => (
-            <p key={f} style={{ ...dim, fontSize: 12 }}>
-              • {f}
-            </p>
-          ))}
-        </div>
-      )}
-      <p style={{ ...dim, fontSize: 11 }}>{b.source}</p>
     </section>
   );
 }
@@ -657,9 +550,6 @@ function Cycles({ cycles, mode }: { cycles: Cycle[]; mode: BotMode }) {
     </section>
   );
 }
-
-type Period = "all" | "30" | "7";
-const PERIODS: [Period, string][] = [["all", "Увесь час"], ["30", "30 днів"], ["7", "7 днів"]];
 
 /** Сторінка бота: що він робить зараз, як торгував, бектест і кожна угода. */
 function BotView({ id, onBack }: { id: BotId; onBack: () => void }) {
