@@ -316,3 +316,24 @@ export function carryConfig(values: Record<string, unknown>): CarryConfig {
   if (out.exitApr > out.entryApr) out.exitApr = out.entryApr;
   return out;
 }
+
+// ── Трендовий кошик ────────────────────────────────────────────────────────
+
+/** Налаштування трендового кошика (поки лише бектест). */
+export interface TrendBasketConfig {
+  /** Монет у списку: найбільші за обігом. Монета, що вже в позиції, тримається, поки вона в топ-2N. */
+  topN: number;
+  /** Лонг, коли денне закриття вище простої середньої за smaDays; інакше без позиції. */
+  smaDays: number;
+  /** Волатильність — стандартне відхилення денних доходностей за volDays, у річному виразі. */
+  volDays: number;
+  /** Цільова річна волатильність кожної позиції: частка = (1/topN) × targetVol / волатильність монети, не більше 2/topN. */
+  targetVol: number;
+  /** Позиція перераховується, лише коли ціль відходить від поточної більше ніж на цю частку (зменшує обіг). */
+  band: number;
+  /** long — лише лонги; both — нижче середньої шорт. */
+  sides: "long" | "both";
+}
+
+/** Стартові значення вибрано до бектесту за дослідженнями часового моментуму в крипті. */
+export const TREND_BASKET_DEFAULTS: TrendBasketConfig = { topN: 10, smaDays: 50, volDays: 30, targetVol: 0.5, band: 0.25, sides: "long" };

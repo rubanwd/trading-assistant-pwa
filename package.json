@@ -17,7 +17,8 @@
     "patterns": "tsx scripts/patterns.ts",
     "backtest:channel": "tsx scripts/channel-backtest.ts",
     "backtest:momentum": "tsx scripts/momentum-backtest.ts",
-    "backtest:carry": "tsx scripts/carry-backtest.ts"
+    "backtest:carry": "tsx scripts/carry-backtest.ts",
+    "backtest:trend": "tsx scripts/trend-backtest.ts"
   },
   "dependencies": {
     "@pushforge/builder": "^2.0.5",
