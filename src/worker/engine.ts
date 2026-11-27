@@ -17,7 +17,8 @@ import {
   type Pipeline,
   type Transport,
 } from "./llm";
-import { BOT_IDS, botEnabledKey, botInfo, carryConfig, channelConfig, isTubeBot, SPOT_TAKER_PCT, TUBE_BOT_IDS, TUBE_FALLBACK, tubeConfig, type ChannelConfig, type TubeBotId, type TubeConfig } from "../shared/bots";
+import { BOT_IDS, botEnabledKey, botInfo, carryConfig, channelConfig, isTubeBot, SPOT_TAKER_PCT, trendConfig, TUBE_BOT_IDS, TUBE_FALLBACK, tubeConfig, type ChannelConfig, type TubeBotId, type TubeConfig } from "../shared/bots";
+import { DAY_MS as TREND_DAY, trendState, trendTargets, withBand, type TrendState } from "./bots/trend";
 import { carryLegCost, carryNetPct, DAY_MS as CARRY_DAY, fundingApr, planCarry, spotBase, type FundingEvent } from "./bots/carry";
 import {
   advanceChannel,
@@ -272,6 +273,27 @@ export interface CarryCycleDetail {
   /** Нараховано за позиціями до цього циклу й комісії входів і виходів доби, % капіталу. */
   fundingPct: number;
   feePct: number;
+  bias: null;
+  chosen: string[];
+  placed: number;
+  open: number;
+  note: string | null;
+  errors: string[];
+}
+
+/** Підсумок доби Trend Basket у runs.detail (kind = 'bot'). Поля bias, chosen, placed, open — як у інших ботів. */
+export interface TrendCycleDetail {
+  bot: "trend";
+  universe: { source: string; size: number; error: string | null };
+  /** Монети списку й позиції: закриття, середня, волатильність, ціль і частка після циклу (знакові частки капіталу). */
+  ranked: (Omit<TrendState, "dir"> & { dir: -1 | 0 | 1 | null; target: number | null; weight: number })[];
+  entered: { symbol: string; weight: number }[];
+  exited: { symbol: string; reason: string; pnlPct: number }[];
+  resized: { symbol: string; from: number; to: number }[];
+  pnlPct: number;
+  feePct: number;
+  fundingPct: number;
+  exposure: number;
   bias: null;
   chosen: string[];
   placed: number;
@@ -1633,7 +1655,9 @@ export class Engine extends DurableObject<Env> {
   private async botUniverseNeed(): Promise<number> {
     const values = Object.fromEntries(await this.settingsMap());
     const carry = values[botEnabledKey("carry")] !== "off" ? carryConfig(values).topN : 0;
-    return Math.max(await this.botUniverseSize(), carry);
+    // Trend Basket тримає позицію, поки монета у вдвічі ширшому списку.
+    const trend = values[botEnabledKey("trend")] !== "off" ? trendConfig(values).topN * 2 : 0;
+    return Math.max(await this.botUniverseSize(), carry, trend);
   }
 
   /**
@@ -1660,6 +1684,7 @@ export class Engine extends DurableObject<Env> {
     if (a === "data") return this.botData(Number(b), now);
     if (a === "c2010" && b === "run") return this.channelRun(now);
     if (a === "carry" && b === "run") return this.carryRun(now);
+    if (a === "trend" && b === "run") return this.trendRun(now);
     if (isTubeBot(a) && b === "run") return this.botRun(a, now);
   }
 
@@ -1978,6 +2003,182 @@ export class Engine extends DurableObject<Env> {
     );
     await db.batch(statements);
     await this.ctx.storage.put(`cry-day:${id}`, day);
+    await this.logRun("bot", started, detail, null, "crypto");
+  }
+
+  /**
+   * Доба Trend Basket: раз на добу, у перший цикл після 00:00 UTC. Переоцінка позицій за марк-ціною й нарахування
+   * фандингу, потім сигнал (закриття вище середньої) і частки за волатильністю на денних свічках Bybit (кеш), перебалансування
+   * зі смугою. Виконання паперове — за марк-ціною в момент циклу. Запитів: марк-ціни (один), денні свічки монет списку
+   * (з кешу — лише нові) і історія фандингу по позиціях — до ~30 при списку 10.
+   */
+  private async trendRun(now: number): Promise<void> {
+    const id = "trend" as const;
+    await this.ctx.storage.put(`bot-last:${id}`, now);
+    const day = Math.floor(now / TREND_DAY) * TREND_DAY;
+    const lastDay = await this.ctx.storage.get<number>(`trb-day:${id}`);
+    if (lastDay !== undefined && lastDay >= day) return;
+    const started = Date.now();
+    const db = this.env.DB;
+    const values = Object.fromEntries(await this.settingsMap());
+    const cfg = trendConfig(values);
+    const enabled = values[botEnabledKey(id)] !== "off";
+    const cost = botFees(values).takerPct / 100;
+    const iso = (t: number) => new Date(t).toISOString();
+    const errors: string[] = [];
+    const detail: TrendCycleDetail = {
+      bot: id, universe: { source: "fallback", size: 0, error: null }, ranked: [], entered: [], exited: [], resized: [], pnlPct: 0, feePct: 0, fundingPct: 0, exposure: 0,
+      bias: null, chosen: [], placed: 0, open: 0, note: null, errors,
+    };
+    type Holding = { id: number; symbol: string; side: "long" | "short"; units: number; last_price: number; last_funding_at: string | null; opened_at: string; pnl: number; fee: number; funding: number; resizes: number };
+    const open = await db
+      .prepare("SELECT id, symbol, side, units, last_price, last_funding_at, opened_at, pnl, fee, funding, resizes FROM trend_holdings WHERE status = 'open' ORDER BY id")
+      .all<Holding>();
+    if (!enabled && !open.results.length) {
+      await this.ctx.storage.put(`trb-day:${id}`, day);
+      return;
+    }
+    const bybit = new BybitLinear(this.http);
+    let marks: Map<string, { markPrice: number }>;
+    try {
+      marks = await bybit.funding();
+    } catch (e) {
+      // Без цін ні переоцінки, ні виконання: спробуємо наступної години.
+      await this.logRun("bot", started, { ...detail, note: "немає марк-цін Bybit" }, `ціни: ${String(e)}`.slice(0, 300), "crypto");
+      return;
+    }
+    const universe = await this.ctx.storage.get<BotUniverse>(UNIVERSE_KEY);
+    const list = universe?.symbols ?? TUBE_FALLBACK;
+    const top = list.slice(0, cfg.topN);
+    const wide = new Set(list.slice(0, cfg.topN * 2));
+    detail.universe = { source: universe?.source ?? "fallback", size: top.length, error: universe?.error ?? null };
+    const held = new Map(open.results.map((h) => [h.symbol, { ...h }]));
+    const evaluate = [...new Set([...top, ...[...held.keys()].filter((s) => wide.has(s))])];
+
+    // Денні свічки через кеш рушія; потрібна свіжа свічка вчорашньої доби.
+    const market = this.botMarket();
+    const need = Math.max(cfg.smaDays, cfg.volDays + 1) + 5;
+    const states = new Map<string, TrendState>();
+    const failed = new Set<string>();
+    for (let i = 0; i < evaluate.length; i += 3) {
+      await Promise.all(
+        evaluate.slice(i, i + 3).map(async (symbol) => {
+          try {
+            const daily = (await market.candles(symbol, "1d", need)).filter((c) => c.openTime < day);
+            const last = daily[daily.length - 1];
+            const st = last && last.openTime === day - TREND_DAY ? trendState({ symbol, daily }, cfg) : null;
+            if (st) states.set(symbol, st);
+            else errors.push(`${symbol}: замало свіжих денних свічок`);
+          } catch (e) {
+            failed.add(symbol);
+            errors.push(`${symbol}: ${String(e)}`.slice(0, 200));
+          }
+        }),
+      );
+    }
+    const targets = enabled ? trendTargets([...states.values()], cfg) : new Map<string, number>();
+
+    const statements: D1PreparedStatement[] = [];
+    const update = db.prepare("UPDATE trend_holdings SET units = ?, last_price = ?, last_funding_at = ?, pnl = ?, fee = ?, funding = ?, resizes = ? WHERE id = ?");
+    const close = db.prepare(
+      "UPDATE trend_holdings SET status = 'closed', closed_at = ?, exit_price = ?, units = 0, last_price = ?, last_funding_at = ?, pnl = ?, fee = ?, funding = ?, resizes = ?, reason = ? WHERE id = ?",
+    );
+    const insert = db.prepare("INSERT INTO trend_holdings (symbol, side, opened_at, entry_price, entry_weight, units, last_price, last_funding_at, fee) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    const weights = new Map<string, number>();
+    const opened = (symbol: string, w: number, price: number) => {
+      const fee = Math.abs(w) * cost;
+      detail.feePct += fee * 100;
+      detail.entered.push({ symbol, weight: Number(w.toFixed(4)) });
+      weights.set(symbol, w);
+      statements.push(insert.bind(symbol, w > 0 ? "long" : "short", iso(now), price, Math.abs(w), w / price, price, iso(now), fee));
+    };
+
+    // 1. Переоцінка, фандинг і рішення по відкритих позиціях.
+    for (const h of held.values()) {
+      const mark = marks.get(h.symbol)?.markPrice;
+      if (!mark) {
+        // Контракту більше немає: закриваємо за останньою ціною.
+        detail.exited.push({ symbol: h.symbol, reason: "no_data", pnlPct: Number(((h.pnl - h.fee + h.funding) * 100).toFixed(4)) });
+        statements.push(close.bind(iso(now), h.last_price, h.last_price, h.last_funding_at, h.pnl, h.fee, h.funding, h.resizes, "no_data", h.id));
+        continue;
+      }
+      const move = h.units * (mark - h.last_price);
+      h.pnl += move;
+      detail.pnlPct += move * 100;
+      try {
+        const since = h.last_funding_at ? Date.parse(h.last_funding_at) + 1 : Date.parse(h.opened_at);
+        const ev = await bybit.fundingHistory(h.symbol, since, now, 3);
+        if (ev.length) {
+          const paid = -ev.reduce((sum, e) => sum + e.rate, 0) * h.units * mark;
+          h.funding += paid;
+          detail.fundingPct += paid * 100;
+          h.last_funding_at = iso(Math.max(...ev.map((e) => e.at)));
+        }
+      } catch (e) {
+        // Нарахування не пропадуть: наступна доба візьме їх з того самого моменту.
+        errors.push(`${h.symbol} фандинг: ${String(e)}`.slice(0, 200));
+      }
+      const cur = h.units * mark;
+      // Монета без свіжих свічок (помилка запиту чи затримка біржі) лишається як є; поза ширшим списком — ціль 0.
+      const keep = enabled && wide.has(h.symbol) && (failed.has(h.symbol) || !states.has(h.symbol));
+      const target = keep ? cur : wide.has(h.symbol) ? (targets.get(h.symbol) ?? 0) : 0;
+      const w = keep ? cur : withBand(cur, target, cfg.band);
+      if (w !== 0 && Math.sign(w) === Math.sign(cur)) {
+        if (w !== cur) {
+          const fee = Math.abs(w - cur) * cost;
+          h.fee += fee;
+          detail.feePct += fee * 100;
+          h.resizes++;
+          detail.resized.push({ symbol: h.symbol, from: Number(cur.toFixed(4)), to: Number(w.toFixed(4)) });
+        }
+        weights.set(h.symbol, w);
+        statements.push(update.bind(w / mark, mark, h.last_funding_at, h.pnl, h.fee, h.funding, h.resizes, h.id));
+        continue;
+      }
+      const fee = Math.abs(cur) * cost;
+      h.fee += fee;
+      detail.feePct += fee * 100;
+      const reason = !enabled ? "disabled" : !wide.has(h.symbol) ? "dropped" : h.side === "long" ? "below_sma" : "above_sma";
+      detail.exited.push({ symbol: h.symbol, reason, pnlPct: Number(((h.pnl - h.fee + h.funding) * 100).toFixed(4)) });
+      statements.push(close.bind(iso(now), mark, mark, h.last_funding_at, h.pnl, h.fee, h.funding, h.resizes, reason, h.id));
+      // Зміна знака — новий епізод.
+      if (w !== 0) opened(h.symbol, w, mark);
+    }
+
+    // 2. Нові позиції.
+    for (const [symbol, w] of targets) {
+      if (w === 0 || held.has(symbol)) continue;
+      const mark = marks.get(symbol)?.markPrice;
+      if (!mark) continue;
+      opened(symbol, w, mark);
+    }
+
+    detail.ranked = evaluate
+      .map((symbol) => {
+        const st = states.get(symbol);
+        return {
+          symbol, close: st?.close ?? 0, sma: st?.sma ?? 0, vol: st?.vol ?? 0, dir: st?.dir ?? null,
+          target: targets.has(symbol) ? Number(targets.get(symbol)!.toFixed(4)) : null, weight: Number((weights.get(symbol) ?? 0).toFixed(4)),
+        };
+      })
+      .sort((a, b) => Math.abs(b.weight) - Math.abs(a.weight) || (b.sma ? b.close / b.sma : 0) - (a.sma ? a.close / a.sma : 0));
+    detail.exposure = Number([...weights.values()].reduce((sum, w) => sum + Math.abs(w), 0).toFixed(4));
+    detail.chosen = [...weights.keys()];
+    detail.placed = detail.entered.length;
+    detail.open = weights.size;
+    detail.pnlPct = Number(detail.pnlPct.toFixed(4));
+    detail.feePct = Number(detail.feePct.toFixed(4));
+    detail.fundingPct = Number(detail.fundingPct.toFixed(4));
+    if (!enabled) detail.note = "бот вимкнений: позиції закриваються, нових немає";
+    statements.push(
+      db
+        .prepare(
+          "INSERT INTO trend_days (day, pnl_pct, fee_pct, funding_pct, exposure, positions) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (day) DO UPDATE SET pnl_pct = pnl_pct + excluded.pnl_pct, fee_pct = fee_pct + excluded.fee_pct, funding_pct = funding_pct + excluded.funding_pct, exposure = excluded.exposure, positions = excluded.positions",
+        )
+        .bind(iso(day).slice(0, 10), detail.pnlPct, detail.feePct, detail.fundingPct, detail.exposure, weights.size),
+    );
+    await db.batch(statements);
+    await this.ctx.storage.put(`trb-day:${id}`, day);
     await this.logRun("bot", started, detail, null, "crypto");
   }
 

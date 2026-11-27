@@ -11,7 +11,7 @@ import { calibration, hit, loadStats } from "./stats";
 import { netR, outcome, summarize, type PickRecord } from "./pickStats";
 import type { Fees } from "../shared/risk";
 import { CRYPTO_LEADER, parseDesk, STOCKS_LEADER_DEFAULT, type Desk } from "../shared/desk";
-import { botEnabledKey, botKeys, BOTS, CARRY_KEYS, carryConfig, CHANNEL_KEYS, channelConfig, isBotId, tubeConfig, type BotId } from "../shared/bots";
+import { botEnabledKey, botKeys, BOTS, CARRY_KEYS, carryConfig, TREND_KEYS, trendConfig, CHANNEL_KEYS, channelConfig, isBotId, tubeConfig, type BotId } from "../shared/bots";
 import { carryNetPct } from "./bots/carry";
 import { netR as tubeNetR, outcomeOf, tubeGroup, tubeSummarize, type TubeRecord } from "./bots/tubeStats";
 
@@ -592,6 +592,75 @@ async function carryPage(db: D1Database, days: number | null) {
   };
 }
 
+interface TrendRow {
+  id: number;
+  symbol: string;
+  side: "long" | "short";
+  opened_at: string;
+  closed_at: string | null;
+  status: "open" | "closed";
+  entry_price: number;
+  entry_weight: number;
+  units: number;
+  last_price: number;
+  exit_price: number | null;
+  pnl: number;
+  fee: number;
+  funding: number;
+  resizes: number;
+  reason: string | null;
+}
+
+/** Підсумок Trend Basket за дні з trend_days, % капіталу бота. */
+async function trendPeriod(db: D1Database, since: string) {
+  const r = await db
+    .prepare(
+      "SELECT COUNT(*) AS days, COALESCE(SUM(pnl_pct), 0) AS pnl, COALESCE(SUM(fee_pct), 0) AS fee, COALESCE(SUM(funding_pct), 0) AS funding, COALESCE(AVG(exposure), 0) AS exposure FROM trend_days WHERE day >= ?",
+    )
+    .bind(since)
+    .first<{ days: number; pnl: number; fee: number; funding: number; exposure: number }>();
+  const days = r?.days ?? 0;
+  const net = (r?.pnl ?? 0) - (r?.fee ?? 0) + (r?.funding ?? 0);
+  const r4 = (v: number) => Number(v.toFixed(4));
+  return { days, pnlPct: r4(r?.pnl ?? 0), feePct: r4(r?.fee ?? 0), fundingPct: r4(r?.funding ?? 0), netPct: r4(net), aprPct: days >= 7 ? Number(((net / days) * 365).toFixed(2)) : null, exposure: r4(r?.exposure ?? 0) };
+}
+
+/** Денна крива Trend Basket: накопичений результат, % капіталу. */
+async function trendCurve(db: D1Database, since: string) {
+  const rows = await db.prepare("SELECT day, pnl_pct + funding_pct - fee_pct AS net, exposure FROM trend_days WHERE day >= ? ORDER BY day").bind(since).all<{ day: string; net: number; exposure: number }>();
+  let sum = 0;
+  return rows.results.map((r) => ({ day: r.day, net: Number((sum += r.net).toFixed(4)), exposure: r.exposure }));
+}
+
+/** Сторінка Trend Basket: налаштування, остання доба, позиції, епізоди, підсумки й крива за період. */
+async function trendPage(db: D1Database, days: number | null) {
+  const since = days === null ? "" : new Date(Date.now() - days * 86_400_000).toISOString();
+  const keys = [...Object.values(TREND_KEYS), botEnabledKey("trend"), "fee_taker_pct"];
+  const [values, cycles, period, curve, rows] = await Promise.all([
+    settingValues(db, keys),
+    botCycles(db, "trend", 30),
+    trendPeriod(db, since.slice(0, 10)),
+    trendCurve(db, since.slice(0, 10)),
+    db.prepare("SELECT * FROM trend_holdings WHERE status = 'open' OR closed_at >= ? ORDER BY id DESC LIMIT 500").bind(since).all<TrendRow>(),
+  ]);
+  const withNet = rows.results.map((r) => ({ ...r, weight: r.units * r.last_price, net_pct: Number(((r.pnl - r.fee + r.funding) * 100).toFixed(4)) }));
+  const closed = withNet.filter((r) => r.status === "closed");
+  return {
+    bot: BOTS.find((b) => b.id === "trend"),
+    enabled: values[botEnabledKey("trend")] !== "off",
+    config: trendConfig(values),
+    takerPct: typeof values.fee_taker_pct === "number" ? values.fee_taker_pct : 0.05,
+    from: since || null,
+    last: cycles[0] ?? null,
+    cycles: cycles.map((x) => ({ at: x.at, status: x.status, error: x.error, detail: x.detail })),
+    period,
+    curve,
+    open: withNet.filter((r) => r.status === "open"),
+    closed,
+    closedSummary: { count: closed.length, wins: closed.filter((r) => r.net_pct > 0).length, netPct: Number(closed.reduce((sum, r) => sum + r.net_pct, 0).toFixed(4)) },
+  };
+}
+
 /** Список ботів: назва, стан і підсумок за 30 днів. */
 app.get("/api/bots", async (c) => {
   const db = c.env.DB;
@@ -599,6 +668,20 @@ app.get("/api/bots", async (c) => {
   const opts = await settingValues(db, BOTS.map((b) => botEnabledKey(b.id)));
   const bots = await Promise.all(
     BOTS.map(async (b) => {
+      if (b.id === "trend") {
+        const [period, open, cycles] = await Promise.all([
+          trendPeriod(db, since.slice(0, 10)),
+          db.prepare("SELECT symbol, units * last_price AS weight FROM trend_holdings WHERE status = 'open' ORDER BY id").all<{ symbol: string; weight: number }>(),
+          botCycles(db, b.id, 1),
+        ]);
+        const last = cycles[0] ?? null;
+        return {
+          ...b,
+          enabled: opts[botEnabledKey(b.id)] !== "off",
+          trend: { ...period, open: open.results.map((r) => r.symbol), weight: Number(open.results.reduce((sum, r) => sum + Math.abs(r.weight), 0).toFixed(4)) },
+          lastCycle: last ? { at: last.at, bias: null, chosen: last.detail.chosen, placed: last.detail.placed, open: last.detail.open, note: last.detail.note } : null,
+        };
+      }
       if (b.id === "carry") {
         const [period, open, cycles] = await Promise.all([
           carryPeriod(db, since.slice(0, 10)),
@@ -638,6 +721,7 @@ app.get("/api/bots/:id", async (c) => {
   if (days !== null && ![7, 30, 90].includes(days)) return c.json({ error: "period must be all, 7, 30 or 90" }, 400);
   const db = c.env.DB;
   if (id === "carry") return c.json(await carryPage(db, days));
+  if (id === "trend") return c.json(await trendPage(db, days));
   const since = days === null ? "" : new Date(Date.now() - days * 86_400_000).toISOString();
   const channel = id === "c2010";
   const keys = [...Object.values(channel ? CHANNEL_KEYS : botKeys(id)), botEnabledKey(id), "risk_per_trade_pct", "deposit_usd", "fee_maker_pct", "fee_taker_pct"];

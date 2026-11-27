@@ -14,6 +14,7 @@ export const WORD: Record<BotMode, { one: string; many: string; gen: string; nea
   fade: { one: "лімітка", many: "лімітки", gen: "ліміток", near: "ближча лімітка", far: "дальня лімітка", Many: "Лімітки" },
   breakout: { one: "стоп-ордер", many: "стоп-ордери", gen: "стоп-ордерів", near: "ближчий стоп-ордер", far: "дальній стоп-ордер", Many: "Стоп-ордери" },
   channel: { one: "вхід", many: "входи", gen: "входів", near: "вхід", far: "вхід", Many: "Входи" },
+  trend: { one: "позиція", many: "позиції", gen: "позицій", near: "позиція", far: "позиція", Many: "Позиції" },
   carry: { one: "позиція", many: "позиції", gen: "позицій", near: "позиція", far: "позиція", Many: "Позиції" },
 };
 
@@ -71,7 +72,7 @@ export function GroupLine({ name, g }: { name: string; g: Group }) {
 }
 
 /** Бектест стратегії на історії: ті самі правила й код виконання, що в боті (npm run backtest:tube, backtest:channel). */
-export function Backtest({ id, mode }: { id: Exclude<BotId, "carry">; mode: BotMode }) {
+export function Backtest({ id, mode }: { id: Exclude<BotId, "carry" | "trend">; mode: BotMode }) {
   const b = BOT_BACKTESTS[id];
   const [open, setOpen] = useState(false);
   const row = (s: (typeof b.periods)[number]) => (

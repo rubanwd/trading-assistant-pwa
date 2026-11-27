@@ -5,7 +5,7 @@ import type { Desk } from "./desk";
  * Поки це паперова торгівля на публічних даних Bybit: ордери не йдуть на біржу, виконання рахує код за свічками.
  */
 
-export const BOT_IDS = ["hvt", "hvb", "c2010", "carry"] as const;
+export const BOT_IDS = ["hvt", "hvb", "c2010", "carry", "trend"] as const;
 export type BotId = (typeof BOT_IDS)[number];
 export const isBotId = (v: unknown): v is BotId => typeof v === "string" && (BOT_IDS as readonly string[]).includes(v);
 
@@ -18,9 +18,10 @@ export const isTubeBot = (v: unknown): v is TubeBotId => typeof v === "string" &
  * fade — лімітки на відстані від ціни ловлять різкий рух і виходять на відкаті (High Value Tube);
  * breakout — стоп-ордери на тій самій відстані входять у бік руху, коли ціна її проходить (High Value Breakout);
  * channel — денний пробій каналу з підтягуванням стопа за коротшим каналом, без тейка (Channel 20/10);
- * carry — спот у лонг і шорт контракту на той самий обсяг, дохід — фандинг (Фандинг-кері).
+ * carry — спот у лонг і шорт контракту на той самий обсяг, дохід — фандинг (Funding Carry);
+ * trend — лонг монет вище денної середньої з частками за волатильністю (Trend Basket).
  */
-export type BotMode = "fade" | "breakout" | "channel" | "carry";
+export type BotMode = "fade" | "breakout" | "channel" | "carry" | "trend";
 
 export interface BotInfo {
   id: BotId;
@@ -59,6 +60,13 @@ export const BOTS: BotInfo[] = [
     desk: "crypto",
     mode: "carry",
     summary: "Купує монету на споті й шортить контракт на той самий обсяг: ціна гаситься, а бот отримує фандинг. Раз на добу входить у монети топ-20 з фандингом від 20% річних і виходить, коли він падає нижче 5%. До 5 позицій.",
+  },
+  {
+    id: "trend",
+    name: "Trend Basket",
+    desk: "crypto",
+    mode: "trend",
+    summary: "Десять найбільших монет: раз на добу лонг тих, що закрились вище 50-денної середньої, решта без позиції. Частка кожної — за її волатильністю, щоб усі ризикували порівну; разом не більше капіталу, без плеча.",
   },
 ];
 
@@ -145,7 +153,7 @@ export const BOT_DEFAULTS: Record<TubeBotId, TubeConfig> = {
 export const TUBE_DEFAULTS = BOT_DEFAULTS.hvt;
 
 /** Префікс налаштувань бота: tube_* для High Value Tube, brk_* для High Value Breakout. */
-export const BOT_PREFIX: Record<BotId, string> = { hvt: "tube", hvb: "brk", c2010: "chn", carry: "cry" };
+export const BOT_PREFIX: Record<BotId, string> = { hvt: "tube", hvb: "brk", c2010: "chn", carry: "cry", trend: "trb" };
 
 const FIELD_KEY: Record<keyof TubeConfig, string> = {
   topN: "top_n",
@@ -319,7 +327,7 @@ export function carryConfig(values: Record<string, unknown>): CarryConfig {
 
 // ── Трендовий кошик ────────────────────────────────────────────────────────
 
-/** Налаштування трендового кошика (поки лише бектест). */
+/** Налаштування Trend Basket. Однакові для рушія й бектесту. */
 export interface TrendBasketConfig {
   /** Монет у списку: найбільші за обігом. Монета, що вже в позиції, тримається, поки вона в топ-2N. */
   topN: number;
@@ -337,3 +345,33 @@ export interface TrendBasketConfig {
 
 /** Стартові значення вибрано до бектесту за дослідженнями часового моментуму в крипті. */
 export const TREND_BASKET_DEFAULTS: TrendBasketConfig = { topN: 10, smaDays: 50, volDays: 30, targetVol: 0.5, band: 0.25, sides: "long" };
+
+type TrendNum = Exclude<keyof TrendBasketConfig, "sides">;
+export const TREND_LIMITS: Record<TrendNum, { min: number; max: number; integer?: boolean }> = {
+  topN: { min: 3, max: 15, integer: true },
+  smaDays: { min: 10, max: 150, integer: true },
+  volDays: { min: 10, max: 90, integer: true },
+  targetVol: { min: 0.1, max: 2 },
+  band: { min: 0, max: 1 },
+};
+
+export const TREND_KEYS: Record<keyof TrendBasketConfig, string> = {
+  topN: "trb_top_n",
+  smaDays: "trb_sma_days",
+  volDays: "trb_vol_days",
+  targetVol: "trb_target_vol",
+  band: "trb_band",
+  sides: "trb_sides",
+};
+
+/** Налаштування Trend Basket з таблиці settings; непридатне значення замінюється стартовим. */
+export function trendConfig(values: Record<string, unknown>): TrendBasketConfig {
+  const out = { ...TREND_BASKET_DEFAULTS };
+  for (const [field, l] of Object.entries(TREND_LIMITS) as [TrendNum, (typeof TREND_LIMITS)[TrendNum]][]) {
+    const v = values[TREND_KEYS[field]];
+    if (typeof v === "number" && Number.isFinite(v) && v >= l.min && v <= l.max && (!l.integer || Number.isInteger(v))) out[field] = v;
+  }
+  const sides = values[TREND_KEYS.sides];
+  if (sides === "long" || sides === "both") out.sides = sides;
+  return out;
+}

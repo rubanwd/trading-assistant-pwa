@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import type { BotInfo, CarryConfig } from "../shared/bots";
-import { CARRY_BACKTEST } from "../shared/tubeBacktest";
+import { CARRY_BACKTEST, type CarryBacktest } from "../shared/tubeBacktest";
 import { PERIODS, type Period } from "./botParts";
 import { api, c, card, coin, day, dim, h2, label, num, p, pct, secondary, signed, time, tone } from "./ui";
 import { Meter, Pill, Segmented, Skeleton, Stat } from "./viz";
@@ -161,8 +161,8 @@ function Positions({ title, rows, empty }: { title: string; rows: Position[]; em
   );
 }
 
-function Backtest() {
-  const b = CARRY_BACKTEST;
+/** Бектест бота з обліком у % капіталу (Funding Carry, Trend Basket). exposure — третя плитка: середня експозиція замість зайнятості. */
+export function PctBacktest({ b, exposure = false }: { b: CarryBacktest; exposure?: boolean }) {
   const [open, setOpen] = useState(false);
   const full = b.periods.find((x) => x.key === "full")!;
   return (
@@ -176,12 +176,12 @@ function Backtest() {
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 10 }}>
         <Stat label="Річних" value={pctText(full.aprPct, 1)} color={tone(full.aprPct)} />
         <Stat label="Просадка" value={`${full.maxDrawdownPct}%`} color={c.down} />
-        <Stat label="Зайнято" value={pct(full.utilization)} sub={`${full.trades} угод`} />
+        {exposure ? <Stat label="Експозиція" value={pct(full.utilization)} sub="капіталу в середньому" /> : <Stat label="Зайнято" value={pct(full.utilization)} sub={`${full.trades} угод`} />}
       </div>
       <p style={{ ...p, fontSize: 13 }}>{b.verdict}</p>
       <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 52px 64px", gap: 6, fontSize: 11, color: c.faint }}>
         <span />
-        <span style={{ textAlign: "right" }}>угод</span>
+        <span style={{ textAlign: "right" }}>{exposure ? "просадка" : "угод"}</span>
         <span style={{ textAlign: "right" }}>річних</span>
       </div>
       {b.periods
@@ -190,7 +190,7 @@ function Backtest() {
           <div key={s.key} style={{ display: "flex", flexDirection: "column", gap: 2, padding: "6px 0", borderBottom: `1px solid ${c.line}` }}>
             <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 52px 64px", gap: 6, fontSize: 13 }}>
               <span style={{ fontWeight: 600 }}>{s.label}</span>
-              <span style={{ ...num, textAlign: "right" }}>{s.trades}</span>
+              <span style={{ ...num, textAlign: "right" }}>{exposure ? `${Math.round(s.maxDrawdownPct)}%` : s.trades}</span>
               <span style={{ ...num, textAlign: "right", fontWeight: 700, color: tone(s.aprPct) }}>{pctText(s.aprPct, 1)}</span>
             </div>
             {s.note && <span style={{ fontSize: 11, color: c.dim }}>{s.note}</span>}
@@ -260,7 +260,7 @@ export function CarryView({ onBack }: { onBack: () => void }) {
           <Summary d={data} />
           <Positions title="Відкриті позиції" rows={data.open} empty="Зараз жодна монета не має фандингу вище порогу входу: капітал вільний." />
           <Funding d={data} />
-          <Backtest />
+          <PctBacktest b={CARRY_BACKTEST} />
           <Positions title="Закриті позиції" rows={data.closed} empty="Закритих позицій за період немає." />
           <Journal cycles={data.cycles} />
           <p style={{ ...dim, fontSize: 11 }}>

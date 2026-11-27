@@ -158,6 +158,7 @@ describe("налаштування", () => {
       brk_target_r: 3, brk_min_stop_pct: 0.5, brk_max_hold_hours: 12, brk_max_positions: 6, brk_trend_only: "off", brk_skip_neutral: "off",
       chn_enabled: "on", chn_symbol: "BTCUSDT", chn_entry_days: 20, chn_exit_days: 10, chn_entry_window_hours: 2,
       cry_enabled: "on", cry_top_n: 20, cry_lookback_days: 3, cry_entry_apr: 20, cry_exit_apr: 5, cry_max_positions: 5,
+      trb_enabled: "on", trb_top_n: 10, trb_sma_days: 50, trb_vol_days: 30, trb_target_vol: 0.5, trb_band: 0.25, trb_sides: "long",
     };
     expect(validateSettings(defaults).errors).toEqual({});
     expect(SETTINGS.map((s) => s.key).sort()).toEqual(Object.keys(defaults).sort());
