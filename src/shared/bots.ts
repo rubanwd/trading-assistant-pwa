@@ -239,3 +239,23 @@ export function channelConfig(values: Record<string, unknown>): ChannelConfig {
   if (typeof sym === "string" && CHANNEL_SYMBOL.test(sym)) out.symbol = sym;
   return out;
 }
+
+// ── Імпульс між монетами ───────────────────────────────────────────────────
+
+export type MomentumWeighting = "equal" | "vol";
+
+/** Налаштування бота «Імпульс між монетами». Однакові для рушія й бектесту. */
+export interface MomentumConfig {
+  /** Скільки монет у списку (топ за капіталізацією в рушії, за обігом у бектесті). */
+  topN: number;
+  /** Доходність за скільки завершених діб ранжує монети. */
+  lookbackDays: number;
+  /** Монет у кожній стороні. */
+  legs: number;
+  /** equal — рівні частки; vol — частки обернено пропорційні волатильності за volDays діб. */
+  weighting: MomentumWeighting;
+  volDays: number;
+}
+
+/** Стартові значення вибрано до бектесту за дослідженнями крипто-імпульсу (1–4 тижні, щотижневе перебалансування). */
+export const MOMENTUM_DEFAULTS: MomentumConfig = { topN: 20, lookbackDays: 28, legs: 4, weighting: "equal", volDays: 30 };
