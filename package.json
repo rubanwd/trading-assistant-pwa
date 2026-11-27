@@ -16,7 +16,8 @@
     "backtest:pick": "tsx scripts/pick-backtest.ts",
     "patterns": "tsx scripts/patterns.ts",
     "backtest:channel": "tsx scripts/channel-backtest.ts",
-    "backtest:momentum": "tsx scripts/momentum-backtest.ts"
+    "backtest:momentum": "tsx scripts/momentum-backtest.ts",
+    "backtest:carry": "tsx scripts/carry-backtest.ts"
   },
   "dependencies": {
     "@pushforge/builder": "^2.0.5",

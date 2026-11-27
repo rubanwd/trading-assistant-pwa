@@ -259,3 +259,22 @@ export interface MomentumConfig {
 
 /** Стартові значення вибрано до бектесту за дослідженнями крипто-імпульсу (1–4 тижні, щотижневе перебалансування). */
 export const MOMENTUM_DEFAULTS: MomentumConfig = { topN: 20, lookbackDays: 28, legs: 4, weighting: "equal", volDays: 30 };
+
+// ── Фандинг-кері ───────────────────────────────────────────────────────────
+
+/** Налаштування бота «Фандинг-кері». Однакові для рушія й бектесту. */
+export interface CarryConfig {
+  /** Скільки монет у списку, з якого бот входить. */
+  topN: number;
+  /** Середня ставка за скільки діб вирішує вхід і вихід. */
+  lookbackDays: number;
+  /** Вхід, коли фандинг не нижче, % річних. */
+  entryApr: number;
+  /** Вихід, коли фандинг нижче, % річних. */
+  exitApr: number;
+  /** Позицій одночасно; кожна — 1/maxPositions капіталу. */
+  maxPositions: number;
+}
+
+/** Стартові значення вибрано до бектесту: вхід від 20% річних, вихід нижче 5%, середнє за 3 доби, до 5 позицій. */
+export const CARRY_DEFAULTS: CarryConfig = { topN: 20, lookbackDays: 3, entryApr: 20, exitApr: 5, maxPositions: 5 };

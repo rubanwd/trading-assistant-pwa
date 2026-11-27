@@ -11,23 +11,10 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { MOMENTUM_DEFAULTS } from "../src/shared/bots";
 import { formatMomentumLine, momentumSummary, momentumWeeksCsv, simulateMomentum, type MomentumSeries, type MomentumWeek } from "../src/backtest/momentum";
-import { months, shiftMonth } from "../src/backtest/data";
-import { loadSymbols, pool, ROOT } from "../src/backtest/load";
-import { fundingMonth } from "../src/research/load";
-import { mergeByTime } from "../src/research/data";
+import { shiftMonth } from "../src/backtest/data";
+import { ROOT } from "../src/backtest/load";
+import { loadBroad } from "../src/backtest/universe";
 import type { MomentumConfig, MomentumWeighting } from "../src/worker/bots/momentum";
-
-/**
- * Широкий список монет, що в різні роки з 2021-го входили до найліквідніших на ф'ючерсах Binance, разом із тими,
- * що потім обвалились чи зникли. Список на кожен тиждень бектест вибирає з нього за обігом.
- */
-const CANDIDATES = [
-  "BTC", "ETH", "BNB", "XRP", "SOL", "ADA", "DOGE", "AVAX", "DOT", "MATIC", "POL", "LINK", "LTC", "BCH", "TRX", "ETC", "UNI", "ATOM",
-  "XLM", "FIL", "NEAR", "APT", "ARB", "OP", "SUI", "TON", "1000SHIB", "1000PEPE", "WIF", "LUNA", "LUNA2", "FTT", "SAND", "MANA", "AXS",
-  "GALA", "AAVE", "EOS", "ALGO", "ICP", "HBAR", "VET", "FTM", "S", "INJ", "TIA", "SEI", "RNDR", "RENDER", "WLD", "ORDI", "1000BONK",
-  "ENA", "HYPE", "ZEC", "XMR", "TAO", "ONDO", "TRUMP", "FET", "LDO", "APE", "CRV", "GMT", "DYDX", "STX", "MKR", "EGLD", "THETA", "CHZ",
-  "XTZ", "SUSHI", "1000FLOKI", "JUP", "PENGU", "VIRTUAL", "KAS", "BTT", "SHIB", "SRM", "KSM", "NEO", "ZIL", "ENJ", "CAKE", "PNUT",
-].map((s) => `${s}USDT`);
 
 const HELP = `Бектест «Імпульс між монетами»: щотижня лонг найсильніших і шорт найслабших монет списку.
 
@@ -80,20 +67,7 @@ async function main() {
   const slippagePct = num(values.slippage, 0.05);
   const log = (l: string) => process.stderr.write(l + "\n");
 
-  // Розігрів: 2 місяці на імпульс і обіг за 30 діб.
-  const loaded = await loadSymbols(CANDIDATES, from, to, log, ["1d"], { warmup: { "1d": 2 }, concurrency: 24 });
-  const monthList = months(shiftMonth(from, -1), to);
-  log(`Завантаження фандингу: ${loaded.length} монет × ${monthList.length} місяців`);
-  let done = 0;
-  const series: MomentumSeries[] = await pool(
-    loaded.map((d) => async () => {
-      const parts = [];
-      for (const m of monthList) parts.push(await fundingMonth(d.symbol, m));
-      if (++done % 10 === 0) log(`  ${done}/${loaded.length}`);
-      return { symbol: d.symbol, daily: d["1d"], funding: mergeByTime(parts).map((f) => ({ at: f.at, paid: f.paid ?? f.rate })) };
-    }),
-    16,
-  );
+  const series: MomentumSeries[] = await loadBroad(from, to, log);
 
   const start = monthStart(from);
   const split = monthStart(testFrom);
