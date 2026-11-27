@@ -1,4 +1,4 @@
-import { botEnabledKey, botInfo, botKeys, CHANNEL_KEYS, CHANNEL_LIMITS, TUBE_BIAS_SIDES, TUBE_LIMITS, type TubeBotId } from "./bots";
+import { botEnabledKey, botInfo, botKeys, CARRY_KEYS, CARRY_LIMITS, CHANNEL_KEYS, CHANNEL_LIMITS, TUBE_BIAS_SIDES, TUBE_LIMITS, type TubeBotId } from "./bots";
 
 /**
  * Схема налаштувань: перевірка значень для API і підписи для екрана «Налаштування».
@@ -119,6 +119,29 @@ function channelSettings(): SettingSpec[] {
   ];
 }
 
+/** Налаштування Funding Carry. */
+function carrySettings(): SettingSpec[] {
+  const g = "Боти" as const;
+  const name = botInfo("carry").name;
+  const n = (field: keyof typeof CARRY_LIMITS) => num(CARRY_LIMITS[field].min, CARRY_LIMITS[field].max, CARRY_LIMITS[field].integer);
+  return [
+    {
+      key: botEnabledKey("carry"),
+      group: g,
+      label: name,
+      help: "Паперова торгівля: спот у лонг і шорт контракту на той самий обсяг, дохід — фандинг. Ордери на біржу не йдуть. Вимкнений бот не входить, а відкриті позиції веде, поки фандинг не впаде нижче порогу виходу.",
+      kind: "enum",
+      options: ["on", "off"],
+      check: onOff,
+    },
+    { key: CARRY_KEYS.topN, group: g, label: `${name}: монет у списку`, help: "Скільки монет з найбільшою капіталізацією, що мають контракт і спот на Bybit, бот розглядає для входу.", kind: "number", check: n("topN") },
+    { key: CARRY_KEYS.lookbackDays, group: g, label: `${name}: середній фандинг за, діб`, help: "Вхід і вихід вирішує сума ставок за стільки останніх діб, приведена до % річних. Коротше вікно — більше входів і виходів і більше комісій.", kind: "number", check: n("lookbackDays") },
+    { key: CARRY_KEYS.entryApr, group: g, label: `${name}: вхід від, % річних`, help: "Нова позиція відкривається, коли фандинг монети не нижче цього порогу. Найвищий фандинг — першим.", kind: "number", check: n("entryApr") },
+    { key: CARRY_KEYS.exitApr, group: g, label: `${name}: вихід нижче, % річних`, help: "Позиція закривається, коли фандинг падає нижче. Не вище порогу входу: проміжок між ними не дає входити й виходити щодня.", kind: "number", check: n("exitApr") },
+    { key: CARRY_KEYS.maxPositions, group: g, label: `${name}: позицій одночасно`, help: "Кожна позиція — така частка капіталу бота.", kind: "number", check: n("maxPositions") },
+  ];
+}
+
 const nullable = (inner: Check): Check => (v) => (v === null ? ok(null) : inner(v));
 
 const CLOCK = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -194,6 +217,7 @@ export const SETTINGS: SettingSpec[] = [
   ...botSettings("hvt"),
   ...botSettings("hvb"),
   ...channelSettings(),
+  ...carrySettings(),
   { key: "signal_cooldown_hours", group: "Сигнали", label: "Пауза для того самого сетапу по монеті, год", kind: "number", check: num(0, 72) },
   { key: "macro_blackout_hours", group: "Сигнали", label: "Без нових сигналів до макроподії, год", kind: "number", check: num(0, 24) },
   {

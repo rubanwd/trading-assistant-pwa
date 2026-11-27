@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import type { BotId, BotInfo, BotMode, TubeConfig } from "../shared/bots";
 import { positionSize } from "../shared/risk";
 import { Backtest, GroupLine, OUTCOME, PERIODS, SIDE, WORD, type Group, type Outcome, type Period, type Side } from "./botParts";
+import { CarryView } from "./CarryBot";
 import { ChannelView } from "./ChannelBot";
 import { fmtPrice, useLivePrice } from "./live";
 import { EquityCurve } from "./Stats";
@@ -58,7 +59,9 @@ interface BotPage {
 }
 interface BotListItem extends BotInfo {
   enabled: boolean;
-  stats30: Group;
+  /** Для ботів у R; у Funding Carry замість нього carry. */
+  stats30?: Group;
+  carry?: { days: number; netPct: number; aprPct: number | null; busyDays: number; open: string[] };
   lastCycle: { at: string; bias: Bias | null; chosen: string[]; placed: number; open: number; note: string | null } | null;
 }
 
@@ -93,8 +96,36 @@ function biasRule(bias: Bias | null, cfg: TubeConfig, mode: BotMode): string {
 
 // ── Список ботів ────────────────────────────────────────────────────────────
 
+function CarryCard({ b, onOpen }: { b: BotListItem; onOpen: () => void }) {
+  const s = b.carry!;
+  const last = b.lastCycle;
+  return (
+    <button type="button" onClick={onOpen} className="press rise" style={{ ...card, color: c.ink, font: "inherit", textAlign: "left", cursor: "pointer" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ fontSize: 20, fontWeight: 800 }}>{b.name}</span>
+        <Pill color={b.enabled ? c.up : c.faint} style={{ marginLeft: "auto" }}>
+          {b.enabled ? "працює" : "вимкнено"}
+        </Pill>
+      </div>
+      <p style={{ ...dim, fontSize: 13 }}>{b.summary}</p>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 10 }}>
+        <Stat label="Позицій" value={String(s.open.length)} sub={s.open.map(coin).join(", ") || "капітал вільний"} />
+        <Stat label="30 дн" value={s.days ? `${signed(s.netPct)}%` : "—"} color={s.days ? tone(s.netPct) : undefined} sub="капіталу" />
+        <Stat label="Річних" value={s.aprPct === null ? "—" : `${signed(s.aprPct, 1)}%`} color={s.aprPct === null ? undefined : tone(s.aprPct)} sub="після комісій" />
+      </div>
+      {last && (
+        <span style={{ fontSize: 12, color: c.dim }}>
+          Остання доба {day(last.at)}: {last.placed ? `нових позицій ${last.placed}` : "без нових позицій"} · відкрито {last.open}
+        </span>
+      )}
+      <span style={{ fontSize: 13, fontWeight: 600, color: c.blue }}>Відкрити →</span>
+    </button>
+  );
+}
+
 function BotCard({ b, onOpen }: { b: BotListItem; onOpen: () => void }) {
-  const s = b.stats30;
+  if (b.carry) return <CarryCard b={b} onOpen={onOpen} />;
+  const s = b.stats30!;
   const last = b.lastCycle;
   return (
     <button type="button" onClick={onOpen} className="press rise" style={{ ...card, color: c.ink, font: "inherit", textAlign: "left", cursor: "pointer" }}>
@@ -127,7 +158,7 @@ function BotCard({ b, onOpen }: { b: BotListItem; onOpen: () => void }) {
 }
 
 /** Розділ «Боти»: список ботів, а вибраний бот відкривається окремою сторінкою. Поки боти працюють лише з крипто. */
-const BOT_IDS_WEB: BotId[] = ["hvt", "hvb", "c2010"];
+const BOT_IDS_WEB: BotId[] = ["hvt", "hvb", "c2010", "carry"];
 
 export function Bots({ openId, onOpen }: { openId: string | null; onOpen: (id: string | null) => void }) {
   const desk = useDesk();
@@ -147,6 +178,7 @@ export function Bots({ openId, onOpen }: { openId: string | null; onOpen: (id: s
   }
   const bot = BOT_IDS_WEB.find((x) => x === openId);
   if (bot === "c2010") return <ChannelView key={bot} id={bot} onBack={() => onOpen(null)} />;
+  if (bot === "carry") return <CarryView key={bot} onBack={() => onOpen(null)} />;
   if (bot) return <BotView key={bot} id={bot} onBack={() => onOpen(null)} />;
   return (
     <>
@@ -552,7 +584,7 @@ function Cycles({ cycles, mode }: { cycles: Cycle[]; mode: BotMode }) {
 }
 
 /** Сторінка бота: що він робить зараз, як торгував, бектест і кожна угода. */
-function BotView({ id, onBack }: { id: BotId; onBack: () => void }) {
+function BotView({ id, onBack }: { id: Exclude<BotId, "carry">; onBack: () => void }) {
   const [period, setPeriod] = useState<Period>("all");
   const [data, setData] = useState<BotPage | null>(null);
   const [error, setError] = useState<string | null>(null);

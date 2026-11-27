@@ -334,7 +334,7 @@ function Journal({ cycles }: { cycles: Cycle[] }) {
   );
 }
 
-export function ChannelView({ id, onBack }: { id: BotId; onBack: () => void }) {
+export function ChannelView({ id, onBack }: { id: Exclude<BotId, "carry">; onBack: () => void }) {
   const [period, setPeriod] = useState<Period>("all");
   const [data, setData] = useState<Page | null>(null);
   const [error, setError] = useState<string | null>(null);

@@ -11,7 +11,8 @@ import { calibration, hit, loadStats } from "./stats";
 import { netR, outcome, summarize, type PickRecord } from "./pickStats";
 import type { Fees } from "../shared/risk";
 import { CRYPTO_LEADER, parseDesk, STOCKS_LEADER_DEFAULT, type Desk } from "../shared/desk";
-import { botEnabledKey, botKeys, BOTS, CHANNEL_KEYS, channelConfig, isBotId, tubeConfig, type BotId } from "../shared/bots";
+import { botEnabledKey, botKeys, BOTS, CARRY_KEYS, carryConfig, CHANNEL_KEYS, channelConfig, isBotId, tubeConfig, type BotId } from "../shared/bots";
+import { carryNetPct } from "./bots/carry";
 import { netR as tubeNetR, outcomeOf, tubeGroup, tubeSummarize, type TubeRecord } from "./bots/tubeStats";
 
 export { Engine } from "./engine";
@@ -530,6 +531,67 @@ async function botCycles(db: D1Database, id: BotId, limit: number): Promise<{ at
   return rows.results.map((r) => ({ at: r.started_at, status: r.status, error: r.error, detail: JSON.parse(r.detail) as TubeCycleDetail & Partial<ChannelCycleDetail> }));
 }
 
+interface CarryRow {
+  id: number;
+  opened_at: string;
+  symbol: string;
+  share: number;
+  entry_apr: number;
+  entry_price: number | null;
+  status: "open" | "closed";
+  closed_at: string | null;
+  exit_apr: number | null;
+  exit_price: number | null;
+  funding: number;
+  payments: number;
+  last_funding_at: string | null;
+  fee: number;
+  reason: string | null;
+}
+
+/** Підсумок Funding Carry за дні з carry_days, % капіталу бота. since — YYYY-MM-DD або "" для всього часу. */
+async function carryPeriod(db: D1Database, since: string): Promise<{ days: number; fundingPct: number; feePct: number; netPct: number; aprPct: number | null; busyDays: number }> {
+  const r = await db
+    .prepare("SELECT COUNT(*) AS days, COALESCE(SUM(funding_pct), 0) AS funding, COALESCE(SUM(fee_pct), 0) AS fee, COALESCE(SUM(positions > 0), 0) AS busy, MIN(day) AS first FROM carry_days WHERE day >= ?")
+    .bind(since)
+    .first<{ days: number; funding: number; fee: number; busy: number; first: string | null }>();
+  const days = r?.days ?? 0;
+  const net = (r?.funding ?? 0) - (r?.fee ?? 0);
+  const r4 = (v: number) => Number(v.toFixed(4));
+  return { days, fundingPct: r4(r?.funding ?? 0), feePct: r4(r?.fee ?? 0), netPct: r4(net), aprPct: days >= 7 ? Number(((net / days) * 365).toFixed(2)) : null, busyDays: r?.busy ?? 0 };
+}
+
+/** Сторінка Funding Carry: налаштування, остання доба, відкриті й закриті позиції, підсумки за період. */
+async function carryPage(db: D1Database, days: number | null) {
+  const since = days === null ? "" : new Date(Date.now() - days * 86_400_000).toISOString();
+  const keys = [...Object.values(CARRY_KEYS), botEnabledKey("carry"), "fee_taker_pct"];
+  const [values, cycles, period, rows] = await Promise.all([
+    settingValues(db, keys),
+    botCycles(db, "carry", 30),
+    carryPeriod(db, since.slice(0, 10)),
+    db.prepare("SELECT * FROM carry_positions WHERE status = 'open' OR closed_at >= ? ORDER BY id DESC LIMIT 500").bind(since).all<CarryRow>(),
+  ]);
+  const withNet = rows.results.map((r) => ({ ...r, net_pct: Number(carryNetPct(r).toFixed(4)) }));
+  const closed = withNet.filter((r) => r.status === "closed");
+  return {
+    bot: BOTS.find((b) => b.id === "carry"),
+    enabled: values[botEnabledKey("carry")] !== "off",
+    config: carryConfig(values),
+    takerPct: typeof values.fee_taker_pct === "number" ? values.fee_taker_pct : 0.05,
+    from: since || null,
+    last: cycles[0] ?? null,
+    cycles: cycles.map((x) => ({ at: x.at, status: x.status, error: x.error, detail: x.detail })),
+    period,
+    open: withNet.filter((r) => r.status === "open"),
+    closed,
+    closedSummary: {
+      count: closed.length,
+      wins: closed.filter((r) => r.net_pct > 0).length,
+      netPct: Number(closed.reduce((sum, r) => sum + r.net_pct, 0).toFixed(4)),
+    },
+  };
+}
+
 /** Список ботів: назва, стан і підсумок за 30 днів. */
 app.get("/api/bots", async (c) => {
   const db = c.env.DB;
@@ -537,6 +599,20 @@ app.get("/api/bots", async (c) => {
   const opts = await settingValues(db, BOTS.map((b) => botEnabledKey(b.id)));
   const bots = await Promise.all(
     BOTS.map(async (b) => {
+      if (b.id === "carry") {
+        const [period, open, cycles] = await Promise.all([
+          carryPeriod(db, since.slice(0, 10)),
+          db.prepare("SELECT symbol FROM carry_positions WHERE status = 'open' ORDER BY id").all<{ symbol: string }>(),
+          botCycles(db, b.id, 1),
+        ]);
+        const last = cycles[0] ?? null;
+        return {
+          ...b,
+          enabled: opts[botEnabledKey(b.id)] !== "off",
+          carry: { ...period, open: open.results.map((r) => r.symbol) },
+          lastCycle: last ? { at: last.at, bias: null, chosen: last.detail.chosen, placed: last.detail.placed, open: last.detail.open, note: last.detail.note } : null,
+        };
+      }
       const [rows, cycles] = await Promise.all([db.prepare(BOT_ORDERS).bind(b.id, since, 20000).all<TubeRecord>(), botCycles(db, b.id, 1)]);
       const last = cycles[0] ?? null;
       return {
@@ -561,6 +637,7 @@ app.get("/api/bots/:id", async (c) => {
   const days = period === "all" ? null : Number(period);
   if (days !== null && ![7, 30, 90].includes(days)) return c.json({ error: "period must be all, 7, 30 or 90" }, 400);
   const db = c.env.DB;
+  if (id === "carry") return c.json(await carryPage(db, days));
   const since = days === null ? "" : new Date(Date.now() - days * 86_400_000).toISOString();
   const channel = id === "c2010";
   const keys = [...Object.values(channel ? CHANNEL_KEYS : botKeys(id)), botEnabledKey(id), "risk_per_trade_pct", "deposit_usd", "fee_maker_pct", "fee_taker_pct"];

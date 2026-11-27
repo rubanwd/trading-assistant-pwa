@@ -36,7 +36,7 @@ export interface BotBacktest {
 const SOURCE =
   "Бектест: npm run backtest:tube. Свічки 15m, 1h і 4h Binance з data.binance.vision (архів Bybit недоступний без API, для топ-20 свічки двох бірж майже однакові); 20 монет, які в листопаді 2026 у топ-20, тож є зсув на користь монет, що дожили до топу. Виконання — той самий код, що в боті.";
 
-export const BOT_BACKTESTS: Record<BotId, BotBacktest> = {
+export const BOT_BACKTESTS: Record<Exclude<BotId, "carry">, BotBacktest> = {
   hvt: {
     from: "2023-11",
     to: "2026-10",
@@ -102,4 +102,55 @@ export const BOT_BACKTESTS: Record<BotId, BotBacktest> = {
     source:
       "Бектест: npm run backtest:channel. Свічки 1d і 1h та ставки фандингу BTCUSDT perp Binance з data.binance.vision (архів Bybit без API недоступний; для BTCUSDT ціни двох бірж майже однакові). Taker 0.055% і проковзування 0.05% за сторону. Код сигналу, стопа й виходу — той самий, що в боті.",
   },
+};
+
+/** Період бектесту Funding Carry: облік у % капіталу бота, а не в R. */
+export interface CarryBacktestPeriod {
+  key: string;
+  label: string;
+  note: string;
+  /** % капіталу на рік і разом за період. */
+  aprPct: number;
+  totalPct: number;
+  /** Середній тиждень, % капіталу, і 95% ДІ. */
+  weekPct: number;
+  ci: [number, number] | null;
+  maxDrawdownPct: number;
+  /** Середня частка зайнятих місць. */
+  utilization: number;
+  trades: number;
+}
+
+export interface CarryBacktest {
+  from: string;
+  to: string;
+  periods: CarryBacktestPeriod[];
+  verdict: string;
+  findings: string[];
+  source: string;
+}
+
+/** Цифри з npm run backtest:carry -- --grid (2021-01 — 2026-10, тест з 2025-11), стартові налаштування CARRY_DEFAULTS. */
+export const CARRY_BACKTEST: CarryBacktest = {
+  from: "2021-01",
+  to: "2026-10",
+  periods: [
+    { key: "full", label: "Увесь період", note: "2021-01 — 2026-10", aprPct: 10.2, totalPct: 59.6, weekPct: 0.195, ci: [0.14, 0.25], maxDrawdownPct: 0.6, utilization: 0.32, trades: 60 },
+    { key: "train", label: "До тесту", note: "2021-01 — 2025-10", aprPct: 12.2, totalPct: 58.8, weekPct: 0.233, ci: [0.17, 0.31], maxDrawdownPct: 0.6, utilization: 0.37, trades: 55 },
+    { key: "test", label: "Тест", note: "2025-11 — 2026-10, останні 12 повних місяців", aprPct: 0.8, totalPct: 0.8, weekPct: 0.015, ci: [0, 0.03], maxDrawdownPct: 0.27, utilization: 0.08, trades: 5 },
+    { key: "y2021", label: "2021", note: "бичачий ринок, фандинг високий", aprPct: 40.5, totalPct: 40.5, weekPct: 0.765, ci: [0.53, 1.01], maxDrawdownPct: 0.6, utilization: 0.81, trades: 19 },
+    { key: "y2022", label: "2022", note: "ведмежий ринок: жодного входу", aprPct: 0, totalPct: 0, weekPct: 0, ci: null, maxDrawdownPct: 0, utilization: 0, trades: 0 },
+    { key: "y2024", label: "2024", note: "", aprPct: 11.1, totalPct: 11.1, weekPct: 0.21, ci: [0.12, 0.32], maxDrawdownPct: 0.48, utilization: 0.47, trades: 21 },
+  ],
+  verdict:
+    "Заробляє лише тоді, коли ринок перегрітий і лонги платять високий фандинг: 2021 рік дав +40% капіталу, 2022-й — нуль (бот жодного разу не входив), 2023 +5%, 2024 +11%, 2025 і 2026 близько +1% на рік. Збиткових тижнів майже немає, але останні 12 місяців бот був зайнятий лише на 8% і дав +0.8% річних — менше, ніж відсоток на стейблкоїнах.",
+  findings: [
+    "Позиція — 1/5 капіталу: спот у лонг і шорт контракту на той самий обсяг. Ціна гаситься, дохід — фандинг мінус комісії обох ніг на вході й виході (спот 0.1%, контракт 0.055%, проковзування 0.05% на кожну ногу).",
+    "Бектест не бачить зміни базису (різниці ціни контракту й споту) між входом і виходом: на одній угоді вона може дати ±0.5–2%, але в середньому не накопичується. Не бачить і переоцінки обсягу з ціною, ризику біржі та ліквідації ноги з плечем.",
+    "Поріг входу важливий: від 10% річних з середнім за 1 добу бот входить і виходить сотні разів, і комісії з'їдають дві третини фандингу.",
+    "Сітка на навчанні (середнє за 1, 3, 7 діб; вхід від 10, 20, 30, 50%; 3 або 5 позицій) дала від +5% до +14% річних; на тесті найкращі варіанти — від −2.6% до +3%.",
+    "Найбільше дали EGLD, DOT, LINK, ETH, BTC і 1000PEPE. Фандинг — історичні ставки Binance; у Bybit вони близькі, але не однакові.",
+  ],
+  source:
+    "Бектест: npm run backtest:carry. Денні свічки й фандинг ф'ючерсів Binance з data.binance.vision; список на кожну добу — топ-20 за обігом 30 діб із 85 монет, серед яких є й ті, що згодом обвалились чи зникли. Правила входу й виходу — той самий код, що в боті.",
 };

@@ -1,7 +1,14 @@
 import type { CarryConfig } from "../shared/bots";
 import { carryLegCost, DAY_MS, planCarry } from "../worker/bots/carry";
 import { bootstrapMeanCi, maxDrawdown } from "./report";
-import type { BroadSeries } from "./universe";
+import type { Candle } from "../worker/market/types";
+
+/** Денні свічки й фактичні ставки фандингу монети (як BroadSeries у universe.ts, без залежності від Node). */
+export interface CarrySeries {
+  symbol: string;
+  daily: Candle[];
+  funding: { at: number; paid: number }[];
+}
 
 /**
  * Бектест бота «Фандинг-кері»: ті самі ставка, вхід і вихід, що й у рушії (src/worker/bots/carry.ts).
@@ -58,7 +65,7 @@ function firstIndex<T>(arr: T[], pred: (x: T) => boolean): number {
   return lo;
 }
 
-export function simulateCarry(series: BroadSeries[], from: number, to: number, bt: CarryBacktestConfig): { days: CarryDay[]; trades: CarryTrade[] } {
+export function simulateCarry(series: CarrySeries[], from: number, to: number, bt: CarryBacktestConfig): { days: CarryDay[]; trades: CarryTrade[] } {
   const { cfg } = bt;
   const share = 1 / cfg.maxPositions;
   const legCost = carryLegCost(bt.fees);

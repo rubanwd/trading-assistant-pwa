@@ -5,7 +5,7 @@ import type { Desk } from "./desk";
  * Поки це паперова торгівля на публічних даних Bybit: ордери не йдуть на біржу, виконання рахує код за свічками.
  */
 
-export const BOT_IDS = ["hvt", "hvb", "c2010"] as const;
+export const BOT_IDS = ["hvt", "hvb", "c2010", "carry"] as const;
 export type BotId = (typeof BOT_IDS)[number];
 export const isBotId = (v: unknown): v is BotId => typeof v === "string" && (BOT_IDS as readonly string[]).includes(v);
 
@@ -17,9 +17,10 @@ export const isTubeBot = (v: unknown): v is TubeBotId => typeof v === "string" &
 /**
  * fade — лімітки на відстані від ціни ловлять різкий рух і виходять на відкаті (High Value Tube);
  * breakout — стоп-ордери на тій самій відстані входять у бік руху, коли ціна її проходить (High Value Breakout);
- * channel — денний пробій каналу з підтягуванням стопа за коротшим каналом, без тейка (Channel 20/10).
+ * channel — денний пробій каналу з підтягуванням стопа за коротшим каналом, без тейка (Channel 20/10);
+ * carry — спот у лонг і шорт контракту на той самий обсяг, дохід — фандинг (Фандинг-кері).
  */
-export type BotMode = "fade" | "breakout" | "channel";
+export type BotMode = "fade" | "breakout" | "channel" | "carry";
 
 export interface BotInfo {
   id: BotId;
@@ -51,6 +52,13 @@ export const BOTS: BotInfo[] = [
     desk: "crypto",
     mode: "channel",
     summary: "BTC на денних свічках: вхід за ринком, коли доба закрилась вище максимуму чи нижче мінімуму попередніх 20 днів; стоп за 10-денним каналом щодня підтягується, тейка немає. Одна позиція.",
+  },
+  {
+    id: "carry",
+    name: "Funding Carry",
+    desk: "crypto",
+    mode: "carry",
+    summary: "Купує монету на споті й шортить контракт на той самий обсяг: ціна гаситься, а бот отримує фандинг. Раз на добу входить у монети топ-20 з фандингом від 20% річних і виходить, коли він падає нижче 5%. До 5 позицій.",
   },
 ];
 
@@ -137,7 +145,7 @@ export const BOT_DEFAULTS: Record<TubeBotId, TubeConfig> = {
 export const TUBE_DEFAULTS = BOT_DEFAULTS.hvt;
 
 /** Префікс налаштувань бота: tube_* для High Value Tube, brk_* для High Value Breakout. */
-export const BOT_PREFIX: Record<BotId, string> = { hvt: "tube", hvb: "brk", c2010: "chn" };
+export const BOT_PREFIX: Record<BotId, string> = { hvt: "tube", hvb: "brk", c2010: "chn", carry: "cry" };
 
 const FIELD_KEY: Record<keyof TubeConfig, string> = {
   topN: "top_n",
@@ -278,3 +286,33 @@ export interface CarryConfig {
 
 /** Стартові значення вибрано до бектесту: вхід від 20% річних, вихід нижче 5%, середнє за 3 доби, до 5 позицій. */
 export const CARRY_DEFAULTS: CarryConfig = { topN: 20, lookbackDays: 3, entryApr: 20, exitApr: 5, maxPositions: 5 };
+
+/** Комісія taker на споті Bybit, %: у налаштуваннях лише комісії ф'ючерсів. */
+export const SPOT_TAKER_PCT = 0.1;
+
+export const CARRY_LIMITS: Record<keyof CarryConfig, { min: number; max: number; integer?: boolean }> = {
+  topN: { min: 5, max: 30, integer: true },
+  lookbackDays: { min: 1, max: 14, integer: true },
+  entryApr: { min: 5, max: 200 },
+  exitApr: { min: -20, max: 100 },
+  maxPositions: { min: 1, max: 10, integer: true },
+};
+
+export const CARRY_KEYS: Record<keyof CarryConfig, string> = {
+  topN: "cry_top_n",
+  lookbackDays: "cry_lookback_days",
+  entryApr: "cry_entry_apr",
+  exitApr: "cry_exit_apr",
+  maxPositions: "cry_max_positions",
+};
+
+/** Налаштування Funding Carry з таблиці settings; непридатне значення замінюється стартовим. Вихід не вище входу. */
+export function carryConfig(values: Record<string, unknown>): CarryConfig {
+  const out = { ...CARRY_DEFAULTS };
+  for (const [field, l] of Object.entries(CARRY_LIMITS) as [keyof CarryConfig, (typeof CARRY_LIMITS)[keyof CarryConfig]][]) {
+    const v = values[CARRY_KEYS[field]];
+    if (typeof v === "number" && Number.isFinite(v) && v >= l.min && v <= l.max && (!l.integer || Number.isInteger(v))) out[field] = v;
+  }
+  if (out.exitApr > out.entryApr) out.exitApr = out.entryApr;
+  return out;
+}

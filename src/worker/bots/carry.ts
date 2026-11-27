@@ -62,3 +62,14 @@ export function planCarry(open: string[], aprOf: Map<string, number | null>, uni
 /** Комісії й проковзування на вхід або вихід, частка обсягу позиції: обидві ноги taker. */
 export const carryLegCost = (fees: { spotTakerPct: number; perpTakerPct: number; slippagePct: number }) =>
   (fees.spotTakerPct + fees.perpTakerPct + 2 * fees.slippagePct) / 100;
+
+/**
+ * Базова монета контракту Bybit для пошуку споту: 1000PEPEUSDT → PEPE, SHIB1000USDT → SHIB, 10000SATSUSDT → SATS.
+ * Множник у назві контракту означає, що в контракті 1000 монет; на споті монета продається поштучно.
+ */
+export function spotBase(symbol: string): string {
+  return symbol.replace(/USDT$/, "").replace(/^10+(?=[A-Z])/, "").replace(/(?<=[A-Z])10+$/, "");
+}
+
+/** Результат позиції в % капіталу бота. */
+export const carryNetPct = (p: { funding: number; fee: number; share: number }) => (p.funding - p.fee) * p.share * 100;
