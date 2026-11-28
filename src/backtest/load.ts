@@ -73,9 +73,10 @@ export async function loadSymbols(
   to: string,
   log: (line: string) => void = () => {},
   timeframes: Timeframe[] = TIMEFRAMES,
+  opts: { warmup?: Partial<Record<Timeframe, number>>; concurrency?: number } = {},
 ): Promise<SymbolCandles[]> {
   const jobs = symbols.flatMap((symbol) =>
-    timeframes.flatMap((tf) => months(shiftMonth(from, -WARMUP[tf]), to).map((month) => ({ symbol, tf, month }))),
+    timeframes.flatMap((tf) => months(shiftMonth(from, -(opts.warmup?.[tf] ?? WARMUP[tf])), to).map((month) => ({ symbol, tf, month }))),
   );
   let done = 0;
   log(`Завантаження свічок: ${jobs.length} місячних файлів (кеш у ${ROOT}/cache)`);
@@ -85,14 +86,14 @@ export async function loadSymbols(
       if (++done % 50 === 0 || done === jobs.length) log(`  ${done}/${jobs.length}`);
       return { ...j, candles };
     }),
-    8,
+    opts.concurrency ?? 8,
   );
   const data: SymbolCandles[] = [];
   for (const symbol of symbols) {
     const series = Object.fromEntries(
       TIMEFRAMES.map((tf) => [tf, mergeCandles(parts.filter((p) => p.symbol === symbol && p.tf === tf).map((p) => p.candles))]),
     ) as Record<Timeframe, Candle[]>;
-    if (!series["1h"].length) {
+    if (!series[timeframes.includes("1h") ? "1h" : timeframes[0]!].length) {
       log(`  ${symbol}: немає даних за період, пропускаю`);
       continue;
     }

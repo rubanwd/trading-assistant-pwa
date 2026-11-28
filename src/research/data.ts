@@ -33,6 +33,8 @@ export interface FundingPoint {
   at: number;
   /** Ставка, зведена до 8-годинного інтервалу, частка. */
   rate: number;
+  /** Ставка, фактично нарахована в цей момент (без зведення до 8 годин), частка. */
+  paid?: number;
 }
 
 /** Дні YYYY-MM-DD місяця YYYY-MM. */
@@ -121,7 +123,7 @@ export function parseFunding(csv: string): FundingPoint[] {
     const interval = num(f[1]);
     const rate = num(f[2]);
     if (at === null || rate === null || interval === null || interval <= 0) continue;
-    out.push({ at, rate: (rate * 8) / interval });
+    out.push({ at, rate: (rate * 8) / interval, paid: rate });
   }
   return out.sort((a, b) => a.at - b.at);
 }

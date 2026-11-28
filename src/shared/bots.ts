@@ -5,7 +5,7 @@ import type { Desk } from "./desk";
  * Поки це паперова торгівля на публічних даних Bybit: ордери не йдуть на біржу, виконання рахує код за свічками.
  */
 
-export const BOT_IDS = ["hvt", "hvb", "c2010"] as const;
+export const BOT_IDS = ["hvt", "hvb", "c2010", "carry", "trend"] as const;
 export type BotId = (typeof BOT_IDS)[number];
 export const isBotId = (v: unknown): v is BotId => typeof v === "string" && (BOT_IDS as readonly string[]).includes(v);
 
@@ -17,9 +17,11 @@ export const isTubeBot = (v: unknown): v is TubeBotId => typeof v === "string" &
 /**
  * fade — лімітки на відстані від ціни ловлять різкий рух і виходять на відкаті (High Value Tube);
  * breakout — стоп-ордери на тій самій відстані входять у бік руху, коли ціна її проходить (High Value Breakout);
- * channel — денний пробій каналу з підтягуванням стопа за коротшим каналом, без тейка (Channel 20/10).
+ * channel — денний пробій каналу з підтягуванням стопа за коротшим каналом, без тейка (Channel 20/10);
+ * carry — спот у лонг і шорт контракту на той самий обсяг, дохід — фандинг (Funding Carry);
+ * trend — лонг монет вище денної середньої з частками за волатильністю (Trend Basket).
  */
-export type BotMode = "fade" | "breakout" | "channel";
+export type BotMode = "fade" | "breakout" | "channel" | "carry" | "trend";
 
 export interface BotInfo {
   id: BotId;
@@ -51,6 +53,20 @@ export const BOTS: BotInfo[] = [
     desk: "crypto",
     mode: "channel",
     summary: "BTC на денних свічках: вхід за ринком, коли доба закрилась вище максимуму чи нижче мінімуму попередніх 20 днів; стоп за 10-денним каналом щодня підтягується, тейка немає. Одна позиція.",
+  },
+  {
+    id: "carry",
+    name: "Funding Carry",
+    desk: "crypto",
+    mode: "carry",
+    summary: "Купує монету на споті й шортить контракт на той самий обсяг: ціна гаситься, а бот отримує фандинг. Раз на добу входить у монети топ-20 з фандингом від 20% річних і виходить, коли він падає нижче 5%. До 5 позицій.",
+  },
+  {
+    id: "trend",
+    name: "Trend Basket",
+    desk: "crypto",
+    mode: "trend",
+    summary: "Десять найбільших монет: раз на добу лонг тих, що закрились вище 50-денної середньої, решта без позиції. Частка кожної — за її волатильністю, щоб усі ризикували порівну; разом не більше капіталу, без плеча.",
   },
 ];
 
@@ -137,7 +153,7 @@ export const BOT_DEFAULTS: Record<TubeBotId, TubeConfig> = {
 export const TUBE_DEFAULTS = BOT_DEFAULTS.hvt;
 
 /** Префікс налаштувань бота: tube_* для High Value Tube, brk_* для High Value Breakout. */
-export const BOT_PREFIX: Record<BotId, string> = { hvt: "tube", hvb: "brk", c2010: "chn" };
+export const BOT_PREFIX: Record<BotId, string> = { hvt: "tube", hvb: "brk", c2010: "chn", carry: "cry", trend: "trb" };
 
 const FIELD_KEY: Record<keyof TubeConfig, string> = {
   topN: "top_n",
@@ -237,5 +253,125 @@ export function channelConfig(values: Record<string, unknown>): ChannelConfig {
   }
   const sym = values[CHANNEL_KEYS.symbol];
   if (typeof sym === "string" && CHANNEL_SYMBOL.test(sym)) out.symbol = sym;
+  return out;
+}
+
+// ── Імпульс між монетами ───────────────────────────────────────────────────
+
+export type MomentumWeighting = "equal" | "vol";
+
+/** Налаштування бота «Імпульс між монетами». Однакові для рушія й бектесту. */
+export interface MomentumConfig {
+  /** Скільки монет у списку (топ за капіталізацією в рушії, за обігом у бектесті). */
+  topN: number;
+  /** Доходність за скільки завершених діб ранжує монети. */
+  lookbackDays: number;
+  /** Монет у кожній стороні. */
+  legs: number;
+  /** equal — рівні частки; vol — частки обернено пропорційні волатильності за volDays діб. */
+  weighting: MomentumWeighting;
+  volDays: number;
+}
+
+/** Стартові значення вибрано до бектесту за дослідженнями крипто-імпульсу (1–4 тижні, щотижневе перебалансування). */
+export const MOMENTUM_DEFAULTS: MomentumConfig = { topN: 20, lookbackDays: 28, legs: 4, weighting: "equal", volDays: 30 };
+
+// ── Фандинг-кері ───────────────────────────────────────────────────────────
+
+/** Налаштування бота «Фандинг-кері». Однакові для рушія й бектесту. */
+export interface CarryConfig {
+  /** Скільки монет у списку, з якого бот входить. */
+  topN: number;
+  /** Середня ставка за скільки діб вирішує вхід і вихід. */
+  lookbackDays: number;
+  /** Вхід, коли фандинг не нижче, % річних. */
+  entryApr: number;
+  /** Вихід, коли фандинг нижче, % річних. */
+  exitApr: number;
+  /** Позицій одночасно; кожна — 1/maxPositions капіталу. */
+  maxPositions: number;
+}
+
+/** Стартові значення вибрано до бектесту: вхід від 20% річних, вихід нижче 5%, середнє за 3 доби, до 5 позицій. */
+export const CARRY_DEFAULTS: CarryConfig = { topN: 20, lookbackDays: 3, entryApr: 20, exitApr: 5, maxPositions: 5 };
+
+/** Комісія taker на споті Bybit, %: у налаштуваннях лише комісії ф'ючерсів. */
+export const SPOT_TAKER_PCT = 0.1;
+
+export const CARRY_LIMITS: Record<keyof CarryConfig, { min: number; max: number; integer?: boolean }> = {
+  topN: { min: 5, max: 30, integer: true },
+  lookbackDays: { min: 1, max: 14, integer: true },
+  entryApr: { min: 5, max: 200 },
+  exitApr: { min: -20, max: 100 },
+  maxPositions: { min: 1, max: 10, integer: true },
+};
+
+export const CARRY_KEYS: Record<keyof CarryConfig, string> = {
+  topN: "cry_top_n",
+  lookbackDays: "cry_lookback_days",
+  entryApr: "cry_entry_apr",
+  exitApr: "cry_exit_apr",
+  maxPositions: "cry_max_positions",
+};
+
+/** Налаштування Funding Carry з таблиці settings; непридатне значення замінюється стартовим. Вихід не вище входу. */
+export function carryConfig(values: Record<string, unknown>): CarryConfig {
+  const out = { ...CARRY_DEFAULTS };
+  for (const [field, l] of Object.entries(CARRY_LIMITS) as [keyof CarryConfig, (typeof CARRY_LIMITS)[keyof CarryConfig]][]) {
+    const v = values[CARRY_KEYS[field]];
+    if (typeof v === "number" && Number.isFinite(v) && v >= l.min && v <= l.max && (!l.integer || Number.isInteger(v))) out[field] = v;
+  }
+  if (out.exitApr > out.entryApr) out.exitApr = out.entryApr;
+  return out;
+}
+
+// ── Трендовий кошик ────────────────────────────────────────────────────────
+
+/** Налаштування Trend Basket. Однакові для рушія й бектесту. */
+export interface TrendBasketConfig {
+  /** Монет у списку: найбільші за обігом. Монета, що вже в позиції, тримається, поки вона в топ-2N. */
+  topN: number;
+  /** Лонг, коли денне закриття вище простої середньої за smaDays; інакше без позиції. */
+  smaDays: number;
+  /** Волатильність — стандартне відхилення денних доходностей за volDays, у річному виразі. */
+  volDays: number;
+  /** Цільова річна волатильність кожної позиції: частка = (1/topN) × targetVol / волатильність монети, не більше 2/topN. */
+  targetVol: number;
+  /** Позиція перераховується, лише коли ціль відходить від поточної більше ніж на цю частку (зменшує обіг). */
+  band: number;
+  /** long — лише лонги; both — нижче середньої шорт. */
+  sides: "long" | "both";
+}
+
+/** Стартові значення вибрано до бектесту за дослідженнями часового моментуму в крипті. */
+export const TREND_BASKET_DEFAULTS: TrendBasketConfig = { topN: 10, smaDays: 50, volDays: 30, targetVol: 0.5, band: 0.25, sides: "long" };
+
+type TrendNum = Exclude<keyof TrendBasketConfig, "sides">;
+export const TREND_LIMITS: Record<TrendNum, { min: number; max: number; integer?: boolean }> = {
+  topN: { min: 3, max: 15, integer: true },
+  smaDays: { min: 10, max: 150, integer: true },
+  volDays: { min: 10, max: 90, integer: true },
+  targetVol: { min: 0.1, max: 2 },
+  band: { min: 0, max: 1 },
+};
+
+export const TREND_KEYS: Record<keyof TrendBasketConfig, string> = {
+  topN: "trb_top_n",
+  smaDays: "trb_sma_days",
+  volDays: "trb_vol_days",
+  targetVol: "trb_target_vol",
+  band: "trb_band",
+  sides: "trb_sides",
+};
+
+/** Налаштування Trend Basket з таблиці settings; непридатне значення замінюється стартовим. */
+export function trendConfig(values: Record<string, unknown>): TrendBasketConfig {
+  const out = { ...TREND_BASKET_DEFAULTS };
+  for (const [field, l] of Object.entries(TREND_LIMITS) as [TrendNum, (typeof TREND_LIMITS)[TrendNum]][]) {
+    const v = values[TREND_KEYS[field]];
+    if (typeof v === "number" && Number.isFinite(v) && v >= l.min && v <= l.max && (!l.integer || Number.isInteger(v))) out[field] = v;
+  }
+  const sides = values[TREND_KEYS.sides];
+  if (sides === "long" || sides === "both") out.sides = sides;
   return out;
 }

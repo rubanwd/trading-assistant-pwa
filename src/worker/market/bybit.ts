@@ -165,6 +165,14 @@ export class BybitLinear implements MarketData {
     return out;
   }
 
+  /** Спотові пари до USDT, що зараз торгуються: базова монета → символ (BTC → BTCUSDT). */
+  async spotUsdt(): Promise<Map<string, string>> {
+    const res = await this.get<{ list: { symbol: string; status: string; baseCoin?: string; quoteCoin?: string }[] }>("/v5/market/instruments-info", { category: "spot" });
+    const out = new Map<string, string>();
+    for (const i of res.list) if (i.status === "Trading" && i.quoteCoin === "USDT" && i.baseCoin) out.set(i.baseCoin, i.symbol);
+    return out;
+  }
+
   /**
    * Запит із повторами після відмови за частотою (код 10006 або HTTP 429). Публічні ліміти Bybit рахуються на IP,
    * а вихідні адреси Cloudflare спільні з іншими клієнтами, тож ліміт буває вичерпаний не нами й скидається за секунди.

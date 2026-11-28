@@ -1,4 +1,4 @@
-import { botEnabledKey, botInfo, botKeys, CHANNEL_KEYS, CHANNEL_LIMITS, TUBE_BIAS_SIDES, TUBE_LIMITS, type TubeBotId } from "./bots";
+import { botEnabledKey, botInfo, botKeys, CARRY_KEYS, CARRY_LIMITS, TREND_KEYS, TREND_LIMITS, CHANNEL_KEYS, CHANNEL_LIMITS, TUBE_BIAS_SIDES, TUBE_LIMITS, type TubeBotId } from "./bots";
 
 /**
  * Схема налаштувань: перевірка значень для API і підписи для екрана «Налаштування».
@@ -119,6 +119,53 @@ function channelSettings(): SettingSpec[] {
   ];
 }
 
+/** Налаштування Funding Carry. */
+function carrySettings(): SettingSpec[] {
+  const g = "Боти" as const;
+  const name = botInfo("carry").name;
+  const n = (field: keyof typeof CARRY_LIMITS) => num(CARRY_LIMITS[field].min, CARRY_LIMITS[field].max, CARRY_LIMITS[field].integer);
+  return [
+    {
+      key: botEnabledKey("carry"),
+      group: g,
+      label: name,
+      help: "Паперова торгівля: спот у лонг і шорт контракту на той самий обсяг, дохід — фандинг. Ордери на біржу не йдуть. Вимкнений бот не входить, а відкриті позиції веде, поки фандинг не впаде нижче порогу виходу.",
+      kind: "enum",
+      options: ["on", "off"],
+      check: onOff,
+    },
+    { key: CARRY_KEYS.topN, group: g, label: `${name}: монет у списку`, help: "Скільки монет з найбільшою капіталізацією, що мають контракт і спот на Bybit, бот розглядає для входу.", kind: "number", check: n("topN") },
+    { key: CARRY_KEYS.lookbackDays, group: g, label: `${name}: середній фандинг за, діб`, help: "Вхід і вихід вирішує сума ставок за стільки останніх діб, приведена до % річних. Коротше вікно — більше входів і виходів і більше комісій.", kind: "number", check: n("lookbackDays") },
+    { key: CARRY_KEYS.entryApr, group: g, label: `${name}: вхід від, % річних`, help: "Нова позиція відкривається, коли фандинг монети не нижче цього порогу. Найвищий фандинг — першим.", kind: "number", check: n("entryApr") },
+    { key: CARRY_KEYS.exitApr, group: g, label: `${name}: вихід нижче, % річних`, help: "Позиція закривається, коли фандинг падає нижче. Не вище порогу входу: проміжок між ними не дає входити й виходити щодня.", kind: "number", check: n("exitApr") },
+    { key: CARRY_KEYS.maxPositions, group: g, label: `${name}: позицій одночасно`, help: "Кожна позиція — така частка капіталу бота.", kind: "number", check: n("maxPositions") },
+  ];
+}
+
+/** Налаштування Trend Basket. */
+function trendSettings(): SettingSpec[] {
+  const g = "Боти" as const;
+  const name = botInfo("trend").name;
+  const n = (field: keyof typeof TREND_LIMITS) => num(TREND_LIMITS[field].min, TREND_LIMITS[field].max, TREND_LIMITS[field].integer);
+  return [
+    {
+      key: botEnabledKey("trend"),
+      group: g,
+      label: name,
+      help: "Паперова торгівля: раз на добу лонг монет списку, що закрились вище денної середньої, частки за волатильністю. Ордери на біржу не йдуть. Вимкнений бот закриває позиції на наступному циклі.",
+      kind: "enum",
+      options: ["on", "off"],
+      check: onOff,
+    },
+    { key: TREND_KEYS.topN, group: g, label: `${name}: монет у списку`, help: "Найбільші за капіталізацією з контрактом на Bybit. Монета в позиції тримається, поки вона у вдвічі ширшому списку.", kind: "number", check: n("topN") },
+    { key: TREND_KEYS.smaDays, group: g, label: `${name}: середня, діб`, help: "Лонг, коли денне закриття вище простої середньої за стільки діб. У бектесті 20 і 50 близькі, 100 гірше.", kind: "number", check: n("smaDays") },
+    { key: TREND_KEYS.volDays, group: g, label: `${name}: волатильність за, діб`, help: "Стандартне відхилення денних доходностей за стільки діб, у річному виразі.", kind: "number", check: n("volDays") },
+    { key: TREND_KEYS.targetVol, group: g, label: `${name}: цільова волатильність позиції`, help: "Частка монети = (1 / монет у списку) × ціль / її волатильність, не більше подвійної рівної частки; сума не більше капіталу. 0.5 — 50% річних.", kind: "number", check: n("targetVol") },
+    { key: TREND_KEYS.band, group: g, label: `${name}: смуга перебалансування`, help: "Частка міняється, лише коли ціль відійшла від поточної більше ніж на цю частку цілі. Менша смуга — точніші частки, але більше комісій.", kind: "number", check: n("band") },
+    { key: TREND_KEYS.sides, group: g, label: `${name}: сторони`, help: "long: нижче середньої без позиції. both: нижче середньої шорт — у бектесті гірше.", kind: "enum", options: ["long", "both"], check: (v) => (v === "long" || v === "both" ? ok(v) : fail("long або both")) },
+  ];
+}
+
 const nullable = (inner: Check): Check => (v) => (v === null ? ok(null) : inner(v));
 
 const CLOCK = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -194,6 +241,8 @@ export const SETTINGS: SettingSpec[] = [
   ...botSettings("hvt"),
   ...botSettings("hvb"),
   ...channelSettings(),
+  ...carrySettings(),
+  ...trendSettings(),
   { key: "signal_cooldown_hours", group: "Сигнали", label: "Пауза для того самого сетапу по монеті, год", kind: "number", check: num(0, 72) },
   { key: "macro_blackout_hours", group: "Сигнали", label: "Без нових сигналів до макроподії, год", kind: "number", check: num(0, 24) },
   {
